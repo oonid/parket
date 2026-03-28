@@ -1,0 +1,5 @@
+/target
+.idea/
+.opencode/
+.env
+state.json
