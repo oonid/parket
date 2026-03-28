@@ -19,13 +19,13 @@
 
 ## 3. State Manager Module — TDD (state.rs)
 
-- [ ] 3.1 Write unit tests for state load/save: missing file, valid JSON, corrupted JSON, update table success, update table failure, atomic write
-- [ ] 3.2 Define `TableState` struct: `last_run_at`, `last_run_status`, `last_run_rows`, `last_run_duration_ms`, `extraction_mode`, `schema_columns_hash`
-- [ ] 3.3 Define `AppState` struct wrapping HashMap of table names to TableState
-- [ ] 3.4 Implement `AppState::load()` — parse state.json, handle missing file and corrupted JSON gracefully
-- [ ] 3.5 Implement `AppState::update_table()` — update state for a table and write to state.json atomically (temp file + rename)
-- [ ] 3.6 Document: create `docs/state-management.md` with state.json schema, atomic write strategy, HWM separation rationale
-- [ ] 3.7 Verify: `cargo build && cargo clippy -- -D warnings && cargo test`
+- [x] 3.1 Write unit tests for state load/save: missing file, valid JSON, corrupted JSON, update table success, update table failure, atomic write
+- [x] 3.2 Define `TableState` struct: `last_run_at`, `last_run_status`, `last_run_rows`, `last_run_duration_ms`, `extraction_mode`, `schema_columns_hash`
+- [x] 3.3 Define `AppState` struct wrapping HashMap of table names to TableState
+- [x] 3.4 Implement `AppState::load()` — parse state.json, handle missing file and corrupted JSON gracefully
+- [x] 3.5 Implement `AppState::update_table()` — update state for a table and write to state.json atomically (temp file + rename)
+- [x] 3.6 Document: create `docs/state-management.md` with state.json schema, atomic write strategy, HWM separation rationale
+- [x] 3.7 Verify: `cargo build && cargo clippy -- -D warnings && cargo test`
 
 ## 4. Query Builder Module — TDD (query.rs)
 

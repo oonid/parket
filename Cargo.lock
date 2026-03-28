@@ -4242,6 +4242,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sqlx",
+ "tempfile",
  "testcontainers",
  "testcontainers-modules",
  "tokio",
