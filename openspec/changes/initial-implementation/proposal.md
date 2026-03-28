@@ -14,6 +14,10 @@ There is no automated pipeline to extract data from MariaDB and land it into a D
 - **Schema evolution**: fail-fast on column drops/type-changes, warn-and-skip on additions.
 - **Structured logging** to stdout via `tracing`.
 - **Graceful signal handling** via `tokio::signal` (finish current batch, then exit).
+- **Test-Driven Development (TDD)** across all modules — tests written before implementation, using `cargo test` with `mockall` for unit tests (mocked MariaDB/S3) and Docker-based integration tests (real MariaDB + MinIO).
+- **Test coverage via `cargo-llvm-cov`** targeting >90% line coverage, enforced as a hard gate in CI.
+- **CI/CD via GitHub Actions**: automated CI pipeline (test, clippy, coverage gate on every push/PR) and release pipeline (cross-compiled binary releases to GitHub Releases + multi-arch Alpine container images to GHCR on version tags).
+- **Inline documentation** — every task group produces a `docs/<topic>.md` documenting what was built, design rationale, and usage notes. A final task consolidates all per-topic docs into a complete `README.md` and project documentation set.
 
 ## Capabilities
 
@@ -28,6 +32,8 @@ There is no automated pipeline to extract data from MariaDB and land it into a D
 - `orchestrator`: Main application loop — iterate configured tables sequentially, run the extract-and-load cycle in batches until 0 rows, handle errors per-table (skip and continue), update state.json, and exit with appropriate code (0/1/2).
 - `logging`: Structured logging to stdout via tracing with tracing-subscriber. Log level controlled by RUST_LOG.
 - `signal-handler`: Catch SIGTERM/SIGINT via tokio::signal, stop starting new batches, let in-flight batch complete, exit gracefully.
+- `ci-cd`: GitHub Actions CI workflow (test, clippy, llvm-cov >90% gate) on push/PR. Release workflow (4 cross-compiled binary targets to GitHub Releases + Alpine multi-arch container image to GHCR) on version tags (`v*`).
+- `documentation`: Every task group produces a `docs/<topic>.md` capturing design decisions, API surface, and examples. Final task consolidates into README.md, architecture overview, configuration reference, and contributing guide.
 
 ### Modified Capabilities
 
@@ -38,4 +44,7 @@ There is no automated pipeline to extract data from MariaDB and land it into a D
 - **New Rust project**: Cargo.toml with dependencies (connectorx, deltalake, sqlx, tokio, serde_json, dotenvy, tracing, tracing-subscriber).
 - **Module structure**: `src/main.rs`, `src/config.rs`, `src/state.rs`, `src/discovery.rs`, `src/query.rs`, `src/extractor.rs`, `src/writer.rs`, `src/orchestrator.rs`.
 - **External dependencies**: MariaDB instance (source), S3/MinIO bucket (target).
+- **Dev dependencies**: `mockall` (unit test mocks), `cargo-llvm-cov` (coverage), `llvm-tools-preview` rustup component.
+- **CI/CD**: `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `Dockerfile` (Alpine-based multi-arch).
+- **Documentation**: `docs/` folder with per-module docs, `README.md`, `docs/architecture.md`, `docs/configuration.md`, `docs/contributing.md`.
 - **No existing code affected** — greenfield implementation.

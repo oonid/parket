@@ -13,6 +13,9 @@ The target environment is a cron-scheduled or container-orchestrated execution m
 - Crash-safe HWM tracking via Delta commitInfo metadata (not state.json)
 - Support both Incremental (cursor-based on `updated_at, id`) and FullRefresh (Overwrite) modes
 - Graceful signal handling (SIGTERM/SIGINT)
+- TDD development: tests before implementation, >90% llvm-cov coverage
+- CI/CD: automated testing, binary releases (GitHub Releases), container images (GHCR)
+- Inline documentation: per-module docs during development, consolidated project docs as final step
 
 **Non-Goals:**
 - Table-level parallelism (v1 is strictly sequential)
@@ -88,6 +91,115 @@ Use `anyhow` for error propagation internally. `thiserror` is not needed — the
 
 Use `tokio` as the async runtime. The binary uses `#[tokio::main]` in main.rs. sqlx requires tokio. connector-x is synchronous (uses its own threads internally), so it is called via `tokio::task::spawn_blocking` to avoid blocking the async runtime.
 
+### D9: Test-Driven Development (TDD)
+
+All modules SHALL be developed test-first. The workflow for each module is:
+
+1. Write failing tests that define the expected behavior (from specs)
+2. Implement the minimum code to make tests pass
+3. Refactor while keeping tests green
+4. Verify: `cargo build && cargo clippy -- -D warnings && cargo test` passes
+
+**Unit tests** live in each module file (`#[cfg(test)] mod tests`) and use `mockall` to mock external dependencies (sqlx pools, connector-x, delta-rs S3 operations). This allows testing business logic without MariaDB or S3.
+
+**Integration tests** live in `tests/` and use real MariaDB + MinIO instances spun up via Docker (using `testcontainers` crate or docker-compose in CI). These verify end-to-end flows.
+
+**Dev dependencies added to Cargo.toml:** `mockall`, `testcontainers`, `testcontainers-modules` (for MariaDB and MinIO images).
+
+### D10: Test coverage with llvm-cov (>90% hard gate)
+
+Use `cargo-llvm-cov` to measure line coverage. The target is **>90% line coverage** across all source files.
+
+**Setup:**
+```bash
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov
+```
+
+**CI enforcement:**
+```bash
+cargo llvm-cov --fail-under-lines 90
+```
+
+This is a **hard gate** — CI fails if coverage drops below 90%. Coverage reports are uploaded as CI artifacts for review.
+
+**Exclusions from coverage measurement:**
+- `src/main.rs` (entry point wiring, hard to unit test — covered by integration tests)
+- Error paths that can only be triggered by OOM or unrecoverable system failures
+
+**Rationale for 90%:** Parket is a data pipeline where correctness is critical (no data loss, no duplicates from HWM bugs). High coverage ensures edge cases in batch sizing, HWM cursor logic, and schema evolution are tested.
+
+### D11: CI/CD — GitHub Actions
+
+Two GitHub Actions workflows:
+
+**`ci.yml` (on push to any branch, on PR to main):**
+1. `cargo test` — all unit + integration tests
+2. `cargo clippy -- -D warnings` — zero-tolerance lint
+3. `cargo llvm-cov --fail-under-lines 90` — coverage hard gate
+4. Upload coverage report as artifact
+
+**`release.yml` (on tag `v*`):**
+1. Build 4 cross-compiled binary targets:
+   - `x86_64-unknown-linux-musl` (static, most Linux servers)
+   - `aarch64-unknown-linux-musl` (static, ARM servers)
+   - `x86_64-unknown-linux-gnu` (dynamic, standard glibc)
+   - `aarch64-unknown-linux-gnu` (dynamic, ARM glibc)
+2. Publish all binaries to GitHub Releases with checksums
+3. Build multi-arch Docker image (`linux/amd64`, `linux/arm64`):
+   - Base: `alpine:latest` (minimal, ~5MB base)
+   - Binary: musl-compiled static binary copied into Alpine
+   - Push to `ghcr.io/<owner>/parket:latest` and `ghcr.io/<owner>/parket:<version>`
+4. Uses `cross` for cross-compilation, `docker/build-push-action` with `buildx` for multi-arch images
+
+**Dockerfile** (multi-stage):
+```dockerfile
+FROM rust:1.85-alpine AS builder
+# Build musl static binary
+...
+
+FROM alpine:latest
+COPY --from=builder /app/parket /usr/local/bin/parket
+ENTRYPOINT ["parket"]
+```
+
+**Alternatives considered:**
+- Debian-based image: larger (~50MB vs ~10MB Alpine), not worth it for a static binary
+- Single-arch only: rejected — ARM servers are common in cloud deployments
+- Soft coverage gate: rejected — data pipeline correctness requires strict enforcement
+
+### D12: Documentation-as-you-go
+
+Every task group SHALL produce a corresponding documentation file in `docs/` before the verification step. This ensures documentation stays in sync with implementation rather than being a retrospective afterthought.
+
+**Per-module documentation structure:**
+
+| Task Group | Doc File | Content |
+|---|---|---|
+| Config | `docs/config.md` | Env var reference, validation rules, defaults table |
+| State Manager | `docs/state-management.md` | state.json schema, atomic write strategy, HWM separation rationale |
+| Query Builder | `docs/query-patterns.md` | SQL templates for each mode, cursor pagination logic |
+| Schema Discovery | `docs/schema-discovery.md` | Mode detection heuristics, unsupported types list, schema hash |
+| Batch Extraction | `docs/batch-extraction.md` | Memory model, adaptive sizing algorithm, connector-x API usage |
+| Delta Writer | `docs/delta-writer.md` | S3 path layout, HWM in commitInfo, Append vs Overwrite semantics |
+| Orchestrator | `docs/orchestrator.md` | Execution flow, error handling, exit codes, schema evolution |
+| Signal Handler | `docs/signal-handling.md` | Graceful shutdown sequence, double-signal behavior |
+| Logging | `docs/logging.md` | Structured log format, field reference, log level guide |
+| CI/CD | `docs/ci-cd.md` | Workflow descriptions, release process, Docker usage |
+
+**Final documentation task** consolidates per-module docs into:
+- `README.md` — project overview, quickstart, usage examples, build instructions
+- `docs/architecture.md` — high-level architecture, data flow diagram, module responsibilities
+- `docs/configuration.md` — complete configuration reference (all env vars, defaults, examples)
+- `docs/contributing.md` — development setup, TDD workflow, PR checklist, coverage requirements
+
+**Rationale:** Writing docs alongside code ensures accuracy — the developer just implemented the logic and has the freshest understanding. Retrofitting docs at the end leads to gaps and stale information.
+
+**Alternatives considered:**
+- Doc-comments only (`///`): good for API docs but insufficient for architecture decisions and operational guides
+- Wiki-based docs: decoupled from code, drifts out of sync — rejected
+- Docs at the end only: high risk of incompleteness — rejected
+
 ## Risks / Trade-offs
 
 | Risk | Mitigation |
@@ -99,6 +211,9 @@ Use `tokio` as the async runtime. The binary uses `#[tokio::main]` in main.rs. s
 | delta-rs S3 configuration complexity (credentials, endpoint) | Use delta-rs's built-in S3 storage options, map from env vars. Test with MinIO early. |
 | Schema evolution false positives (hash changes due to column order) | Hash includes ordinal_position to detect reordering |
 | Two DB connections (sqlx + connector-x) doubles connection count | Acceptable — metadata queries are short-lived, connector-x connection per batch cycle |
+| `cargo-llvm-cov` setup on CI requires `llvm-tools-preview` component | Add explicit install step in CI workflow; pin rust toolchain version |
+| Cross-compilation for 4 targets in CI increases build time (~15-20 min) | Cache cargo registry and target directories per target; use CI matrix for parallel builds |
+| `mockall` mock maintenance overhead as interfaces change | Keep mocks minimal — mock only external I/O boundaries (DB, S3), not internal logic |
 
 ## Open Questions
 
