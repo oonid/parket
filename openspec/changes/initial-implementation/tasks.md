@@ -9,13 +9,13 @@
 
 ## 2. Configuration Module — TDD (config.rs)
 
-- [ ] 2.1 Write unit tests for `Config::load()`: valid env vars, missing required vars, empty TABLES, DATABASE_URL scheme validation, optional defaults, per-table mode overrides
-- [ ] 2.2 Implement `Config` struct with all required and optional fields
-- [ ] 2.3 Implement `Config::load()` — read env vars via `std::env::var`, use dotenvy as `.env` fallback
-- [ ] 2.4 Implement `Config::validate()` — check required fields, DATABASE_URL starts with `mysql://`, TABLES non-empty, TARGET_MEMORY_MB > 0
-- [ ] 2.5 Implement table list parsing (comma-separated, trimmed) and `TABLE_MODE_<NAME>` override lookup
-- [ ] 2.6 Document: create `docs/config.md` with env var reference, validation rules, defaults table, and per-table override examples
-- [ ] 2.7 Verify: `cargo build && cargo clippy -- -D warnings && cargo test`
+- [x] 2.1 Write unit tests for `Config::load()`: valid env vars, missing required vars, empty TABLES, DATABASE_URL scheme validation, optional defaults, per-table mode overrides
+- [x] 2.2 Implement `Config` struct with all required and optional fields
+- [x] 2.3 Implement `Config::load()` — read env vars via `std::env::var`, use dotenvy as `.env` fallback
+- [x] 2.4 Implement `Config::validate()` — check required fields, DATABASE_URL starts with `mysql://`, TABLES non-empty, TARGET_MEMORY_MB > 0
+- [x] 2.5 Implement table list parsing (comma-separated, trimmed) and `TABLE_MODE_<NAME>` override lookup
+- [x] 2.6 Document: create `docs/config.md` with env var reference, validation rules, defaults table, and per-table override examples
+- [x] 2.7 Verify: `cargo build && cargo clippy -- -D warnings && cargo test`
 
 ## 3. State Manager Module — TDD (state.rs)
 
