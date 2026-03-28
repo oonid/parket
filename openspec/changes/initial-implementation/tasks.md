@@ -29,12 +29,12 @@
 
 ## 4. Query Builder Module — TDD (query.rs)
 
-- [ ] 4.1 Write unit tests for `QueryBuilder`: incremental with HWM, incremental without HWM (first run), full_refresh query, backtick-quoting, reserved word table names, column list formatting
-- [ ] 4.2 Implement `QueryBuilder::build_incremental_query()` — cursor-based windowing with `(updated_at = ? AND id > ?) OR (updated_at > ?)` ORDER BY + LIMIT; handle no-HWM case
-- [ ] 4.3 Implement `QueryBuilder::build_full_refresh_query()` — plain `SELECT {columns} FROM {table}`
-- [ ] 4.4 Implement backtick-quoting for all table and column names
-- [ ] 4.5 Document: create `docs/query-patterns.md` with SQL templates for each mode, cursor pagination logic, and generated SQL examples
-- [ ] 4.6 Verify: `cargo build && cargo clippy -- -D warnings && cargo test`
+- [x] 4.1 Write unit tests for `QueryBuilder`: incremental with HWM, incremental without HWM (first run), full_refresh query, backtick-quoting, reserved word table names, column list formatting
+- [x] 4.2 Implement `QueryBuilder::build_incremental_query()` — cursor-based windowing with `(updated_at = ? AND id > ?) OR (updated_at > ?)` ORDER BY + LIMIT; handle no-HWM case
+- [x] 4.3 Implement `QueryBuilder::build_full_refresh_query()` — plain `SELECT {columns} FROM {table}`
+- [x] 4.4 Implement backtick-quoting for all table and column names
+- [x] 4.5 Document: create `docs/query-patterns.md` with SQL templates for each mode, cursor pagination logic, and generated SQL examples
+- [x] 4.6 Verify: `cargo build && cargo clippy -- -D warnings && cargo test`
 
 ## 5. Schema Discovery Module — TDD (discovery.rs)
 
