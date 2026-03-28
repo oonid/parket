@@ -1,11 +1,11 @@
 ## 1. Project Scaffolding & CI Setup
 
-- [ ] 1.1 Initialize Rust project with `Cargo.toml` with dependencies: connectorx (features: src_mysql), deltalake (features: s3, datafusion), sqlx (features: mysql, runtime-tokio, macros), tokio (features: full), serde, serde_json, dotenvy, tracing, tracing-subscriber, anyhow; dev-dependencies: mockall, testcontainers, testcontainers-modules
-- [ ] 1.2 Create module files: `src/main.rs`, `src/config.rs`, `src/state.rs`, `src/discovery.rs`, `src/query.rs`, `src/extractor.rs`, `src/writer.rs`, `src/orchestrator.rs`
-- [ ] 1.3 Create `.env.example` with all configuration variables and comments
-- [ ] 1.4 Update `.gitignore` (target/, .env, state.json, .idea/, .opencode/, coverage/)
-- [ ] 1.5 Create `rust-toolchain.toml` with pinned Rust version
-- [ ] 1.6 Verify: `cargo build && cargo clippy -- -D warnings`
+- [x] 1.1 Initialize Rust project with `Cargo.toml` with dependencies: connectorx (features: src_mysql), deltalake (features: s3, datafusion), sqlx (features: mysql, runtime-tokio, macros), tokio (features: full), serde, serde_json, dotenvy, tracing, tracing-subscriber, anyhow; dev-dependencies: mockall, testcontainers, testcontainers-modules
+- [x] 1.2 Create module files: `src/main.rs`, `src/config.rs`, `src/state.rs`, `src/discovery.rs`, `src/query.rs`, `src/extractor.rs`, `src/writer.rs`, `src/orchestrator.rs`
+- [x] 1.3 Create `.env.example` with all configuration variables and comments
+- [x] 1.4 Update `.gitignore` (target/, .env, state.json, .idea/, .opencode/, coverage/)
+- [x] 1.5 Create `rust-toolchain.toml` with pinned Rust version
+- [x] 1.6 Verify: `cargo build && cargo clippy -- -D warnings`
 
 ## 2. Configuration Module — TDD (config.rs)
 
