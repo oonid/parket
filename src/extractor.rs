@@ -1,4 +1,5 @@
-#[allow(dead_code)] // TODO: remove when BatchExtractor is implemented (Task 6)
+// TODO(task-6): implement BatchExtractor — connector-x streaming, adaptive batch sizing
+#[allow(dead_code)]
 pub struct BatchExtractor {
     database_url: String,
     target_memory_mb: u64,

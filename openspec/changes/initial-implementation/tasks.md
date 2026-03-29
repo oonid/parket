@@ -38,15 +38,15 @@
 
 ## 5. Schema Discovery Module — TDD (discovery.rs)
 
-- [ ] 5.1 Write unit tests with mocked sqlx pool: column discovery, unsupported type filtering (GEOMETRY etc.), mode detection (both columns present, missing updated_at, missing id), mode override precedence, AVG_ROW_LENGTH retrieval, AVG_ROW_LENGTH zero/null fallback, index check, schema hash computation
-- [ ] 5.2 Implement `ColumnInfo` struct and `SchemaInspector` with sqlx MySqlPool
-- [ ] 5.3 Implement `SchemaInspector::discover_columns()` — query `information_schema.columns`, filter unsupported types with warning logs
-- [ ] 5.4 Implement `SchemaInspector::detect_mode()` — check for `updated_at` (TIMESTAMP/DATETIME) + `id` columns, respect per-table mode override
-- [ ] 5.5 Implement `SchemaInspector::get_avg_row_length()` — query `information_schema.tables`
-- [ ] 5.6 Implement `SchemaInspector::check_updated_at_index()` — query `information_schema.statistics`, warn if no index
-- [ ] 5.7 Implement `compute_schema_hash()` — hash column names and types for change detection
-- [ ] 5.8 Document: create `docs/schema-discovery.md` with mode detection heuristics, unsupported types list, schema hash algorithm, and information_schema queries used
-- [ ] 5.9 Verify: `cargo build && cargo clippy -- -D warnings && cargo test`
+- [x] 5.1 Write unit tests with mocked sqlx pool: column discovery, unsupported type filtering (GEOMETRY etc.), mode detection (both columns present, missing updated_at, missing id), mode override precedence, AVG_ROW_LENGTH retrieval, AVG_ROW_LENGTH zero/null fallback, index check, schema hash computation
+- [x] 5.2 Implement `ColumnInfo` struct and `SchemaInspector` with sqlx MySqlPool
+- [x] 5.3 Implement `SchemaInspector::discover_columns()` — query `information_schema.columns`, filter unsupported types with warning logs
+- [x] 5.4 Implement `SchemaInspector::detect_mode()` — check for `updated_at` (TIMESTAMP/DATETIME) + `id` columns, respect per-table mode override
+- [x] 5.5 Implement `SchemaInspector::get_avg_row_length()` — query `information_schema.tables`
+- [x] 5.6 Implement `SchemaInspector::check_updated_at_index()` — query `information_schema.statistics`, warn if no index
+- [x] 5.7 Implement `compute_schema_hash()` — hash column names and types for change detection
+- [x] 5.8 Document: create `docs/schema-discovery.md` with mode detection heuristics, unsupported types list, schema hash algorithm, and information_schema queries used
+- [x] 5.9 Verify: `cargo build && cargo clippy -- -D warnings && cargo test`
 
 ## 6. Batch Extraction Module — TDD (extractor.rs)
 

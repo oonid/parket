@@ -1,3 +1,4 @@
+// TODO(task-7): implement DeltaWriter — S3/Delta writes, HWM in commitInfo
 pub struct DeltaWriter;
 
 impl DeltaWriter {
