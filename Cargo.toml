@@ -8,8 +8,9 @@ repository = "https://github.com/oonid/parket"
 description = "Universal MariaDB to Delta Lake Extractor"
 
 [dependencies]
-connectorx = { version = "0.4.5", features = ["src_mysql"] }
+connectorx = { version = "0.4.5", features = ["src_mysql", "dst_arrow"] }
 deltalake = { version = "0.31", features = ["s3", "datafusion"] }
+arrow = "54"
 sqlx = { version = "0.8", features = ["mysql", "runtime-tokio", "macros"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

@@ -50,14 +50,14 @@
 
 ## 6. Batch Extraction Module — TDD (extractor.rs)
 
-- [ ] 6.1 Write unit tests with mocked connector-x: batch size calculation (AVG_ROW_LENGTH > 0, = 0, = NULL), adaptive sizing after first batch (>2x diff, <2x diff), hard ceiling enforcement, zero-row result, multi-row result
-- [ ] 6.2 Implement `BatchExtractor` struct holding connector-x connection config and current batch_size
-- [ ] 6.3 Implement initial batch size calculation: `batch_size = (TARGET_MEMORY_MB * 1024 * 1024) / AVG_ROW_LENGTH` with DEFAULT_BATCH_SIZE fallback
-- [ ] 6.4 Implement `BatchExtractor::extract()` — execute SQL via connector-x streaming API, collect RecordBatches up to batch_size rows
-- [ ] 6.5 Implement adaptive batch sizing: measure `RecordBatch::get_array_memory_size()`, recalculate bytes_per_row, adjust if >2x off
-- [ ] 6.6 Implement hard memory ceiling check: if batch exceeds `2 * TARGET_MEMORY_MB`, log warning and halve batch_size
-- [ ] 6.7 Document: create `docs/batch-extraction.md` with memory model, adaptive sizing algorithm, connector-x streaming API usage, and batch size calculation examples
-- [ ] 6.8 Verify: `cargo build && cargo clippy -- -D warnings && cargo test`
+- [x] 6.1 Write unit tests with mocked connector-x: batch size calculation (AVG_ROW_LENGTH > 0, = 0, = NULL), adaptive sizing after first batch (>2x diff, <2x diff), hard ceiling enforcement, zero-row result, multi-row result
+- [x] 6.2 Implement `BatchExtractor` struct holding connector-x connection config and current batch_size
+- [x] 6.3 Implement initial batch size calculation: `batch_size = (TARGET_MEMORY_MB * 1024 * 1024) / AVG_ROW_LENGTH` with DEFAULT_BATCH_SIZE fallback
+- [x] 6.4 Implement `BatchExtractor::extract()` — execute SQL via connector-x streaming API, collect RecordBatches up to batch_size rows
+- [x] 6.5 Implement adaptive batch sizing: measure `RecordBatch::get_array_memory_size()`, recalculate bytes_per_row, adjust if >2x off
+- [x] 6.6 Implement hard memory ceiling check: if batch exceeds `2 * TARGET_MEMORY_MB`, log warning and halve batch_size
+- [x] 6.7 Document: create `docs/batch-extraction.md` with memory model, adaptive sizing algorithm, connector-x streaming API usage, and batch size calculation examples
+- [x] 6.8 Verify: `cargo build && cargo clippy -- -D warnings && cargo test`
 
 ## 7. Delta Writer Module — TDD (writer.rs)
 
