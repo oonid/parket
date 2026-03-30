@@ -10,7 +10,7 @@ mod orchestrator;
 mod query;
 #[allow(dead_code)] // TODO(task-8.2): remove when Orchestrator wires up StateManager
 mod state;
-#[allow(dead_code)] // TODO(task-7.2): remove when DeltaWriter is implemented
+#[allow(dead_code)] // TODO(task-8.2): remove when Orchestrator wires up DeltaWriter
 mod writer;
 
 // TODO(task-9.2): install tokio::signal handler for SIGTERM/SIGINT

@@ -61,15 +61,15 @@
 
 ## 7. Delta Writer Module — TDD (writer.rs)
 
-- [ ] 7.1 Write unit tests with mocked delta-rs: ensure_table (exists/not exists), append_batch with HWM metadata, overwrite_table, read_hwm (with/without metadata), extract_hwm_from_batch, S3 connection error handling
-- [ ] 7.2 Implement `DeltaWriter` struct with S3 storage configuration from Config
-- [ ] 7.3 Implement `DeltaWriter::ensure_table()` — check Delta table at S3 path, create with Arrow schema if missing
-- [ ] 7.4 Implement `DeltaWriter::append_batch()` — write RecordBatch with SaveMode::Append, HWM in commitInfo metadata
-- [ ] 7.5 Implement `DeltaWriter::overwrite_table()` — write with SaveMode::Overwrite for FullRefresh
-- [ ] 7.6 Implement `DeltaWriter::read_hwm()` — read latest commitInfo from Delta log, extract `hwm_updated_at` and `hwm_last_id`
-- [ ] 7.7 Implement `extract_hwm_from_batch()` — scan RecordBatch for max `updated_at` and corresponding `id`
-- [ ] 7.8 Document: create `docs/delta-writer.md` with S3 path layout, HWM in commitInfo, Append vs Overwrite semantics, and delta-rs API surface used
-- [ ] 7.9 Verify: `cargo build && cargo clippy -- -D warnings && cargo test`
+- [x] 7.1 Write unit tests with mocked delta-rs: ensure_table (exists/not exists), append_batch with HWM metadata, overwrite_table, read_hwm (with/without metadata), extract_hwm_from_batch, S3 connection error handling
+- [x] 7.2 Implement `DeltaWriter` struct with S3 storage configuration from Config
+- [x] 7.3 Implement `DeltaWriter::ensure_table()` — check Delta table at S3 path, create with Arrow schema if missing
+- [x] 7.4 Implement `DeltaWriter::append_batch()` — write RecordBatch with SaveMode::Append, HWM in commitInfo metadata
+- [x] 7.5 Implement `DeltaWriter::overwrite_table()` — write with SaveMode::Overwrite for FullRefresh
+- [x] 7.6 Implement `DeltaWriter::read_hwm()` — read latest commitInfo from Delta log, extract `hwm_updated_at` and `hwm_last_id`
+- [x] 7.7 Implement `extract_hwm_from_batch()` — scan RecordBatch for max `updated_at` and corresponding `id`
+- [x] 7.8 Document: create `docs/delta-writer.md` with S3 path layout, HWM in commitInfo, Append vs Overwrite semantics, and delta-rs API surface used
+- [x] 7.9 Verify: `cargo build && cargo clippy -- -D warnings && cargo test`
 
 ## 8. Orchestrator Module — TDD (orchestrator.rs)
 

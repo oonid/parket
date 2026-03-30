@@ -10,7 +10,11 @@ description = "Universal MariaDB to Delta Lake Extractor"
 [dependencies]
 connectorx = { version = "0.4.5", features = ["src_mysql", "dst_arrow"] }
 deltalake = { version = "0.31", features = ["s3", "datafusion"] }
-arrow = "54"
+arrow = { version = "54", features = ["ffi"] }
+# arrow57 activates the "ffi" feature on arrow v57 via Cargo feature unification.
+# deltalake depends on arrow 57 without "ffi", so we need this to make
+# deltalake::arrow::ffi available.
+arrow57 = { package = "arrow", version = "57", features = ["ffi"] }
 sqlx = { version = "0.8", features = ["mysql", "runtime-tokio", "macros"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -20,6 +24,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 sha2 = "0.10"
+url = "2.5.8"
 
 [dev-dependencies]
 mockall = "0.14"
