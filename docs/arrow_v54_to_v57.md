@@ -326,3 +326,43 @@ All MariaDB types that connectorx extracts pass through the IPC roundtrip withou
 | `JSON` | `Utf8` (stringified) | Yes | N/A |
 
 FFI verification done via `examples/ffi_vs_ipc.rs` — correctness checks on Int64, Utf8, Float64 (with nulls), Timestamp(Microsecond), Boolean, Date32.
+
+## Production Conversion API (extractor.rs)
+
+All conversion functions are standalone public functions in `src/extractor.rs`. They do **not** modify any existing `BatchExtractor` methods or signatures. When connector-x eventually supports arrow v57 (or is replaced), these functions are simply deleted.
+
+### Public Functions
+
+| Function | Signature | Purpose |
+|---|---|---|
+| `convert_datatype` | `(&arrow::datatypes::DataType) -> Result<deltalake::arrow::datatypes::DataType>` | Map a single v54 DataType to v57. Returns error for unsupported types (List, Struct, Map, etc.). |
+| `convert_schema_v54_to_v57` | `(&arrow::datatypes::Schema) -> Result<Arc<V57Schema>>` | Convert a full Arrow schema (field names, types, nullability preserved). |
+| `convert_v54_to_v57` | `(&arrow::record_batch::RecordBatch) -> Result<V57RecordBatch>` | FFI zero-copy single RecordBatch conversion. Exports v54 data via `arrow::ffi::to_ffi`, copies C ABI structs, imports via `deltalake::arrow::ffi::from_ffi`. |
+| `convert_batches` | `(Vec<arrow::record_batch::RecordBatch>) -> Result<Vec<V57RecordBatch>>` | Apply `convert_v54_to_v57()` over a Vec of batches. |
+
+### Supported Types
+
+Null, Boolean, Int8–Int64, UInt8–UInt64, Float16–Float64, Utf8, LargeUtf8, Binary, LargeBinary, Date32, Date64, Timestamp (all 4 time units, with/without timezone).
+
+### Usage in Orchestrator
+
+```rust
+use crate::extractor::{convert_batches, convert_schema_v54_to_v57};
+
+// Convert extracted batches (v54 → v57) before writing to Delta
+let v57_batches = convert_batches(v54_batches)?;
+
+// Convert schema for ensure_table() call
+let v57_schema = convert_schema_v54_to_v57(&v54_schema)?;
+writer.ensure_table(table_name, v57_schema).await?;
+```
+
+### Removal Instructions
+
+When connector-x upgrades to arrow v57 (or is replaced by `connector_arrow` / sqlx-based extraction):
+
+1. Delete the four `convert_*` functions from `extractor.rs`
+2. Delete the `arrow57` dependency from `Cargo.toml`
+3. Remove the `ffi` feature from the `arrow` v54 dependency (or remove `arrow` v54 entirely)
+4. Update `BatchExtractor::extract()` to return `Vec<deltalake::arrow::record_batch::RecordBatch>` directly
+5. Update `docs/arrow_v54_to_v57.md` — this entire document becomes obsolete

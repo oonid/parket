@@ -1,10 +1,17 @@
 use std::convert::TryFrom;
+use std::sync::Arc;
 
 use anyhow::Result;
 use arrow::record_batch::RecordBatch;
 use tracing::{debug, info, warn};
 
 use connectorx::prelude::{new_record_batch_iter, CXQuery, RecordBatchIterator, SourceConn};
+
+use deltalake::arrow::array::Array as V57ArrayTrait;
+use deltalake::arrow::datatypes::{
+    DataType as V57DataType, Field as V57Field, Schema as V57Schema, TimeUnit as V57TimeUnit,
+};
+use deltalake::arrow::record_batch::RecordBatch as V57RecordBatch;
 
 const DEFAULT_BATCH_SIZE: u64 = 10000;
 
@@ -161,6 +168,113 @@ impl BatchExtractor {
     pub fn batch_size(&self) -> u64 {
         self.batch_size
     }
+}
+
+// ---------------------------------------------------------------------------
+// Arrow v54 → v57 FFI Conversion Functions
+// ---------------------------------------------------------------------------
+// connector-x is pinned to arrow v54. These standalone functions convert
+// RecordBatches from v54 to v57 via the Arrow C Data Interface (zero-copy).
+// When connector-x upgrades to v57, delete this entire section.
+// See docs/arrow_v54_to_v57.md section B for design rationale.
+// ---------------------------------------------------------------------------
+
+pub fn convert_datatype(dt: &arrow::datatypes::DataType) -> Result<V57DataType> {
+    use arrow::datatypes::{DataType, TimeUnit};
+    match dt {
+        DataType::Null => Ok(V57DataType::Null),
+        DataType::Boolean => Ok(V57DataType::Boolean),
+        DataType::Int8 => Ok(V57DataType::Int8),
+        DataType::Int16 => Ok(V57DataType::Int16),
+        DataType::Int32 => Ok(V57DataType::Int32),
+        DataType::Int64 => Ok(V57DataType::Int64),
+        DataType::UInt8 => Ok(V57DataType::UInt8),
+        DataType::UInt16 => Ok(V57DataType::UInt16),
+        DataType::UInt32 => Ok(V57DataType::UInt32),
+        DataType::UInt64 => Ok(V57DataType::UInt64),
+        DataType::Float16 => Ok(V57DataType::Float16),
+        DataType::Float32 => Ok(V57DataType::Float32),
+        DataType::Float64 => Ok(V57DataType::Float64),
+        DataType::Utf8 => Ok(V57DataType::Utf8),
+        DataType::LargeUtf8 => Ok(V57DataType::LargeUtf8),
+        DataType::Binary => Ok(V57DataType::Binary),
+        DataType::LargeBinary => Ok(V57DataType::LargeBinary),
+        DataType::Date32 => Ok(V57DataType::Date32),
+        DataType::Date64 => Ok(V57DataType::Date64),
+        DataType::Timestamp(unit, tz) => {
+            let v57_unit = match unit {
+                TimeUnit::Second => V57TimeUnit::Second,
+                TimeUnit::Millisecond => V57TimeUnit::Millisecond,
+                TimeUnit::Microsecond => V57TimeUnit::Microsecond,
+                TimeUnit::Nanosecond => V57TimeUnit::Nanosecond,
+            };
+            let v57_tz = tz.as_deref().map(|s| Arc::<str>::from(s.to_string()));
+            Ok(V57DataType::Timestamp(v57_unit, v57_tz))
+        }
+        other => Err(anyhow::anyhow!(
+            "unsupported Arrow type for FFI conversion: {other:?}"
+        )),
+    }
+}
+
+pub fn convert_schema_v54_to_v57(schema: &arrow::datatypes::Schema) -> Result<Arc<V57Schema>> {
+    let v57_fields: Result<Vec<V57Field>> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let dt = convert_datatype(f.data_type())?;
+            Ok(V57Field::new(f.name(), dt, f.is_nullable()))
+        })
+        .collect();
+    Ok(Arc::new(V57Schema::new(v57_fields?)))
+}
+
+pub fn convert_v54_to_v57(batch: &RecordBatch) -> Result<V57RecordBatch> {
+    let v57_schema = convert_schema_v54_to_v57(&batch.schema())?;
+
+    let mut v57_columns: Vec<Arc<dyn V57ArrayTrait>> = Vec::new();
+    for col_idx in 0..batch.num_columns() {
+        let v54_data = batch.column(col_idx).to_data();
+
+        let (ffi_array, ffi_schema) = arrow::ffi::to_ffi(&v54_data)?;
+
+        let v57_ffi_schema = unsafe {
+            let src = &ffi_schema as *const _ as *const u8;
+            let mut dst = std::mem::zeroed::<deltalake::arrow::ffi::FFI_ArrowSchema>();
+            std::ptr::copy_nonoverlapping(
+                src,
+                &mut dst as *mut _ as *mut u8,
+                std::mem::size_of::<deltalake::arrow::ffi::FFI_ArrowSchema>(),
+            );
+            dst
+        };
+
+        let v57_ffi_array = unsafe {
+            let src = &ffi_array as *const _ as *const u8;
+            let mut dst = std::mem::zeroed::<deltalake::arrow::ffi::FFI_ArrowArray>();
+            std::ptr::copy_nonoverlapping(
+                src,
+                &mut dst as *mut _ as *mut u8,
+                std::mem::size_of::<deltalake::arrow::ffi::FFI_ArrowArray>(),
+            );
+            dst
+        };
+
+        std::mem::forget(ffi_array);
+        std::mem::forget(ffi_schema);
+
+        let v57_data = unsafe { deltalake::arrow::ffi::from_ffi(v57_ffi_array, &v57_ffi_schema)? };
+        v57_columns.push(deltalake::arrow::array::make_array(v57_data));
+    }
+
+    Ok(V57RecordBatch::try_new(v57_schema, v57_columns)?)
+}
+
+pub fn convert_batches(v54_batches: Vec<RecordBatch>) -> Result<Vec<V57RecordBatch>> {
+    v54_batches
+        .into_iter()
+        .map(|b| convert_v54_to_v57(&b))
+        .collect()
 }
 
 #[cfg(test)]
@@ -393,5 +507,608 @@ mod tests {
         let mut streamer2 = MockStreamer::new(vec![Some(make_large_batch(100))]);
         let _ = ext.extract_from_stream(&mut streamer2).unwrap();
         assert_eq!(ext.batch_size(), size_after_first_adapt);
+    }
+
+    // -----------------------------------------------------------------------
+    // FFI conversion tests (Task 8)
+    // -----------------------------------------------------------------------
+    use arrow::array::{
+        BooleanArray, Date32Array, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray,
+    };
+    use deltalake::arrow::array as v57_arr;
+    use deltalake::arrow::datatypes::TimeUnit as V57TU;
+
+    fn make_v54_single_col_int64(rows: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let arr = Int64Array::from((0..rows as i64).collect::<Vec<_>>());
+        RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap()
+    }
+
+    fn make_v54_single_col_utf8(values: Vec<Option<&str>>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+        let arr = StringArray::from(values);
+        RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap()
+    }
+
+    fn make_v54_single_col_float64_nulls(n: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "price",
+            DataType::Float64,
+            true,
+        )]));
+        let arr = Float64Array::from(
+            (0..n)
+                .map(|i| {
+                    if i % 3 == 0 {
+                        None
+                    } else {
+                        Some(i as f64 * 1.1)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+        RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap()
+    }
+
+    fn make_v54_single_col_timestamp(rows: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "updated_at",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            false,
+        )]));
+        let arr = TimestampMicrosecondArray::from(
+            (0..rows)
+                .map(|i| 1743158400000000i64 + i as i64 * 1000000)
+                .collect::<Vec<_>>(),
+        );
+        RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap()
+    }
+
+    fn make_v54_single_col_boolean(rows: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "is_active",
+            DataType::Boolean,
+            false,
+        )]));
+        let arr = BooleanArray::from((0..rows).map(|i| i % 2 == 0).collect::<Vec<_>>());
+        RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap()
+    }
+
+    fn make_v54_single_col_date32(rows: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "birth_date",
+            DataType::Date32,
+            true,
+        )]));
+        let arr = Date32Array::from((0..rows).map(|_| Some(20000i32)).collect::<Vec<_>>());
+        RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap()
+    }
+
+    fn make_v54_multi_col_batch(n: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("price", DataType::Float64, true),
+            Field::new(
+                "updated_at",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new("is_active", DataType::Boolean, false),
+            Field::new("birth_date", DataType::Date32, true),
+        ]));
+        let id = Int64Array::from((0..n as i64).collect::<Vec<_>>());
+        let name = StringArray::from((0..n).map(|i| format!("user_{i}")).collect::<Vec<_>>());
+        let price = Float64Array::from(
+            (0..n)
+                .map(|i| {
+                    if i % 5 == 0 {
+                        None
+                    } else {
+                        Some(i as f64 * 1.1)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+        let ts = TimestampMicrosecondArray::from(
+            (0..n)
+                .map(|i| 1743158400000000i64 + i as i64 * 1000000)
+                .collect::<Vec<_>>(),
+        );
+        let active = BooleanArray::from((0..n).map(|i| i % 2 == 0).collect::<Vec<_>>());
+        let bd = Date32Array::from((0..n).map(|_| Some(20000i32)).collect::<Vec<_>>());
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(id),
+                Arc::new(name),
+                Arc::new(price),
+                Arc::new(ts),
+                Arc::new(active),
+                Arc::new(bd),
+            ],
+        )
+        .unwrap()
+    }
+
+    // --- 8.1 convert_datatype tests ---
+
+    #[test]
+    fn convert_datatype_null() {
+        assert!(matches!(
+            convert_datatype(&DataType::Null),
+            Ok(V57DataType::Null)
+        ));
+    }
+
+    #[test]
+    fn convert_datatype_boolean() {
+        assert!(matches!(
+            convert_datatype(&DataType::Boolean),
+            Ok(V57DataType::Boolean)
+        ));
+    }
+
+    #[test]
+    fn convert_datatype_int8() {
+        assert!(matches!(
+            convert_datatype(&DataType::Int8),
+            Ok(V57DataType::Int8)
+        ));
+    }
+
+    #[test]
+    fn convert_datatype_int16() {
+        assert!(matches!(
+            convert_datatype(&DataType::Int16),
+            Ok(V57DataType::Int16)
+        ));
+    }
+
+    #[test]
+    fn convert_datatype_int32() {
+        assert!(matches!(
+            convert_datatype(&DataType::Int32),
+            Ok(V57DataType::Int32)
+        ));
+    }
+
+    #[test]
+    fn convert_datatype_int64() {
+        assert!(matches!(
+            convert_datatype(&DataType::Int64),
+            Ok(V57DataType::Int64)
+        ));
+    }
+
+    #[test]
+    fn convert_datatype_uint8() {
+        assert!(matches!(
+            convert_datatype(&DataType::UInt8),
+            Ok(V57DataType::UInt8)
+        ));
+    }
+
+    #[test]
+    fn convert_datatype_uint16() {
+        assert!(matches!(
+            convert_datatype(&DataType::UInt16),
+            Ok(V57DataType::UInt16)
+        ));
+    }
+
+    #[test]
+    fn convert_datatype_uint32() {
+        assert!(matches!(
+            convert_datatype(&DataType::UInt32),
+            Ok(V57DataType::UInt32)
+        ));
+    }
+
+    #[test]
+    fn convert_datatype_uint64() {
+        assert!(matches!(
+            convert_datatype(&DataType::UInt64),
+            Ok(V57DataType::UInt64)
+        ));
+    }
+
+    #[test]
+    fn convert_datatype_float16() {
+        assert!(matches!(
+            convert_datatype(&DataType::Float16),
+            Ok(V57DataType::Float16)
+        ));
+    }
+
+    #[test]
+    fn convert_datatype_float32() {
+        assert!(matches!(
+            convert_datatype(&DataType::Float32),
+            Ok(V57DataType::Float32)
+        ));
+    }
+
+    #[test]
+    fn convert_datatype_float64() {
+        assert!(matches!(
+            convert_datatype(&DataType::Float64),
+            Ok(V57DataType::Float64)
+        ));
+    }
+
+    #[test]
+    fn convert_datatype_utf8() {
+        assert!(matches!(
+            convert_datatype(&DataType::Utf8),
+            Ok(V57DataType::Utf8)
+        ));
+    }
+
+    #[test]
+    fn convert_datatype_large_utf8() {
+        assert!(matches!(
+            convert_datatype(&DataType::LargeUtf8),
+            Ok(V57DataType::LargeUtf8)
+        ));
+    }
+
+    #[test]
+    fn convert_datatype_binary() {
+        assert!(matches!(
+            convert_datatype(&DataType::Binary),
+            Ok(V57DataType::Binary)
+        ));
+    }
+
+    #[test]
+    fn convert_datatype_large_binary() {
+        assert!(matches!(
+            convert_datatype(&DataType::LargeBinary),
+            Ok(V57DataType::LargeBinary)
+        ));
+    }
+
+    #[test]
+    fn convert_datatype_date32() {
+        assert!(matches!(
+            convert_datatype(&DataType::Date32),
+            Ok(V57DataType::Date32)
+        ));
+    }
+
+    #[test]
+    fn convert_datatype_date64() {
+        assert!(matches!(
+            convert_datatype(&DataType::Date64),
+            Ok(V57DataType::Date64)
+        ));
+    }
+
+    #[test]
+    fn convert_datatype_timestamp_microsecond() {
+        let result = convert_datatype(&DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Microsecond,
+            None,
+        ));
+        assert!(matches!(
+            result,
+            Ok(V57DataType::Timestamp(V57TU::Microsecond, None))
+        ));
+    }
+
+    #[test]
+    fn convert_datatype_timestamp_second() {
+        let result = convert_datatype(&DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Second,
+            None,
+        ));
+        assert!(matches!(
+            result,
+            Ok(V57DataType::Timestamp(V57TU::Second, None))
+        ));
+    }
+
+    #[test]
+    fn convert_datatype_timestamp_millisecond() {
+        let result = convert_datatype(&DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Millisecond,
+            None,
+        ));
+        assert!(matches!(
+            result,
+            Ok(V57DataType::Timestamp(V57TU::Millisecond, None))
+        ));
+    }
+
+    #[test]
+    fn convert_datatype_timestamp_nanosecond() {
+        let result = convert_datatype(&DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Nanosecond,
+            None,
+        ));
+        assert!(matches!(
+            result,
+            Ok(V57DataType::Timestamp(V57TU::Nanosecond, None))
+        ));
+    }
+
+    #[test]
+    fn convert_datatype_timestamp_with_timezone() {
+        let result = convert_datatype(&DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ));
+        match result {
+            Ok(V57DataType::Timestamp(V57TU::Microsecond, Some(tz))) => {
+                assert_eq!(tz.as_ref(), "UTC");
+            }
+            _ => panic!("expected Timestamp(Microsecond, Some(\"UTC\"))"),
+        }
+    }
+
+    #[test]
+    fn convert_datatype_unsupported_list() {
+        let dt = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+        assert!(convert_datatype(&dt).is_err());
+    }
+
+    #[test]
+    fn convert_datatype_unsupported_struct() {
+        let dt = DataType::Struct(arrow::datatypes::Fields::from(vec![Field::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+        assert!(convert_datatype(&dt).is_err());
+    }
+
+    // --- 8.2 convert_schema_v54_to_v57 tests ---
+
+    #[test]
+    fn convert_schema_preserves_field_names() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let v57 = convert_schema_v54_to_v57(&schema).unwrap();
+        let names: Vec<&str> = v57.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["id", "name"]);
+    }
+
+    #[test]
+    fn convert_schema_preserves_nullability() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let v57 = convert_schema_v54_to_v57(&schema).unwrap();
+        assert!(!v57.field(0).is_nullable());
+        assert!(v57.field(1).is_nullable());
+    }
+
+    #[test]
+    fn convert_schema_preserves_types() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("price", DataType::Float64, true),
+        ]));
+        let v57 = convert_schema_v54_to_v57(&schema).unwrap();
+        assert!(matches!(v57.field(0).data_type(), V57DataType::Int64));
+        assert!(matches!(v57.field(1).data_type(), V57DataType::Float64));
+    }
+
+    #[test]
+    fn convert_schema_unsupported_type_returns_error() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "data",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            false,
+        )]));
+        assert!(convert_schema_v54_to_v57(&schema).is_err());
+    }
+
+    // --- 8.3 convert_v54_to_v57 tests ---
+
+    #[test]
+    fn ffi_convert_int64_column() {
+        let v54 = make_v54_single_col_int64(10);
+        let v57 = convert_v54_to_v57(&v54).unwrap();
+        assert_eq!(v57.num_rows(), 10);
+        let col = v57
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<v57_arr::Int64Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 0);
+        assert_eq!(col.value(9), 9);
+    }
+
+    #[test]
+    fn ffi_convert_utf8_column() {
+        let v54 = make_v54_single_col_utf8(vec![Some("hello"), None, Some("world")]);
+        let v57 = convert_v54_to_v57(&v54).unwrap();
+        assert_eq!(v57.num_rows(), 3);
+        let col = v57
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<v57_arr::StringArray>()
+            .unwrap();
+        assert_eq!(col.value(0), "hello");
+        assert!(col.is_null(1));
+        assert_eq!(col.value(2), "world");
+    }
+
+    #[test]
+    fn ffi_convert_float64_with_nulls() {
+        let v54 = make_v54_single_col_float64_nulls(10);
+        let v57 = convert_v54_to_v57(&v54).unwrap();
+        assert_eq!(v57.num_rows(), 10);
+        let col = v57
+            .column_by_name("price")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<v57_arr::Float64Array>()
+            .unwrap();
+        assert!(col.is_null(0));
+        assert!(!col.is_null(1));
+        assert!(col.is_null(3));
+    }
+
+    #[test]
+    fn ffi_convert_timestamp_column() {
+        let v54 = make_v54_single_col_timestamp(5);
+        let v57 = convert_v54_to_v57(&v54).unwrap();
+        assert_eq!(v57.num_rows(), 5);
+        let col = v57.column_by_name("updated_at").unwrap();
+        let ids = col
+            .as_any()
+            .downcast_ref::<v57_arr::TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(ids.value(0), 1743158400000000i64);
+        assert_eq!(ids.value(4), 1743158404000000i64);
+    }
+
+    #[test]
+    fn ffi_convert_boolean_column() {
+        let v54 = make_v54_single_col_boolean(4);
+        let v57 = convert_v54_to_v57(&v54).unwrap();
+        assert_eq!(v57.num_rows(), 4);
+        let col = v57
+            .column_by_name("is_active")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<v57_arr::BooleanArray>()
+            .unwrap();
+        assert!(col.value(0));
+        assert!(!col.value(1));
+    }
+
+    #[test]
+    fn ffi_convert_date32_column() {
+        let v54 = make_v54_single_col_date32(3);
+        let v57 = convert_v54_to_v57(&v54).unwrap();
+        assert_eq!(v57.num_rows(), 3);
+        let col = v57
+            .column_by_name("birth_date")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<v57_arr::Date32Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 20000);
+    }
+
+    #[test]
+    fn ffi_convert_multi_column_batch() {
+        let v54 = make_v54_multi_col_batch(100);
+        let v57 = convert_v54_to_v57(&v54).unwrap();
+        assert_eq!(v57.num_columns(), 6);
+        assert_eq!(v57.num_rows(), 100);
+
+        let id_col = v57
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<v57_arr::Int64Array>()
+            .unwrap();
+        assert_eq!(id_col.value(0), 0);
+        assert_eq!(id_col.value(99), 99);
+
+        let name_col = v57
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<v57_arr::StringArray>()
+            .unwrap();
+        assert_eq!(name_col.value(0), "user_0");
+
+        let price_col = v57
+            .column_by_name("price")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<v57_arr::Float64Array>()
+            .unwrap();
+        assert!(price_col.is_null(0));
+        assert!(!price_col.is_null(1));
+    }
+
+    #[test]
+    fn ffi_convert_empty_batch() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let arr = Int64Array::from(Vec::<i64>::new());
+        let v54 = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+
+        let v57 = convert_v54_to_v57(&v54).unwrap();
+        assert_eq!(v57.num_rows(), 0);
+        assert_eq!(v57.num_columns(), 1);
+    }
+
+    #[test]
+    fn ffi_convert_schema_field_names_preserved() {
+        let v54 = make_v54_multi_col_batch(10);
+        let v57 = convert_v54_to_v57(&v54).unwrap();
+        let schema = v57.schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "id",
+                "name",
+                "price",
+                "updated_at",
+                "is_active",
+                "birth_date"
+            ]
+        );
+    }
+
+    #[test]
+    fn ffi_convert_nullability_preserved() {
+        let v54 = make_v54_multi_col_batch(10);
+        let v57 = convert_v54_to_v57(&v54).unwrap();
+        assert!(!v57.schema().field(0).is_nullable()); // id
+        assert!(!v57.schema().field(1).is_nullable()); // name
+        assert!(v57.schema().field(2).is_nullable()); // price
+        assert!(v57.schema().field(5).is_nullable()); // birth_date
+    }
+
+    // --- 8.4 convert_batches tests ---
+
+    #[test]
+    fn convert_batches_empty_vec() {
+        let result: Result<Vec<V57RecordBatch>> = convert_batches(vec![]);
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn convert_batches_single() {
+        let v54 = make_v54_single_col_int64(5);
+        let result = convert_batches(vec![v54]).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 5);
+    }
+
+    #[test]
+    fn convert_batches_multiple() {
+        let b1 = make_v54_single_col_int64(3);
+        let b2 = make_v54_single_col_int64(7);
+        let b3 = make_v54_single_col_int64(1);
+        let result = convert_batches(vec![b1, b2, b3]).unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].num_rows(), 3);
+        assert_eq!(result[1].num_rows(), 7);
+        assert_eq!(result[2].num_rows(), 1);
+    }
+
+    #[test]
+    fn convert_batches_mixed_types() {
+        let b1 = make_v54_single_col_int64(5);
+        let b2 = make_v54_single_col_utf8(vec![Some("a"), Some("b")]);
+        let result = convert_batches(vec![b1, b2]).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].num_rows(), 5);
+        assert_eq!(result[1].num_rows(), 2);
     }
 }
