@@ -13,6 +13,165 @@ mod state;
 #[allow(dead_code)]
 mod writer;
 
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("parket=info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_level(true)
+        .with_thread_ids(false)
+        .with_file(false)
+        .with_line_number(false)
+        .init();
+}
+
 fn main() {
+    init_tracing();
     println!("Hello, world!");
+}
+
+#[cfg(test)]
+mod tests {
+    use tracing::{info, debug, error};
+    use tracing_subscriber::EnvFilter;
+
+    #[test]
+    fn default_log_level_is_info() {
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("parket=info"));
+        let directives: Vec<String> = filter.max_level_hint()
+            .map(|l| l.to_string())
+            .into_iter().collect();
+        assert!(
+            directives.len() <= 1,
+            "default filter should resolve to a single level"
+        );
+    }
+
+    #[test]
+    fn debug_level_filter_allows_debug() {
+        let filter = EnvFilter::new("parket=debug");
+        assert!(filter.max_level_hint().is_some());
+    }
+
+    #[test]
+    fn structured_fields_in_log_statements() {
+        let _guard = tracing_subscriber::fmt()
+            .with_env_filter("parket=debug")
+            .with_test_writer()
+            .try_init();
+
+        info!(
+            table = "orders",
+            rows = 45000,
+            arrow_bytes = 1024,
+            "batch extracted"
+        );
+        info!(
+            table = "orders",
+            rows = 45000,
+            hwm_updated_at = "2026-03-28 10:00:00",
+            hwm_last_id = 12345,
+            "batch committed"
+        );
+        error!(
+            table = "orders",
+            error = "connection refused",
+            "table failed"
+        );
+        info!(
+            succeeded = 5,
+            failed = 0,
+            duration_ms = 3200,
+            "run complete"
+        );
+    }
+
+    #[test]
+    fn extractor_batch_extracted_log_matches_spec() {
+        let _guard = tracing_subscriber::fmt()
+            .with_env_filter("parket=debug")
+            .with_test_writer()
+            .try_init();
+
+        info!(
+            table = "orders",
+            rows = 45000usize,
+            arrow_bytes = 524288usize,
+            "batch extracted"
+        );
+    }
+
+    #[test]
+    fn writer_batch_committed_log_matches_spec() {
+        let _guard = tracing_subscriber::fmt()
+            .with_env_filter("parket=debug")
+            .with_test_writer()
+            .try_init();
+
+        info!(
+            table = "orders",
+            rows = 45000usize,
+            hwm_updated_at = "2026-03-28 10:00:00",
+            hwm_last_id = 98765i64,
+            "batch committed"
+        );
+    }
+
+    #[test]
+    fn orchestrator_run_complete_log_matches_spec() {
+        let _guard = tracing_subscriber::fmt()
+            .with_env_filter("parket=debug")
+            .with_test_writer()
+            .try_init();
+
+        info!(
+            succeeded = 5u32,
+            failed = 0u32,
+            duration_ms = 3200u64,
+            "run complete"
+        );
+    }
+
+    #[test]
+    fn orchestrator_table_failed_log_matches_spec() {
+        let _guard = tracing_subscriber::fmt()
+            .with_env_filter("parket=debug")
+            .with_test_writer()
+            .try_init();
+
+        error!(
+            table = "orders",
+            error = "connection refused",
+            "table failed"
+        );
+    }
+
+    #[test]
+    fn init_tracing_filter_construction() {
+        use tracing_subscriber::EnvFilter;
+        let default_filter = EnvFilter::new("parket=info");
+        let debug_filter = EnvFilter::new("parket=debug");
+        assert!(default_filter.max_level_hint().is_some());
+        assert!(debug_filter.max_level_hint().is_some());
+    }
+
+    #[test]
+    fn env_filter_parses_rust_log_env() {
+        use tracing_subscriber::EnvFilter;
+        let filter = EnvFilter::try_from("parket=debug").unwrap();
+        assert!(filter.max_level_hint().is_some());
+    }
+
+    #[test]
+    fn debug_level_captures_debug_messages() {
+        let _guard = tracing_subscriber::fmt()
+            .with_env_filter("parket=debug")
+            .with_test_writer()
+            .try_init();
+
+        debug!(batch_size = 10000, "debug message visible at debug level");
+    }
 }

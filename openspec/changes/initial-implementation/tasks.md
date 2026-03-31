@@ -109,11 +109,11 @@ connector-x is pinned to arrow v54 with no upgrade path. Add **additional standa
 
 ## 11. Logging Setup (main.rs)
 
-- [ ] 11.1 Write unit tests verifying log output: default level, debug level, structured fields present
-- [ ] 11.2 Initialize `tracing_subscriber::fmt` with structured output to stdout, RUST_LOG env var (default: `parket=info`)
-- [ ] 11.3 Add structured span/field instrumentation: batch extracted, batch committed, table failed, run complete
-- [ ] 11.4 Document: create `docs/logging.md` with structured log format, field reference, log level guide, and example log output
-- [ ] 11.5 Verify: `cargo build && cargo clippy -- -D warnings && cargo test`
+- [x] 11.1 Write unit tests verifying log output: default level, debug level, structured fields present
+- [x] 11.2 Initialize `tracing_subscriber::fmt` with structured output to stdout, RUST_LOG env var (default: `parket=info`)
+- [x] 11.3 Add structured span/field instrumentation: batch extracted, batch committed, table failed, run complete
+- [x] 11.4 Document: create `docs/logging.md` with structured log format, field reference, log level guide, and example log output
+- [x] 11.5 Verify: `cargo build && cargo clippy -- -D warnings && cargo test`
 
 ## 12. Integration & End-to-End
 

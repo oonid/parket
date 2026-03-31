@@ -142,6 +142,8 @@ impl DeltaWriter {
         )
         .await?;
 
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+
         #[allow(deprecated)]
         {
             ops.write(batches)
@@ -152,8 +154,10 @@ impl DeltaWriter {
 
         info!(
             table = table_name,
-            hwm = ?hwm,
-            "batch appended to Delta table"
+            rows = total_rows,
+            hwm_updated_at = ?hwm.as_ref().map(|h| h.updated_at.as_str()),
+            hwm_last_id = ?hwm.as_ref().map(|h| h.last_id),
+            "batch committed"
         );
         Ok(())
     }
@@ -180,6 +184,8 @@ impl DeltaWriter {
         )
         .await?;
 
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+
         #[allow(deprecated)]
         ops.write(batches)
             .with_save_mode(SaveMode::Overwrite)
@@ -188,6 +194,7 @@ impl DeltaWriter {
 
         info!(
             table = table_name,
+            rows = total_rows,
             "table overwritten in Delta Lake"
         );
         Ok(())

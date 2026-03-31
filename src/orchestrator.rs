@@ -358,11 +358,11 @@ where
     }
 
     pub async fn run(&mut self) -> ExitCode {
+        let run_start = Instant::now();
         self.state_mgr.load_or_default(&self.state_path);
 
         let mut succeeded = 0u32;
         let mut failed = 0u32;
-        let total = self.config.tables.len();
 
         let tables = self.config.tables.clone();
         for table_name in &tables {
@@ -397,10 +397,11 @@ where
             }
         }
 
+        let duration_ms = run_start.elapsed().as_millis() as u64;
         info!(
-            total,
             succeeded,
             failed,
+            duration_ms,
             "run complete"
         );
 
@@ -507,6 +508,13 @@ where
             }
 
             let batch_rows: u64 = v54_batches.iter().map(|b| b.num_rows() as u64).sum();
+            let arrow_bytes: usize = v54_batches.iter().map(|b| b.get_array_memory_size()).sum();
+            info!(
+                table = table_name,
+                rows = batch_rows,
+                arrow_bytes,
+                "batch extracted"
+            );
             let v57_batches = convert_batches(v54_batches)?;
             let batch_hwm = v57_batches
                 .last()
@@ -538,6 +546,13 @@ where
         let sql = QueryBuilder::build_full_refresh_query(table_name, columns);
         let v54_batches = self.extractor.extract(&sql)?;
         let total_rows: u64 = v54_batches.iter().map(|b| b.num_rows() as u64).sum();
+        let arrow_bytes: usize = v54_batches.iter().map(|b| b.get_array_memory_size()).sum();
+        info!(
+            table = table_name,
+            rows = total_rows,
+            arrow_bytes,
+            "batch extracted"
+        );
         let v57_batches = convert_batches(v54_batches)?;
         self.writer
             .overwrite_table(table_name, v57_batches, None)
