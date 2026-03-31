@@ -518,7 +518,7 @@ mod tests {
     use deltalake::arrow::array as v57_arr;
     use deltalake::arrow::datatypes::TimeUnit as V57TU;
 
-    fn make_v54_single_col_int64(rows: usize) -> RecordBatch {
+    pub fn make_v54_single_col_int64(rows: usize) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let arr = Int64Array::from((0..rows as i64).collect::<Vec<_>>());
         RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap()

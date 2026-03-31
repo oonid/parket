@@ -55,6 +55,12 @@ This ensures `state.json` is never in a partially-written state.
 | `state.json` contains invalid JSON | `load()` returns error; `load_or_warn()` logs warning and returns empty state |
 | `state.json` is empty file | `load()` returns error (invalid JSON) |
 
+## Derives
+
+`AppState` derives `Clone` to support the orchestrator's `StateManage` adapter pattern. The adapter owns an `AppState` instance and clones it on `load_or_default()` so the orchestrator can read the current state while the adapter retains ownership for subsequent `update_table()` calls.
+
+`TableState` derives `Clone` for the same reason — the orchestrator constructs `TableState` values and passes them to the adapter by value.
+
 ## API
 
 ```rust

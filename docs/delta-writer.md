@@ -218,6 +218,17 @@ All MariaDB types that connectorx extracts pass through the IPC roundtrip withou
 
 The FFI approach uses `unsafe` for `from_ffi()` and raw byte copying but benchmarks show 23-590x speedup at zero memory overhead. Correctness verified via `examples/ffi_vs_ipc.rs`.
 
+## Table Introspection: `open_table()`
+
+`open_table()` is a public method that opens a Delta table handle for a given table name. It is used by the orchestrator's `DeltaWriterAdapter` to implement `get_schema()`, which reads the existing Delta table's Arrow schema for schema evolution checks.
+
+```rust
+let table = writer.open_table("orders").await?;
+let schema = table.snapshot()?.schema();
+```
+
+This method returns `Err` if the table does not exist or is unreachable.
+
 ## Testing
 
 Writer tests use a dual strategy:

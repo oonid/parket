@@ -17,7 +17,7 @@ pub struct TableState {
     pub schema_columns_hash: Option<String>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct AppState {
     #[serde(default)]
     pub tables: HashMap<String, TableState>,

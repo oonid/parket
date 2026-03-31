@@ -70,7 +70,7 @@ impl DeltaWriter {
         }
     }
 
-    async fn open_table(&self, table_name: &str) -> Result<DeltaTable> {
+    pub async fn open_table(&self, table_name: &str) -> Result<DeltaTable> {
         let url = self.table_url(table_name)?;
         let mut table = deltalake::DeltaTableBuilder::from_url(url)?
             .with_storage_options(self.storage_options.clone())

@@ -88,14 +88,14 @@ connector-x is pinned to arrow v54 with no upgrade path. Add **additional standa
 
 ## 9. Orchestrator Module — TDD (orchestrator.rs)
 
-- [ ] 9.1 Write unit tests with mocked dependencies: all tables succeed (exit 0), partial failure (exit 1), fatal misconfig (exit 2), schema evolution (addition: warn+skip, drop: fail, type change: fail), batch loop until exhausted, graceful shutdown signal
-- [ ] 9.2 Implement `Orchestrator` struct holding Config, StateManager, SchemaInspector, BatchExtractor, DeltaWriter, shutdown receiver
-- [ ] 9.3 Implement main table loop: discover → read HWM → build query → extract batch → write batch → update HWM → repeat until 0 rows
-- [ ] 9.4 Implement schema evolution check: compare MariaDB schema with Delta Arrow schema; warn+skip additions, fail drops/type-changes
-- [ ] 9.5 Implement per-table error handling: catch errors, log, mark table failed in state.json, continue
-- [ ] 9.6 Implement exit code logic: 0 (all success), 1 (partial failure), 2 (fatal misconfiguration)
-- [ ] 9.7 Document: create `docs/orchestrator.md` with execution flow, error handling strategy, exit codes, and schema evolution rules
-- [ ] 9.8 Verify: `cargo build && cargo clippy -- -D warnings && cargo test`
+- [x] 9.1 Write unit tests with mocked dependencies: all tables succeed (exit 0), partial failure (exit 1), fatal misconfig (exit 2), schema evolution (addition: warn+skip, drop: fail, type change: fail), batch loop until exhausted, graceful shutdown signal
+- [x] 9.2 Implement `Orchestrator` struct holding Config, StateManager, SchemaInspector, BatchExtractor, DeltaWriter, shutdown receiver
+- [x] 9.3 Implement main table loop: discover → read HWM → build query → extract batch → write batch → update HWM → repeat until 0 rows
+- [x] 9.4 Implement schema evolution check: compare MariaDB schema with Delta Arrow schema; warn+skip additions, fail drops/type-changes
+- [x] 9.5 Implement per-table error handling: catch errors, log, mark table failed in state.json, continue
+- [x] 9.6 Implement exit code logic: 0 (all success), 1 (partial failure), 2 (fatal misconfiguration)
+- [x] 9.7 Document: create `docs/orchestrator.md` with execution flow, error handling strategy, exit codes, and schema evolution rules
+- [x] 9.8 Verify: `cargo build && cargo clippy -- -D warnings && cargo test`
 
 ## 10. Signal Handler (main.rs)
 
