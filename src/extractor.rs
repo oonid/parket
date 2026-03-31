@@ -20,7 +20,7 @@ pub trait CxStreamer {
     fn next_batch(&mut self) -> Option<RecordBatch>;
 }
 
-// TODO(task-11.2): integration tests with real MariaDB covering DefaultCxStreamer + extract()
+// TODO(task-12.2): integration tests with real MariaDB covering DefaultCxStreamer + extract()
 struct DefaultCxStreamer {
     inner: Box<dyn RecordBatchIterator>,
 }

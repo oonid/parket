@@ -34,7 +34,7 @@ impl SchemaInspector {
         Self { pool, database }
     }
 
-    // TODO(task-11): integration tests with real MariaDB
+    // TODO(task-12): integration tests with real MariaDB
     pub async fn discover_columns(&self, table: &str) -> Result<Vec<ColumnInfo>> {
         let rows: Vec<MySqlColumnRow> = sqlx::query_as(
             "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE FROM information_schema.columns WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION"
@@ -62,7 +62,7 @@ impl SchemaInspector {
         Ok(columns)
     }
 
-    // TODO(task-11): integration tests with real MariaDB
+    // TODO(task-12): integration tests with real MariaDB
     pub async fn get_avg_row_length(&self, table: &str) -> Result<Option<u64>> {
         let row: Option<MySqlAvgRowRow> = sqlx::query_as(
             "SELECT AVG_ROW_LENGTH FROM information_schema.tables WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?"
@@ -82,7 +82,7 @@ impl SchemaInspector {
         }
     }
 
-    // TODO(task-11): integration tests with real MariaDB
+    // TODO(task-12): integration tests with real MariaDB
     pub async fn check_updated_at_index(&self, table: &str) -> Result<bool> {
         let row: Option<(i64,)> = sqlx::query_as(
             "SELECT COUNT(*) FROM information_schema.statistics WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = 'updated_at'"
