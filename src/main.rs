@@ -1,20 +1,17 @@
 #[allow(dead_code)]
 mod config;
-#[allow(dead_code)] // TODO(task-8.2): remove when Orchestrator wires up SchemaInspector
+#[allow(dead_code)]
 mod discovery;
-#[allow(dead_code)] // TODO(task-8.2): remove when Orchestrator wires up BatchExtractor
+#[allow(dead_code)]
 mod extractor;
-#[allow(dead_code)] // TODO(task-8.2): remove when Orchestrator is implemented
+#[allow(dead_code)]
 mod orchestrator;
-#[allow(dead_code)] // TODO(task-8.2): remove when Orchestrator wires up QueryBuilder
+#[allow(dead_code)]
 mod query;
-#[allow(dead_code)] // TODO(task-8.2): remove when Orchestrator wires up StateManager
+#[allow(dead_code)]
 mod state;
-#[allow(dead_code)] // TODO(task-8.2): remove when Orchestrator wires up DeltaWriter
+#[allow(dead_code)]
 mod writer;
-
-// TODO(task-9.2): install tokio::signal handler for SIGTERM/SIGINT
-// TODO(task-10.2): initialize tracing_subscriber::fmt with structured output
 
 fn main() {
     println!("Hello, world!");

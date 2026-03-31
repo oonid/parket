@@ -16,3 +16,4 @@ state.json
 # Coverage reports
 coverage/
 lcov.info
+lcov.json

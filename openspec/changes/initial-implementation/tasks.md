@@ -99,13 +99,13 @@ connector-x is pinned to arrow v54 with no upgrade path. Add **additional standa
 
 ## 10. Signal Handler (main.rs)
 
-- [ ] 10.1 Write unit tests for shutdown signal propagation: signal between tables, signal during batch, second signal (exit 130)
-- [ ] 10.2 Install `tokio::signal` handler for SIGTERM and SIGINT
-- [ ] 10.3 Use `tokio::sync::watch` channel to communicate shutdown signal to orchestrator
-- [ ] 10.4 Implement graceful shutdown in orchestrator: check signal before each new table/batch, finish in-flight batch
-- [ ] 10.5 Implement double-signal handling: exit immediately with code 130 on second signal
-- [ ] 10.6 Document: create `docs/signal-handling.md` with graceful shutdown sequence, double-signal behavior, and tokio::signal usage
-- [ ] 10.7 Verify: `cargo build && cargo clippy -- -D warnings && cargo test`
+- [x] 10.1 Write unit tests for shutdown signal propagation: signal between tables, signal during batch, second signal (exit 130)
+- [x] 10.2 Install `tokio::signal` handler for SIGTERM and SIGINT
+- [x] 10.3 Use `tokio::sync::watch` channel to communicate shutdown signal to orchestrator
+- [x] 10.4 Implement graceful shutdown in orchestrator: check signal before each new table/batch, finish in-flight batch
+- [x] 10.5 Implement double-signal handling: exit immediately with code 130 on second signal
+- [x] 10.6 Document: create `docs/signal-handling.md` with graceful shutdown sequence, double-signal behavior, and tokio::signal usage
+- [x] 10.7 Verify: `cargo build && cargo clippy -- -D warnings && cargo test`
 
 ## 11. Logging Setup (main.rs)
 

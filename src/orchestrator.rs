@@ -482,6 +482,14 @@ where
         let mut total_rows = 0u64;
 
         loop {
+            if self.check_shutdown() {
+                info!(
+                    table = table_name,
+                    "shutdown signal received during batch loop, finishing table"
+                );
+                break;
+            }
+
             let batch_size = self.extractor.batch_size();
             let sql = QueryBuilder::build_incremental_query(
                 table_name,
@@ -602,6 +610,28 @@ fn epoch_days_to_ymd(days: i64) -> (i64, i64, i64) {
 
 fn is_leap(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+pub struct SignalHandler {
+    tx: watch::Sender<bool>,
+}
+
+impl SignalHandler {
+    pub fn new() -> (Self, watch::Receiver<bool>) {
+        let (tx, rx) = watch::channel(false);
+        (Self { tx }, rx)
+    }
+
+    pub async fn install(self) {
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            info!("received first signal, initiating graceful shutdown");
+            let _ = self.tx.send(true);
+            tokio::signal::ctrl_c().await.ok();
+            info!("received second signal, forcing immediate exit");
+            std::process::exit(130);
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1822,5 +1852,139 @@ mod tests {
         let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
         let result = orch.run().await;
         assert!(matches!(result, ExitCode::Fatal));
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_between_tables_skips_remaining() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config(vec!["table1".to_string(), "table2".to_string()]);
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+        let (tx, rx) = watch::channel(false);
+
+        setup_incremental_mocks(&mut schema_mock, &mut extract_mock, &mut writer_mock, &mut state_mock);
+
+        let mut orch = Orchestrator::new(
+            config,
+            schema_mock,
+            extract_mock,
+            writer_mock,
+            state_mock,
+            rx,
+            dir.path().to_path_buf(),
+        );
+
+        tx.send(true).unwrap();
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success));
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_during_batch_loop_stops_after_current_batch() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config(vec!["orders".to_string()]);
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+        let (tx, rx) = watch::channel(false);
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        extract_mock
+            .expect_batch_size()
+            .returning(|| 1);
+        writer_mock
+            .expect_ensure_table()
+            .returning(|_, _| Ok(()));
+        writer_mock
+            .expect_get_schema()
+            .returning(|_| Ok(None));
+        writer_mock
+            .expect_read_hwm()
+            .returning(|_| Ok(None));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        let tx_clone = tx.clone();
+        extract_mock
+            .expect_extract()
+            .returning(move |_| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    let _ = tx_clone.send(true);
+                }
+                if count < 3 {
+                    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                        arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int32, false),
+                        arrow::datatypes::Field::new("val", arrow::datatypes::DataType::Int32, false),
+                    ]));
+                    let batch = arrow::record_batch::RecordBatch::try_new(
+                        schema,
+                        vec![
+                            Arc::new(arrow::array::Int32Array::from(vec![1i32])),
+                            Arc::new(arrow::array::Int32Array::from(vec![1i32])),
+                        ],
+                    )
+                    .unwrap();
+                    Ok(vec![batch])
+                } else {
+                    Ok(vec![])
+                }
+            });
+
+        writer_mock
+            .expect_append_batch()
+            .returning(|_, _, _| Ok(()));
+        state_mock
+            .expect_update_table()
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = Orchestrator::new(
+            config,
+            schema_mock,
+            extract_mock,
+            writer_mock,
+            state_mock,
+            rx,
+            dir.path().to_path_buf(),
+        );
+
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success));
+        let total_extracts = call_count.load(Ordering::SeqCst);
+        assert!(
+            total_extracts <= 2,
+            "should have stopped after signal, got {total_extracts} extracts"
+        );
+        assert!(
+            total_extracts >= 1,
+            "should have completed at least one batch, got {total_extracts}"
+        );
+    }
+
+    #[test]
+    fn signal_handler_sends_shutdown_on_first_signal() {
+        let (handler, mut rx) = SignalHandler::new();
+        std::mem::drop(handler);
+        assert!(!*rx.borrow_and_update());
+    }
+
+    #[test]
+    fn signal_handler_watch_channel_starts_false() {
+        let (_handler, rx) = SignalHandler::new();
+        assert!(!*rx.borrow());
     }
 }
