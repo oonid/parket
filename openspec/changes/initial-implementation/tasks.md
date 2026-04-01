@@ -125,9 +125,9 @@ connector-x is pinned to arrow v54 with no upgrade path. Add **additional standa
 
 ## 13. Coverage Gate
 
-- [ ] 13.1 Install `cargo-llvm-cov` and verify setup: `cargo llvm-cov --summary-only`
-- [ ] 13.2 Run `cargo llvm-cov --fail-under-lines 90` — if below 90%, add missing tests for uncovered paths
-- [ ] 13.3 Verify: `cargo llvm-cov --fail-under-lines 90` passes
+- [x] 13.1 Install `cargo-llvm-cov` and verify setup: `cargo llvm-cov --summary-only`
+- [x] 13.2 Run `cargo llvm-cov --fail-under-lines 90` — if below 90%, add missing tests for uncovered paths
+- [x] 13.3 Verify: `cargo llvm-cov --fail-under-lines 90` passes
 
 ## 14. CI/CD & Release Pipeline
 
