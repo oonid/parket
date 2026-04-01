@@ -21,6 +21,7 @@ use crate::state::{AppState, TableState};
 use crate::writer::{extract_hwm_from_batch, DeltaWriter, Hwm};
 
 #[cfg_attr(test, mockall::automock)]
+#[allow(async_fn_in_trait)]
 pub trait SchemaInspect: Send + Sync {
     async fn discover_columns(&self, table: &str) -> Result<Vec<ColumnInfo>>;
     async fn get_avg_row_length(&self, table: &str) -> Result<Option<u64>>;
@@ -34,6 +35,7 @@ pub trait Extract: Send {
 }
 
 #[cfg_attr(test, mockall::automock)]
+#[allow(async_fn_in_trait)]
 pub trait DeltaWrite: Send + Sync {
     async fn ensure_table(&self, table_name: &str, schema: V57SchemaRef) -> Result<()>;
     async fn append_batch(
@@ -113,15 +115,14 @@ impl Extract for ExtractorAdapter {
     }
 }
 
+#[derive(Default)]
 pub struct StateManageAdapter {
     state: AppState,
 }
 
 impl StateManageAdapter {
     pub fn new() -> Self {
-        Self {
-            state: AppState::default(),
-        }
+        Self::default()
     }
 }
 
@@ -268,7 +269,7 @@ fn schema_evolution_check(
             let expected_dt = mariadb_type_to_arrow(&col.data_type, &col.column_type);
             match expected_dt {
                 Ok(dt) => {
-                    if delta_field.data_type() != &dt {
+                    if !types_equivalent(delta_field.data_type(), &dt) {
                         errors.push(format!(
                             "column {} type changed: Delta has {:?}, MariaDB has {:?}",
                             col.name,
@@ -310,6 +311,20 @@ fn schema_evolution_check(
     Ok(select_columns)
 }
 
+fn types_equivalent(delta_dt: &V57DataType, mariadb_dt: &V57DataType) -> bool {
+    match (delta_dt, mariadb_dt) {
+        (V57DataType::Timestamp(_, tz_a), V57DataType::Timestamp(_, tz_b)) => {
+            match (tz_a.as_deref(), tz_b.as_deref()) {
+                (Some("UTC"), Some("UTC")) | (None, None) => true,
+                (Some("UTC"), None) | (None, Some("UTC")) => true,
+                (a, b) => a == b,
+            }
+        }
+        _ => delta_dt == mariadb_dt,
+    }
+}
+
+#[derive(Debug)]
 pub enum ExitCode {
     Success = 0,
     PartialFailure = 1,
@@ -378,6 +393,9 @@ where
                 }
                 Err(e) => {
                     error!(table = table_name, error = %e, "table failed");
+                    for cause in e.chain() {
+                        error!(table = table_name, cause = %cause, "  caused by");
+                    }
                     failed += 1;
                     if let Err(se) = self.state_mgr.update_table(
                         table_name,

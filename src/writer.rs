@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use deltalake::arrow::array::{Array, Int64Array, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampSecondArray};
+use deltalake::arrow::array::{Array, Int64Array, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray};
 use deltalake::arrow::datatypes::{DataType, Schema as ArrowSchema, SchemaRef, TimeUnit};
 use deltalake::arrow::record_batch::RecordBatch;
 use deltalake::kernel::StructType;
@@ -99,9 +99,6 @@ impl DeltaWriter {
                 info!(table = table_name, "Creating new Delta table");
                 let delta_schema = arrow_schema_to_delta(&schema)?;
 
-                // NOTE: DeltaOps is deprecated in deltalake 0.31 in favor of
-                // DeltaTable::create(), but that API does not exist yet in 0.31.1.
-                // Replace with DeltaTable::create() when upgrading to deltalake 0.32+.
                 #[allow(deprecated)]
                 let table = deltalake::DeltaOps::try_from_url_with_storage_options(
                     url,
@@ -328,6 +325,18 @@ fn extract_timestamp_as_strings(col: &std::sync::Arc<dyn Array>) -> Option<Vec<S
                 })
                 .collect(),
         )
+    } else if let Some(ts) = col.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        Some(
+            (0..ts.len())
+                .map(|i| {
+                    if ts.is_null(i) {
+                        String::new()
+                    } else {
+                        nanos_to_string(ts.value(i))
+                    }
+                })
+                .collect(),
+        )
     } else {
         col.as_any()
             .downcast_ref::<StringArray>()
@@ -349,6 +358,12 @@ fn millis_to_string(millis: i64) -> String {
 
 fn secs_to_string(secs: i64) -> String {
     format_naive_datetime(secs, 0)
+}
+
+fn nanos_to_string(nanos: i64) -> String {
+    let secs = nanos / 1_000_000_000;
+    let subsec_nanos = (nanos % 1_000_000_000).unsigned_abs() as u32;
+    format_naive_datetime(secs, subsec_nanos)
 }
 
 fn format_naive_datetime(secs: i64, subsec_nanos: u32) -> String {
@@ -454,10 +469,14 @@ fn arrow_type_to_delta(dt: &DataType) -> Result<deltalake::kernel::DataType> {
         DataType::Utf8 | DataType::LargeUtf8 => Ok(D::STRING),
         DataType::Binary | DataType::LargeBinary => Ok(D::BINARY),
         DataType::Date32 | DataType::Date64 => Ok(D::DATE),
-        DataType::Timestamp(TimeUnit::Microsecond, _) => Ok(D::TIMESTAMP),
-        DataType::Timestamp(TimeUnit::Millisecond, _) => Ok(D::TIMESTAMP),
-        DataType::Timestamp(TimeUnit::Second, _) => Ok(D::TIMESTAMP),
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => Ok(D::TIMESTAMP),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => Ok(D::TIMESTAMP_NTZ),
+        DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => Ok(D::TIMESTAMP),
+        DataType::Timestamp(TimeUnit::Millisecond, None) => Ok(D::TIMESTAMP_NTZ),
+        DataType::Timestamp(TimeUnit::Millisecond, Some(_)) => Ok(D::TIMESTAMP),
+        DataType::Timestamp(TimeUnit::Second, None) => Ok(D::TIMESTAMP_NTZ),
+        DataType::Timestamp(TimeUnit::Second, Some(_)) => Ok(D::TIMESTAMP),
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => Ok(D::TIMESTAMP_NTZ),
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(_)) => Ok(D::TIMESTAMP),
         DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => {
             let scale_u8: u8 = (*s).try_into().context("invalid decimal scale")?;
             Ok(D::decimal(*p, scale_u8)?)
@@ -752,38 +771,37 @@ mod tests {
 
     #[test]
     fn arrow_type_to_delta_conversions() {
-        assert!(matches!(
-            arrow_type_to_delta(&DataType::Boolean),
-            Ok(deltalake::kernel::DataType::BOOLEAN)
-        ));
-        assert!(matches!(
-            arrow_type_to_delta(&DataType::Int32),
-            Ok(deltalake::kernel::DataType::INTEGER)
-        ));
-        assert!(matches!(
-            arrow_type_to_delta(&DataType::Int64),
-            Ok(deltalake::kernel::DataType::LONG)
-        ));
-        assert!(matches!(
-            arrow_type_to_delta(&DataType::Float32),
-            Ok(deltalake::kernel::DataType::FLOAT)
-        ));
-        assert!(matches!(
-            arrow_type_to_delta(&DataType::Float64),
-            Ok(deltalake::kernel::DataType::DOUBLE)
-        ));
-        assert!(matches!(
-            arrow_type_to_delta(&DataType::Utf8),
-            Ok(deltalake::kernel::DataType::STRING)
-        ));
-        assert!(matches!(
-            arrow_type_to_delta(&DataType::Date32),
-            Ok(deltalake::kernel::DataType::DATE)
-        ));
-        assert!(matches!(
-            arrow_type_to_delta(&DataType::Timestamp(TimeUnit::Microsecond, None)),
-            Ok(deltalake::kernel::DataType::TIMESTAMP)
-        ));
+        let r = arrow_type_to_delta(&DataType::Boolean);
+        assert!(r.is_ok());
+        assert_eq!(r.unwrap(), deltalake::kernel::DataType::BOOLEAN);
+
+        let r = arrow_type_to_delta(&DataType::Int32);
+        assert!(r.is_ok());
+        assert_eq!(r.unwrap(), deltalake::kernel::DataType::INTEGER);
+
+        let r = arrow_type_to_delta(&DataType::Int64);
+        assert!(r.is_ok());
+        assert_eq!(r.unwrap(), deltalake::kernel::DataType::LONG);
+
+        let r = arrow_type_to_delta(&DataType::Float32);
+        assert!(r.is_ok());
+        assert_eq!(r.unwrap(), deltalake::kernel::DataType::FLOAT);
+
+        let r = arrow_type_to_delta(&DataType::Float64);
+        assert!(r.is_ok());
+        assert_eq!(r.unwrap(), deltalake::kernel::DataType::DOUBLE);
+
+        let r = arrow_type_to_delta(&DataType::Utf8);
+        assert!(r.is_ok());
+        assert_eq!(r.unwrap(), deltalake::kernel::DataType::STRING);
+
+        let r = arrow_type_to_delta(&DataType::Date32);
+        assert!(r.is_ok());
+        assert_eq!(r.unwrap(), deltalake::kernel::DataType::DATE);
+
+        let ts_result = arrow_type_to_delta(&DataType::Timestamp(TimeUnit::Microsecond, None));
+        assert!(ts_result.is_ok());
+        assert_eq!(ts_result.unwrap(), deltalake::kernel::DataType::TIMESTAMP_NTZ);
     }
 
     #[test]
@@ -1111,28 +1129,35 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn arrow_type_to_delta_timestamp_millis() {
-        assert!(matches!(
-            arrow_type_to_delta(&DataType::Timestamp(TimeUnit::Millisecond, None)),
-            Ok(deltalake::kernel::DataType::TIMESTAMP)
-        ));
-    }
+
 
     #[test]
     fn arrow_type_to_delta_timestamp_second() {
-        assert!(matches!(
-            arrow_type_to_delta(&DataType::Timestamp(TimeUnit::Second, None)),
-            Ok(deltalake::kernel::DataType::TIMESTAMP)
-        ));
+        let result = arrow_type_to_delta(&DataType::Timestamp(TimeUnit::Second, None));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), deltalake::kernel::DataType::TIMESTAMP_NTZ);
     }
 
     #[test]
+    fn arrow_type_to_delta_timestamp_micros() {
+        let result = arrow_type_to_delta(&DataType::Timestamp(TimeUnit::Microsecond, None));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), deltalake::kernel::DataType::TIMESTAMP_NTZ);
+    }
+
+    #[test]
+    fn arrow_type_to_delta_timestamp_millis() {
+        let result = arrow_type_to_delta(&DataType::Timestamp(TimeUnit::Millisecond, None));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), deltalake::kernel::DataType::TIMESTAMP_NTZ);
+    }
+
+
+    #[test]
     fn arrow_type_to_delta_timestamp_nanos() {
-        assert!(matches!(
-            arrow_type_to_delta(&DataType::Timestamp(TimeUnit::Nanosecond, None)),
-            Ok(deltalake::kernel::DataType::TIMESTAMP)
-        ));
+        let result = arrow_type_to_delta(&DataType::Timestamp(TimeUnit::Nanosecond, None));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), deltalake::kernel::DataType::TIMESTAMP_NTZ);
     }
 
     #[test]

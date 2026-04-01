@@ -34,10 +34,9 @@ impl SchemaInspector {
         Self { pool, database }
     }
 
-    // TODO(task-12): integration tests with real MariaDB
     pub async fn discover_columns(&self, table: &str) -> Result<Vec<ColumnInfo>> {
         let rows: Vec<MySqlColumnRow> = sqlx::query_as(
-            "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE FROM information_schema.columns WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION"
+            "SELECT COLUMN_NAME AS column_name, DATA_TYPE AS data_type, COLUMN_TYPE AS column_type FROM information_schema.columns WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION"
         )
         .bind(&self.database)
         .bind(table)
@@ -62,10 +61,9 @@ impl SchemaInspector {
         Ok(columns)
     }
 
-    // TODO(task-12): integration tests with real MariaDB
     pub async fn get_avg_row_length(&self, table: &str) -> Result<Option<u64>> {
         let row: Option<MySqlAvgRowRow> = sqlx::query_as(
-            "SELECT AVG_ROW_LENGTH FROM information_schema.tables WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?"
+            "SELECT AVG_ROW_LENGTH AS avg_row_length FROM information_schema.tables WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?"
         )
         .bind(&self.database)
         .bind(table)
@@ -76,13 +74,12 @@ impl SchemaInspector {
         match row {
             Some(r) => match r.avg_row_length {
                 0 => Ok(None),
-                v => Ok(Some(v as u64)),
+                v => Ok(Some(v)),
             },
             None => Ok(None),
         }
     }
 
-    // TODO(task-12): integration tests with real MariaDB
     pub async fn check_updated_at_index(&self, table: &str) -> Result<bool> {
         let row: Option<(i64,)> = sqlx::query_as(
             "SELECT COUNT(*) FROM information_schema.statistics WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = 'updated_at'"
@@ -161,7 +158,7 @@ struct MySqlColumnRow {
 
 #[derive(Debug, sqlx::FromRow)]
 struct MySqlAvgRowRow {
-    avg_row_length: i64,
+    avg_row_length: u64,
 }
 
 #[cfg(test)]

@@ -27,6 +27,8 @@ sha2 = "0.10"
 url = "2.5.8"
 
 [dev-dependencies]
+aws-sdk-s3 = "1"
+futures = "0.3"
 mockall = "0.14"
 serial_test = "3"
 tempfile = "3"

@@ -117,9 +117,11 @@ connector-x is pinned to arrow v54 with no upgrade path. Add **additional standa
 
 ## 12. Integration & End-to-End
 
-- [ ] 12.1 Wire all modules together in `main.rs`: load config → init tracing → init sqlx pool → create orchestrator → run
-- [ ] 12.2 Write integration tests using testcontainers (MariaDB + MinIO): incremental table extraction, full_refresh table extraction, graceful shutdown via SIGTERM, crash recovery (HWM correct after restart), schema evolution (add column → warn+skip)
-- [ ] 12.3 Verify: `cargo build && cargo clippy -- -D warnings && cargo test`
+- [x] 12.1 Wire all modules together in `main.rs`: load config → init tracing → init sqlx pool → create orchestrator → run
+- [x] 12.2 Write integration tests using testcontainers (MariaDB + MinIO): incremental table extraction, full_refresh table extraction, graceful shutdown via SIGTERM, crash recovery (HWM correct after restart), schema evolution (add column → warn+skip)
+- [x] 12.3 Verify: `cargo build && cargo clippy -- -D warnings && cargo test`
+- [x] 12.4 Create `docs/integration.md` reflection document: planned vs actual, bugs found, design decisions, lessons learned (process documented in `docs/integration-exploration.md` Checkpoint K)
+- [x] 12.5 Create `examples/standalone_pipeline.rs`: standalone runnable example that translates integration tests into a single application with embedded SQL data, writes real Delta Lake parquet files to local filesystem, verifies FullRefresh + Incremental+HWM scenarios without Docker)
 
 ## 13. Coverage Gate
 

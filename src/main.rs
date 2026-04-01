@@ -1,22 +1,14 @@
-#[allow(dead_code)]
-mod config;
-#[allow(dead_code)]
-mod discovery;
-#[allow(dead_code)]
-mod extractor;
-#[allow(dead_code)]
-mod orchestrator;
-#[allow(dead_code)]
-mod query;
-#[allow(dead_code)]
-mod state;
-#[allow(dead_code)]
-mod writer;
+use std::path::PathBuf;
+
+use parket::config;
+use parket::orchestrator::{
+    DeltaWriterAdapter, ExtractorAdapter, Orchestrator, SchemaInspectorAdapter,
+    SignalHandler, StateManageAdapter,
+};
 
 fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("parket=info"));
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("parket=info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
@@ -27,9 +19,59 @@ fn init_tracing() {
         .init();
 }
 
-fn main() {
+fn extract_database_name(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| {
+            u.path_segments()
+                .and_then(|mut s| s.next_back().map(|s| s.to_string()))
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::main]
+async fn main() {
     init_tracing();
-    println!("Hello, world!");
+
+    let config = match config::Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("configuration error: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    let pool = match sqlx::MySqlPool::connect(&config.database_url).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("database connection error: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    let database = extract_database_name(&config.database_url);
+
+    let schema_inspect = SchemaInspectorAdapter::new(pool, database);
+    let extractor = ExtractorAdapter::new(&config);
+    let writer = DeltaWriterAdapter::new(&config);
+    let state_mgr = StateManageAdapter::new();
+
+    let (signal_handler, shutdown_rx) = SignalHandler::new();
+    signal_handler.install().await;
+
+    let state_path = PathBuf::from("state.json");
+    let mut orchestrator = Orchestrator::new(
+        config,
+        schema_inspect,
+        extractor,
+        writer,
+        state_mgr,
+        shutdown_rx,
+        state_path,
+    );
+
+    let exit_code = orchestrator.run().await;
+    std::process::exit(exit_code as i32);
 }
 
 #[cfg(test)]

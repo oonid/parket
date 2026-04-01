@@ -13,14 +13,11 @@ use deltalake::arrow::datatypes::{
 };
 use deltalake::arrow::record_batch::RecordBatch as V57RecordBatch;
 
-const DEFAULT_BATCH_SIZE: u64 = 10000;
-
 pub trait CxStreamer {
     fn prepare(&mut self);
     fn next_batch(&mut self) -> Option<RecordBatch>;
 }
 
-// TODO(task-12.2): integration tests with real MariaDB covering DefaultCxStreamer + extract()
 struct DefaultCxStreamer {
     inner: Box<dyn RecordBatchIterator>,
 }

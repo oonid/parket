@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::{bail, Context, Result};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Config {
     pub database_url: String,
     pub s3_bucket: String,
