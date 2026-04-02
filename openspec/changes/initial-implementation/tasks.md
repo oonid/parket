@@ -131,13 +131,13 @@ connector-x is pinned to arrow v54 with no upgrade path. Add **additional standa
 
 ## 14. CI/CD & Release Pipeline
 
-- [ ] 14.1 Create `.github/workflows/ci.yml`: checkout → install toolchain (from rust-toolchain.toml) + llvm-tools-preview → cargo test → cargo clippy -- -D warnings → cargo llvm-cov --fail-under-lines 90 → upload coverage report artifact
-- [ ] 14.2 Create `.github/workflows/release.yml` (trigger on `v*` tag): build 4 cross-compiled targets (x86_64-musl, aarch64-musl, x86_64-gnu, aarch64-gnu) using `cross` → generate SHA256 checksums → create GitHub Release with binaries + checksums
-- [ ] 14.3 Add GHCR publish job to `release.yml`: multi-arch Docker build (linux/amd64, linux/arm64) → push to `ghcr.io/<OWNER>/parket:latest` and `ghcr.io/<OWNER>/parket:<version>`
-- [ ] 14.4 Create `Dockerfile`: multi-stage build — `rust:alpine` builder stage (musl target) → `alpine:latest` runtime stage with binary at `/usr/local/bin/parket`
-- [ ] 14.5 Document: create `docs/ci-cd.md` with workflow descriptions, release process, Docker usage, and multi-arch build details
-- [ ] 14.6 Verify: `docker build .` succeeds locally
-- [ ] 14.7 Verify: `cargo build && cargo clippy -- -D warnings && cargo test && cargo llvm-cov --fail-under-lines 90`
+- [x] 14.1 Create `.github/workflows/ci.yml`: checkout → install toolchain (from rust-toolchain.toml) + llvm-tools-preview → cargo test → cargo clippy -- -D warnings → cargo llvm-cov --fail-under-lines 90 → upload coverage report artifact
+- [x] 14.2 Create `.github/workflows/release.yml` (trigger on `v*` tag): build 4 cross-compiled targets (x86_64-musl, aarch64-musl, x86_64-gnu, aarch64-gnu) using `cross` → generate SHA256 checksums → create GitHub Release with binaries + checksums
+- [x] 14.3 Add GHCR publish job to `release.yml`: multi-arch Docker build (linux/amd64, linux/arm64) → push to `ghcr.io/<OWNER>/parket:latest` and `ghcr.io/<OWNER>/parket:<version>`
+- [x] 14.4 Create `Dockerfile`: multi-stage build — `rust:alpine` builder stage (musl target) → `alpine:latest` runtime stage with binary at `/usr/local/bin/parket`
+- [x] 14.5 Document: create `docs/ci-cd.md` with workflow descriptions, release process, Docker usage, and multi-arch build details
+- [x] 14.6 Verify: `docker build .` succeeds locally
+- [x] 14.7 Verify: `cargo build && cargo clippy -- -D warnings && cargo test && cargo llvm-cov --fail-under-lines 90`
 
 ## 15. Project Documentation Consolidation
 
