@@ -178,6 +178,7 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use tracing::{info, debug, error};
     use tracing_subscriber::EnvFilter;
 
