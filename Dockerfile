@@ -1,6 +1,6 @@
 FROM rust:1.92-alpine AS builder
 
-RUN apk add --no-cache build-base pkgconf zlib-dev zlib-static mariadb-connector-c-dev
+RUN apk add --no-cache build-base pkgconf perl zlib-dev zlib-static mariadb-connector-c-dev
 
 WORKDIR /app
 
