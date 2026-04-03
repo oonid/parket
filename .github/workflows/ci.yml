@@ -17,6 +17,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghcActions
+          sudo apt-get clean
+          df -h /
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -28,21 +34,20 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Build
-        run: cargo build
-
-      - name: Test
+      - name: Build and test
         run: cargo test
 
       - name: Clippy
         run: cargo clippy -- -D warnings
+
+      - name: Clean uninstrumented build artifacts
+        run: cargo clean
 
       - name: Coverage
         run: cargo llvm-cov --fail-under-lines 90
