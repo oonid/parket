@@ -95,10 +95,9 @@ jobs:
 
       - name: Rename binaries for Dockerfile
         run: |
-          mkdir -p docker-artifacts
-          mv artifacts/parket-x86_64-unknown-linux-musl docker-artifacts/parket-amd64-unknown-linux-musl
-          mv artifacts/parket-aarch64-unknown-linux-musl docker-artifacts/parket-arm64-unknown-linux-musl
-          chmod +x docker-artifacts/parket-*
+          mv artifacts/parket-x86_64-unknown-linux-musl artifacts/parket-amd64-unknown-linux-musl
+          mv artifacts/parket-aarch64-unknown-linux-musl artifacts/parket-arm64-unknown-linux-musl
+          chmod +x artifacts/parket-*
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
