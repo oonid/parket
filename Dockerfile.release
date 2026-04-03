@@ -1,0 +1,11 @@
+FROM --platform=$BUILDPLATFORM alpine:latest
+
+ARG TARGETARCH
+ARG BINARY_NAME=parket
+
+RUN apk add --no-cache ca-certificates mariadb-connector-c
+
+COPY artifacts/parket-${TARGETARCH}-unknown-linux-musl /usr/local/bin/parket
+RUN chmod +x /usr/local/bin/parket
+
+ENTRYPOINT ["parket"]
