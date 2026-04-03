@@ -203,6 +203,65 @@ impl DeltaWrite for DeltaWriterAdapter {
     }
 }
 
+
+pub struct LocalDeltaWriterAdapter {
+    inner: DeltaWriter,
+}
+
+impl LocalDeltaWriterAdapter {
+    pub fn new(dir: &Path) -> Self {
+        Self {
+            inner: DeltaWriter::new_local(&dir.to_string_lossy()),
+        }
+    }
+}
+
+impl DeltaWrite for LocalDeltaWriterAdapter {
+    async fn ensure_table(&self, table_name: &str, schema: V57SchemaRef) -> Result<()> {
+        self.inner.ensure_table(table_name, schema).await?;
+        Ok(())
+    }
+
+    async fn append_batch(
+        &self,
+        table_name: &str,
+        batches: Vec<V57RecordBatch>,
+        hwm: Option<Hwm>,
+    ) -> Result<()> {
+        self.inner
+            .append_batch(table_name, batches, hwm.as_ref())
+            .await
+    }
+
+    async fn overwrite_table(
+        &self,
+        table_name: &str,
+        batches: Vec<V57RecordBatch>,
+        hwm: Option<Hwm>,
+    ) -> Result<()> {
+        self.inner
+            .overwrite_table(table_name, batches, hwm.as_ref())
+            .await
+    }
+
+    async fn read_hwm(&self, table_name: &str) -> Result<Option<Hwm>> {
+        self.inner.read_hwm(table_name).await
+    }
+
+    async fn get_schema(&self, table_name: &str) -> Result<Option<V57SchemaRef>> {
+        match self.inner.open_table(table_name).await {
+            Ok(table) => {
+                let kernel_schema = table.snapshot()?.schema();
+                let arrow_schema: deltalake::arrow::datatypes::Schema =
+                    deltalake::kernel::engine::arrow_conversion::TryIntoArrow::try_into_arrow(
+                        kernel_schema.as_ref(),
+                    )?;
+                Ok(Some(Arc::new(arrow_schema)))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+}
 fn column_info_to_v57_schema(columns: &[ColumnInfo]) -> Result<V57SchemaRef> {
     let fields: Result<Vec<V57Field>> = columns
         .iter()
@@ -339,6 +398,7 @@ pub struct Orchestrator<S, E, W, M> {
     state_mgr: M,
     shutdown: watch::Receiver<bool>,
     state_path: PathBuf,
+    progress: bool,
 }
 
 impl<S, E, W, M> Orchestrator<S, E, W, M>
@@ -348,6 +408,7 @@ where
     W: DeltaWrite + Send + Sync,
     M: StateManage + Send,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
         schema_inspect: S,
@@ -356,6 +417,7 @@ where
         state_mgr: M,
         shutdown: watch::Receiver<bool>,
         state_path: PathBuf,
+        progress: bool,
     ) -> Self {
         Self {
             config,
@@ -365,6 +427,7 @@ where
             state_mgr,
             shutdown,
             state_path,
+            progress,
         }
     }
 
@@ -499,6 +562,7 @@ where
     ) -> Result<u64> {
         let mut current_hwm = self.writer.read_hwm(table_name).await?;
         let mut total_rows = 0u64;
+        let mut batch_index: u64 = 0;
 
         loop {
             if self.check_shutdown() {
@@ -527,12 +591,8 @@ where
 
             let batch_rows: u64 = v54_batches.iter().map(|b| b.num_rows() as u64).sum();
             let arrow_bytes: usize = v54_batches.iter().map(|b| b.get_array_memory_size()).sum();
-            info!(
-                table = table_name,
-                rows = batch_rows,
-                arrow_bytes,
-                "batch extracted"
-            );
+            let batch_start = Instant::now();
+
             let v57_batches = convert_batches(v54_batches)?;
             let batch_hwm = v57_batches
                 .last()
@@ -547,6 +607,29 @@ where
                 current_hwm = Some(h);
             }
             total_rows += batch_rows;
+            batch_index += 1;
+
+            let batch_elapsed = batch_start.elapsed();
+
+            if self.progress {
+                let cumulative_rows = total_rows;
+                info!(
+                    table = table_name,
+                    batch_index,
+                    rows = batch_rows,
+                    cumulative_rows,
+                    arrow_bytes,
+                    batch_duration_ms = batch_elapsed.as_millis(),
+                    "batch progress"
+                );
+            } else {
+                info!(
+                    table = table_name,
+                    rows = batch_rows,
+                    arrow_bytes,
+                    "batch extracted"
+                );
+            }
 
             if batch_rows < batch_size {
                 break;
@@ -729,6 +812,7 @@ mod tests {
             state_mock,
             rx,
             state_path,
+            false,
         )
     }
 
@@ -1007,6 +1091,7 @@ mod tests {
             state_mock,
             rx,
             dir.path().to_path_buf(),
+            false,
         );
         let result = orch.run().await;
         assert!(matches!(result, ExitCode::Success));
@@ -1907,6 +1992,7 @@ mod tests {
             state_mock,
             rx,
             dir.path().to_path_buf(),
+            false,
         );
 
         tx.send(true).unwrap();
@@ -1993,6 +2079,7 @@ mod tests {
             state_mock,
             rx,
             dir.path().to_path_buf(),
+            false,
         );
 
         let result = orch.run().await;
@@ -2019,5 +2106,89 @@ mod tests {
     fn signal_handler_watch_channel_starts_false() {
         let (_handler, rx) = SignalHandler::new();
         assert!(!*rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn progress_flag_emits_detailed_logs() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config(vec!["orders".to_string()]);
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        extract_mock
+            .expect_batch_size()
+            .returning(|| 1);
+        writer_mock
+            .expect_ensure_table()
+            .returning(|_, _| Ok(()));
+        writer_mock
+            .expect_get_schema()
+            .returning(|_| Ok(None));
+        writer_mock
+            .expect_read_hwm()
+            .returning(|_| Ok(None));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        extract_mock
+            .expect_extract()
+            .returning(move |_| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                        arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+                        arrow::datatypes::Field::new(
+                            "updated_at",
+                            arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                            false,
+                        ),
+                    ]));
+                    let batch = RecordBatch::try_new(
+                        schema,
+                        vec![
+                            Arc::new(arrow::array::Int64Array::from(vec![1i64])),
+                            Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![1743158400000000i64])),
+                        ],
+                    )
+                    .unwrap();
+                    Ok(vec![batch])
+                } else {
+                    Ok(vec![])
+                }
+            });
+        writer_mock
+            .expect_append_batch()
+            .returning(|_, _, _| Ok(()));
+        state_mock
+            .expect_update_table()
+            .returning(|_, _, _| Ok(()));
+
+        let (_tx, rx) = watch::channel(false);
+        let mut orch = Orchestrator::new(
+            config,
+            schema_mock,
+            extract_mock,
+            writer_mock,
+            state_mock,
+            rx,
+            dir.path().to_path_buf(),
+            true,
+        );
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success));
     }
 }

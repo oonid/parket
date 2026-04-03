@@ -12,10 +12,12 @@
 //!
 //! No public API stability is implied — this is purely an internal structuring choice.
 
+pub mod cli;
 pub mod config;
 pub mod discovery;
 pub mod extractor;
 pub mod orchestrator;
+pub mod preflight;
 pub mod query;
 pub mod state;
 pub mod writer;

@@ -152,6 +152,7 @@ impl TestEnv {
             state_mgr,
             shutdown_rx,
             self.state_path(),
+            false,
         )
     }
 

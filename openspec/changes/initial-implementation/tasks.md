@@ -139,11 +139,29 @@ connector-x is pinned to arrow v54 with no upgrade path. Add **additional standa
 - [x] 14.6 Verify: `docker build .` succeeds locally
 - [x] 14.7 Verify: `cargo build && cargo clippy -- -D warnings && cargo test && cargo llvm-cov --fail-under-lines 90`
 
-## 15. Project Documentation Consolidation
+## 15. CLI
 
-- [ ] 15.1 Create `README.md` at project root: project overview, quickstart guide, usage examples (one-shot binary, Docker), build instructions, configuration summary, and links to all `docs/` files
-- [ ] 15.2 Create `docs/architecture.md`: high-level architecture, data flow diagram (text-based), module responsibilities, key design decisions summary (cross-referencing design.md), and dependency graph
-- [ ] 15.3 Create `docs/configuration.md`: complete env var reference (all required + optional), defaults table, per-table override examples, S3/MinIO setup guide, and troubleshooting common config errors
-- [ ] 15.4 Create `docs/contributing.md`: development setup (rustup, llvm-cov, Docker), TDD workflow (red-green-refactor cycle), PR checklist (tests pass, clippy clean, coverage >90%, docs updated), CI expectations, and commit message conventions
-- [ ] 15.5 Review all `docs/*.md` files for consistency, cross-link correctness, and completeness against specs
-- [ ] 15.6 Verify: all documentation files exist, README.md links are valid, no placeholder content remains
+- [x] 15.1 Add `clap` dependency (with `derive` feature) to `Cargo.toml`; define `Cli` struct with `--version` (from Cargo.toml), `--check`, and default run mode; wire into `main.rs` — `parket` runs normally, `parket --check` validates without extracting, `parket --version` prints version, `parket --help` is self-documenting
+- [x] 15.2 Implement `--check` / pre-flight mode: connect to DB → verify all configured tables exist in `information_schema` → connect to S3 → verify bucket is writable (write + delete a tiny test object) → print per-table mode detection summary (table name, detected mode, columns count, AVG_ROW_LENGTH) → exit 0 if all OK, exit 2 on any failure
+- [x] 15.3 Implement startup banner: log `parket v{version} starting` at INFO with table count, database host (masked), and S3 bucket name — runs on every normal invocation (not in `--check`)
+- [x] 15.4 Implement config display sanitization: add `Config::display_safe()` method that returns a summary string with `DATABASE_URL` password masked (`mysql://user:****@host/db`) and `S3_SECRET_ACCESS_KEY` masked; replace any direct `Debug` formatting of `Config` in log output with this safe display
+- [x] 15.5 Add `--progress` CLI flag; when set, emit per-batch structured INFO logs with table name, batch index, rows in batch, cumulative rows, arrow bytes, and batch duration — test Cli parsing and that flag propagates to orchestrator extraction loop
+- [x] 15.6 Add `--local <dir>` CLI flag: when set, skip all S3/MinIO — write Delta Lake files to local filesystem instead. Branches: `cli.rs` adds arg, `config.rs` relaxes S3 credential validation when local mode, `main.rs` uses `DeltaWriter::new_local(dir)` instead of `DeltaWriterAdapter::new(&config)`, `preflight.rs` skips S3 connectivity check, `orchestrator.rs` accepts local writer. Delta Lake on local FS is already supported via `DeltaWriter::new_local()` (used in tests). Update `.env.example` with `--local` usage note.
+- [x] 15.7 Write unit tests for: `--local` CLI parsing, config skips S3 validation in local mode, preflight skips S3 check in local mode, orchestrator works with local writer, local writer produces valid Delta table on disk; Cli arg parsing (--check, --version, --progress, default), `Config::display_safe()` masking, pre-flight check success/failure paths (mocked DB + S3), startup banner output
+- [x] 15.8 Document: update `docs/config.md` with `--local <dir>` usage, CLI usage (`--check`, `--version`, `--progress`, `--help`), startup banner format, `--check` output examples; update `AGENTS.md` CLI flags table
+- [x] 15.9 Verify: `cargo build && cargo clippy -- -D warnings && cargo test && cargo llvm-cov --lib --fail-under-lines 90`
+- [x] 15.10 Create `AGENTS.md` at project root: comprehensive guide for AI coding agents covering build/lint/test commands, project conventions, module overview with public API surface, testing patterns, CI expectations, and key design decisions
+
+## 16. Real-World Data Compatibility
+
+- [ ] 16.1 Add missing MariaDB text subtypes (`tinytext`, `mediumtext`, `longtext`) and binary subtypes (`tinyblob`, `mediumblob`, `longblob`) to `mariadb_type_to_arrow()` in `orchestrator.rs` — all map to `Utf8` (text) or `Binary` (blob) respectively; add unit tests for each new type; verify `cargo build && cargo clippy -- -D warnings && cargo test --lib && cargo llvm-cov --lib --fail-under-lines 90`
+- [ ] 16.2 Fix relative path handling in `--local` mode: `Url::from_directory_path()` in `writer.rs` requires an absolute path, but `--local ./output` passes a relative path causing "invalid local path" error — absolutize the path in `DeltaWriter::new_local()` (or in `LocalDeltaWriterAdapter::new()` in `orchestrator.rs`) using `std::fs::canonicalize()` or `std::path::absolute()`; add tests for relative and absolute local paths; verify full test suite passes
+
+## 17. Project Documentation Consolidation
+
+- [ ] 17.1 Create `README.md` at project root: project overview, quickstart guide, usage examples (one-shot binary, Docker, `--check`), build instructions, configuration summary, and links to all `docs/` files
+- [ ] 17.2 Create `docs/architecture.md`: high-level architecture, data flow diagram (text-based), module responsibilities, key design decisions summary (cross-referencing design.md), and dependency graph
+- [ ] 17.3 Create `docs/configuration.md`: complete env var reference (all required + optional), defaults table, per-table override examples, S3/MinIO setup guide, and troubleshooting common config errors
+- [ ] 17.4 Create `docs/contributing.md`: development setup (rustup, llvm-cov, Docker), TDD workflow (red-green-refactor cycle), PR checklist (tests pass, clippy clean, coverage >90%, docs updated), CI expectations, and commit message conventions
+- [ ] 17.5 Review all `docs/*.md` files for consistency, cross-link correctness, and completeness against specs
+- [ ] 17.6 Verify: all documentation files exist, README.md links are valid, no placeholder content remains

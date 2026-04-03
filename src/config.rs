@@ -88,6 +88,81 @@ impl Config {
             table_modes,
         })
     }
+
+    pub fn load_local() -> Result<Self> {
+        let _ = dotenvy::dotenv();
+
+        let database_url = env("DATABASE_URL")?;
+        let tables_raw = env("TABLES")?;
+        let target_memory_mb_raw = env("TARGET_MEMORY_MB")?;
+
+        validate_database_url(&database_url)?;
+
+        let tables = parse_tables(&tables_raw)?;
+        if tables.is_empty() {
+            bail!("TABLES must not be empty");
+        }
+
+        let target_memory_mb: u64 = target_memory_mb_raw
+            .parse()
+            .context("TARGET_MEMORY_MB must be a positive integer")?;
+        if target_memory_mb == 0 {
+            bail!("TARGET_MEMORY_MB must be greater than 0");
+        }
+
+        let s3_endpoint = std::env::var("S3_ENDPOINT").ok().filter(|s| !s.is_empty());
+        let s3_region = std::env::var("S3_REGION")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "us-east-1".to_string());
+        let s3_prefix = std::env::var("S3_PREFIX")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "parket".to_string());
+        let default_batch_size: u64 = std::env::var("DEFAULT_BATCH_SIZE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse())
+            .transpose()
+            .context("DEFAULT_BATCH_SIZE must be a positive integer")?
+            .unwrap_or(10000);
+        let rust_log = std::env::var("RUST_LOG")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "info".to_string());
+
+        let table_modes = parse_table_modes(&tables);
+
+        Ok(Self {
+            database_url,
+            s3_bucket: String::new(),
+            s3_access_key_id: String::new(),
+            s3_secret_access_key: String::new(),
+            tables,
+            target_memory_mb,
+            s3_endpoint,
+            s3_region,
+            s3_prefix,
+            default_batch_size,
+            rust_log,
+            table_modes,
+        })
+    }
+
+    pub fn display_safe(&self) -> String {
+        let masked_url = mask_database_url(&self.database_url);
+        let masked_secret = mask_secret(&self.s3_secret_access_key);
+        let tables_joined = self.tables.join(", ");
+        format!(
+            "database_url={masked_url} s3_bucket={} s3_access_key_id={} s3_secret_access_key={masked_secret} tables=[{tables_joined}] target_memory_mb={} s3_region={} s3_prefix={} default_batch_size={}",
+            self.s3_bucket,
+            self.s3_access_key_id,
+            self.target_memory_mb,
+            self.s3_region,
+            self.s3_prefix,
+            self.default_batch_size,
+        )
+    }
 }
 
 fn env(key: &str) -> Result<String> {
@@ -129,6 +204,33 @@ fn parse_table_modes(tables: &[String]) -> HashMap<String, ExtractionMode> {
         }
     }
     modes
+}
+
+pub fn mask_database_url(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .map(|u| {
+            let scheme = u.scheme();
+            let host = u.host_str().unwrap_or("unknown");
+            let port = u.port().map_or(String::new(), |p| format!(":{p}"));
+            if u.password().is_some() {
+                format!("{scheme}://****:****@{host}{port}")
+            } else if !u.username().is_empty() {
+                format!("{scheme}://{}@{host}{port}", u.username())
+            } else {
+                format!("{scheme}://{host}{port}")
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+pub fn mask_secret(secret: &str) -> String {
+    if secret.len() <= 4 {
+        "****".to_string()
+    } else {
+        let visible = &secret[secret.len() - 4..];
+        format!("****{visible}")
+    }
 }
 
 #[cfg(test)]
@@ -568,5 +670,204 @@ mod tests {
             Some(&ExtractionMode::FullRefresh)
         );
         assert_eq!(config.table_modes.get("products"), None);
+    }
+
+    #[test]
+    #[serial]
+    fn display_safe_masks_password_in_database_url() {
+        clear_config_env();
+        set_required_vars();
+        let config = Config::load().expect("load should succeed");
+        let display = config.display_safe();
+        assert!(
+            !display.contains("pass"),
+            "display_safe should mask password, got: {display}"
+        );
+        assert!(
+            display.contains("****:****"),
+            "display_safe should show masked credentials, got: {display}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn display_safe_masks_s3_secret_key() {
+        clear_config_env();
+        set_required_vars();
+        let config = Config::load().expect("load should succeed");
+        let display = config.display_safe();
+        assert!(
+            !display.contains("minioadmin") || display.contains("****"),
+            "display_safe should mask S3 secret, got: {display}"
+        );
+    }
+
+    #[test]
+    fn mask_database_url_with_password() {
+        let masked = mask_database_url("mysql://admin:s3cret@dbhost.example.com:3306/mydb");
+        assert_eq!(masked, "mysql://****:****@dbhost.example.com:3306");
+    }
+
+    #[test]
+    fn mask_database_url_without_password() {
+        let masked = mask_database_url("mysql://admin@dbhost.example.com:3306/mydb");
+        assert_eq!(masked, "mysql://admin@dbhost.example.com:3306");
+    }
+
+    #[test]
+    fn mask_database_url_no_credentials() {
+        let masked = mask_database_url("mysql://dbhost.example.com:3306/mydb");
+        assert_eq!(masked, "mysql://dbhost.example.com:3306");
+    }
+
+    #[test]
+    fn mask_database_url_invalid() {
+        let masked = mask_database_url("not-a-url");
+        assert_eq!(masked, "unknown");
+    }
+
+    #[test]
+    fn mask_database_url_no_port() {
+        let masked = mask_database_url("mysql://user:pass@dbhost/mydb");
+        assert_eq!(masked, "mysql://****:****@dbhost");
+    }
+
+    #[test]
+    fn mask_secret_short_value() {
+        assert_eq!(mask_secret("ab"), "****");
+    }
+
+    #[test]
+    fn mask_secret_exact_four_chars() {
+        assert_eq!(mask_secret("abcd"), "****");
+    }
+
+    #[test]
+    fn mask_secret_long_value() {
+        assert_eq!(mask_secret("mysecretkey123"), "****y123");
+    }
+
+    #[test]
+    fn mask_secret_five_chars() {
+        assert_eq!(mask_secret("abcde"), "****bcde");
+    }
+
+    #[test]
+    #[serial]
+    fn load_local_succeeds_without_s3_vars() {
+        clear_config_env();
+        unsafe {
+            env::set_var("DATABASE_URL", "mysql://user:pass@host:3306/dbname");
+            env::set_var("TABLES", "orders,customers");
+            env::set_var("TARGET_MEMORY_MB", "256");
+        }
+
+        let config = Config::load_local().expect("load_local should succeed without S3 vars");
+        assert_eq!(config.database_url, "mysql://user:pass@host:3306/dbname");
+        assert_eq!(config.tables, vec!["orders", "customers"]);
+        assert_eq!(config.target_memory_mb, 256);
+        assert!(config.s3_bucket.is_empty());
+        assert!(config.s3_access_key_id.is_empty());
+        assert!(config.s3_secret_access_key.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn load_local_fails_without_database_url() {
+        clear_config_env();
+        unsafe {
+            env::set_var("TABLES", "orders");
+            env::set_var("TARGET_MEMORY_MB", "512");
+        }
+
+        let result = Config::load_local();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn load_local_fails_without_tables() {
+        clear_config_env();
+        unsafe {
+            env::set_var("DATABASE_URL", "mysql://user:pass@host:3306/dbname");
+            env::set_var("TARGET_MEMORY_MB", "512");
+        }
+
+        let result = Config::load_local();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn load_local_fails_without_target_memory() {
+        clear_config_env();
+        unsafe {
+            env::set_var("DATABASE_URL", "mysql://user:pass@host:3306/dbname");
+            env::set_var("TABLES", "orders");
+        }
+
+        let result = Config::load_local();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn load_local_fails_with_wrong_scheme() {
+        clear_config_env();
+        unsafe {
+            env::set_var("DATABASE_URL", "postgres://user:pass@host:5432/db");
+            env::set_var("TABLES", "orders");
+            env::set_var("TARGET_MEMORY_MB", "512");
+        }
+
+        let result = Config::load_local();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn load_local_fails_with_zero_memory() {
+        clear_config_env();
+        unsafe {
+            env::set_var("DATABASE_URL", "mysql://user:pass@host:3306/dbname");
+            env::set_var("TABLES", "orders");
+            env::set_var("TARGET_MEMORY_MB", "0");
+        }
+
+        let result = Config::load_local();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn load_local_ignores_s3_vars_if_set() {
+        clear_config_env();
+        unsafe {
+            env::set_var("DATABASE_URL", "mysql://user:pass@host:3306/dbname");
+            env::set_var("TABLES", "orders");
+            env::set_var("TARGET_MEMORY_MB", "128");
+            env::set_var("S3_BUCKET", "should-be-ignored");
+        }
+
+        let config = Config::load_local().expect("load_local should succeed");
+        assert!(config.s3_bucket.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn load_local_uses_optional_defaults() {
+        clear_config_env();
+        unsafe {
+            env::set_var("DATABASE_URL", "mysql://user:pass@host:3306/dbname");
+            env::set_var("TABLES", "orders");
+            env::set_var("TARGET_MEMORY_MB", "512");
+        }
+
+        let config = Config::load_local().expect("load_local should succeed");
+        assert_eq!(config.s3_region, "us-east-1");
+        assert_eq!(config.s3_prefix, "parket");
+        assert_eq!(config.default_batch_size, 10000);
+        assert_eq!(config.rust_log, "info");
+        assert!(config.s3_endpoint.is_none());
     }
 }

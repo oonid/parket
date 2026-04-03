@@ -59,6 +59,89 @@ Parket validates configuration at startup and exits with code 2 on any failure:
 
 Error messages identify the specific missing or invalid variable.
 
+## CLI Usage
+
+```
+parket                    Run the extractor (default mode)
+parket --check            Validate config and connectivity without extracting
+parket --progress         Emit per-batch progress logs with timing and row counts
+parket --local <dir>      Write Delta Lake files to local directory instead of S3
+parket --version          Print version
+parket --help             Show help
+```
+
+### `--check` (Pre-flight Mode)
+
+Connects to the database and S3 bucket, verifies all configured tables exist in `information_schema`, checks S3 writability (write + delete a tiny test object), and prints a per-table mode detection summary:
+
+```
+TABLE                           MODE            COLUMNS    AVG_ROW_LEN
+orders                          incremental     5          128
+products                        full_refresh    3          N/A
+pre-flight check passed
+```
+
+Exits with code 0 if all OK, code 2 on any failure. No data is extracted.
+
+When combined with `--local`, the S3 connectivity check is skipped (only database connectivity and table discovery are validated).
+
+### `--local <dir>` (Local Mode)
+
+Writes Delta Lake files to a local directory instead of S3. When set:
+
+- S3 credentials (`S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`) are **not required** and ignored if present.
+- `Config::load_local()` is used instead of `Config::load()`, so validation only requires `DATABASE_URL`, `TABLES`, and `TARGET_MEMORY_MB`.
+- Pre-flight (`--check`) skips the S3 writability check.
+- The orchestrator uses `DeltaWriter::new_local(dir)` to write Delta tables on the local filesystem.
+
+```
+parket --local /data/delta
+parket --local ./output --check
+```
+
+### `--progress` (Progress Logging)
+
+When set, emits structured INFO logs for each batch with detailed timing and cumulative statistics. Without this flag, only a concise per-batch summary is logged.
+
+Progress log fields:
+
+| Field | Description |
+|-------|-------------|
+| `table` | Table name |
+| `batch_index` | Zero-based batch counter |
+| `rows` | Rows in this batch |
+| `cumulative_rows` | Total rows extracted so far for this table |
+| `arrow_bytes` | Arrow batch size in bytes |
+| `batch_duration_ms` | Wall-clock time for this batch in milliseconds |
+
+### `--version` and `--help`
+
+`--version` prints the version from `Cargo.toml`. `--help` prints self-documenting usage with all flags and their descriptions.
+
+### Startup Banner
+
+On every normal invocation (not `--check`), parket logs an INFO-level startup banner:
+
+```
+parket v0.1.0 starting  version=0.1.0 tables=3 database_host="mysql://****:****@dbhost:3306" s3_bucket=data-lake
+```
+
+In local mode:
+
+```
+parket v0.1.0 starting (local mode)  version=0.1.0 tables=3 database_host="mysql://****:****@dbhost:3306" local_dir=/data/delta
+```
+
+Sensitive values (database password, S3 secret key) are masked in all log output via `Config::display_safe()`.
+
+### Exit Codes
+
+| Code | Condition |
+|------|-----------|
+| 0 | All tables extracted successfully (or `--check` passed, or signal received after graceful shutdown) |
+| 1 | Partial failure — some tables failed, others succeeded |
+| 2 | Fatal error — config invalid, database unreachable, `--check` failed |
+
 ## Example `.env`
 
 ```env

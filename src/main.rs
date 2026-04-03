@@ -1,9 +1,14 @@
 use std::path::PathBuf;
 
+use clap::Parser;
+use parket::cli::Cli;
 use parket::config;
 use parket::orchestrator::{
-    DeltaWriterAdapter, ExtractorAdapter, Orchestrator, SchemaInspectorAdapter,
-    SignalHandler, StateManageAdapter,
+    DeltaWriterAdapter, ExtractorAdapter, LocalDeltaWriterAdapter, Orchestrator,
+    SchemaInspectorAdapter, SignalHandler, StateManageAdapter,
+};
+use parket::preflight::{
+    NoopPreflightStorage, PreflightCheck, PreflightInspectAdapter, PreflightStorageAdapter,
 };
 
 fn init_tracing() {
@@ -29,17 +34,97 @@ fn extract_database_name(url: &str) -> String {
         .unwrap_or_default()
 }
 
+fn log_startup_banner(config: &config::Config, local_dir: Option<&std::path::Path>) {
+    let host = config::mask_database_url(&config.database_url);
+    let version = env!("CARGO_PKG_VERSION");
+    if let Some(dir) = local_dir {
+        tracing::info!(
+            version,
+            tables = config.tables.len(),
+            database_host = %host,
+            local_dir = %dir.display(),
+            "parket v{version} starting (local mode)"
+        );
+    } else {
+        tracing::info!(
+            version,
+            tables = config.tables.len(),
+            database_host = %host,
+            s3_bucket = %config.s3_bucket,
+            "parket v{version} starting"
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    let cli = Cli::parse();
+
     init_tracing();
 
-    let config = match config::Config::load() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("configuration error: {e}");
-            std::process::exit(2);
+    let local_dir = cli.local.as_deref().map(|p| p.to_path_buf());
+
+    let config = if local_dir.is_some() {
+        match config::Config::load_local() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("configuration error: {e}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        match config::Config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("configuration error: {e}");
+                std::process::exit(2);
+            }
         }
     };
+
+    tracing::debug!(config = %config.display_safe(), "loaded configuration");
+
+    if cli.check {
+        let pool = match sqlx::MySqlPool::connect(&config.database_url).await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("database connection error: {e}");
+                std::process::exit(2);
+            }
+        };
+
+        let database = extract_database_name(&config.database_url);
+        let inspect = PreflightInspectAdapter::new(pool, database);
+
+        if local_dir.is_some() {
+            println!(
+                "{:<30} {:<15} {:<10} {:<15}",
+                "TABLE", "MODE", "COLUMNS", "AVG_ROW_LEN"
+            );
+            let check = PreflightCheck::new(config, inspect, NoopPreflightStorage);
+            if let Err(e) = check.run().await {
+                eprintln!("pre-flight check failed: {e}");
+                std::process::exit(2);
+            }
+            println!("pre-flight check passed");
+            std::process::exit(0);
+        } else {
+            let storage = PreflightStorageAdapter::new(&config);
+            println!(
+                "{:<30} {:<15} {:<10} {:<15}",
+                "TABLE", "MODE", "COLUMNS", "AVG_ROW_LEN"
+            );
+            let check = PreflightCheck::new(config, inspect, storage);
+            if let Err(e) = check.run().await {
+                eprintln!("pre-flight check failed: {e}");
+                std::process::exit(2);
+            }
+            println!("pre-flight check passed");
+            std::process::exit(0);
+        }
+    }
+
+    log_startup_banner(&config, local_dir.as_deref());
 
     let pool = match sqlx::MySqlPool::connect(&config.database_url).await {
         Ok(p) => p,
@@ -53,25 +138,42 @@ async fn main() {
 
     let schema_inspect = SchemaInspectorAdapter::new(pool, database);
     let extractor = ExtractorAdapter::new(&config);
-    let writer = DeltaWriterAdapter::new(&config);
     let state_mgr = StateManageAdapter::new();
 
     let (signal_handler, shutdown_rx) = SignalHandler::new();
     signal_handler.install().await;
 
     let state_path = PathBuf::from("state.json");
-    let mut orchestrator = Orchestrator::new(
-        config,
-        schema_inspect,
-        extractor,
-        writer,
-        state_mgr,
-        shutdown_rx,
-        state_path,
-    );
 
-    let exit_code = orchestrator.run().await;
-    std::process::exit(exit_code as i32);
+    if let Some(ref dir) = local_dir {
+        let writer = LocalDeltaWriterAdapter::new(dir);
+        let mut orchestrator = Orchestrator::new(
+            config,
+            schema_inspect,
+            extractor,
+            writer,
+            state_mgr,
+            shutdown_rx,
+            state_path,
+            cli.progress,
+        );
+        let exit_code = orchestrator.run().await;
+        std::process::exit(exit_code as i32);
+    } else {
+        let writer = DeltaWriterAdapter::new(&config);
+        let mut orchestrator = Orchestrator::new(
+            config,
+            schema_inspect,
+            extractor,
+            writer,
+            state_mgr,
+            shutdown_rx,
+            state_path,
+            cli.progress,
+        );
+        let exit_code = orchestrator.run().await;
+        std::process::exit(exit_code as i32);
+    }
 }
 
 #[cfg(test)]
@@ -215,5 +317,69 @@ mod tests {
             .try_init();
 
         debug!(batch_size = 10000, "debug message visible at debug level");
+    }
+
+    #[test]
+    fn startup_banner_logs_version_tables_host_bucket() {
+        let _guard = tracing_subscriber::fmt()
+            .with_env_filter("parket=info")
+            .with_test_writer()
+            .try_init();
+
+        use parket::config;
+        let config = config::Config {
+            database_url: "mysql://admin:s3cret@dbhost:3306/mydb".to_string(),
+            s3_bucket: "data-lake".to_string(),
+            s3_access_key_id: "key".to_string(),
+            s3_secret_access_key: "secret".to_string(),
+            tables: vec!["orders".to_string(), "products".to_string()],
+            target_memory_mb: 512,
+            s3_endpoint: None,
+            s3_region: "us-east-1".to_string(),
+            s3_prefix: "parket".to_string(),
+            default_batch_size: 10000,
+            rust_log: "info".to_string(),
+            table_modes: std::collections::HashMap::new(),
+        };
+
+        log_startup_banner(&config, None);
+    }
+
+    #[test]
+    fn startup_banner_local_mode() {
+        let _guard = tracing_subscriber::fmt()
+            .with_env_filter("parket=info")
+            .with_test_writer()
+            .try_init();
+
+        use parket::config;
+        let config = config::Config {
+            database_url: "mysql://admin:s3cret@dbhost:3306/mydb".to_string(),
+            s3_bucket: String::new(),
+            s3_access_key_id: String::new(),
+            s3_secret_access_key: String::new(),
+            tables: vec!["orders".to_string()],
+            target_memory_mb: 256,
+            s3_endpoint: None,
+            s3_region: "us-east-1".to_string(),
+            s3_prefix: "parket".to_string(),
+            default_batch_size: 10000,
+            rust_log: "info".to_string(),
+            table_modes: std::collections::HashMap::new(),
+        };
+
+        log_startup_banner(&config, Some(std::path::Path::new("/tmp/delta")));
+    }
+
+    #[test]
+    fn extract_database_name_parses_url() {
+        let name = extract_database_name("mysql://user:pass@host:3306/mydb");
+        assert_eq!(name, "mydb");
+    }
+
+    #[test]
+    fn extract_database_name_invalid_url_returns_empty() {
+        let name = extract_database_name("not-a-url");
+        assert_eq!(name, "");
     }
 }

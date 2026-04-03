@@ -23,9 +23,11 @@ dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+clap = { version = "4", features = ["derive"] }
 openssl = { version = "0.10", features = ["vendored"] }
 sha2 = "0.10"
 url = "2.5.8"
+object_store = { version = "0.12", features = ["aws"] }
 
 [dev-dependencies]
 aws-sdk-s3 = "1"
