@@ -1,5 +1,19 @@
 # Arrow v54 ↔ v57 Version Conflict & Conversion Guide
 
+## Status Update (2026-06-06) — MIGRATION COMPLETED
+
+**Both phases completed 2026-06-06.** The dual-arrow problem is resolved. There is now a single arrow version (58) throughout the entire dependency tree.
+
+| Change | Status |
+|---|---|
+| deltalake upgraded 0.31.1 → 0.32.3 | Done — writer uses arrow 58 |
+| connectorx replaced with connector_arrow 0.11.0 | Done — extractor uses arrow 58 |
+| FFI/IPC conversion layer deleted | Done — `convert_batches()`, `convert_v54_to_v57()`, etc. removed from `extractor.rs` |
+| `examples/ffi_vs_ipc.rs` deleted | Done — benchmark no longer relevant |
+| DeltaOps deprecated calls replaced | Done — using `DeltaTable::create()` and `DeltaTable::write()` |
+
+**This document is now historical reference.** It describes the problem and solution approach that was implemented. The conversion layer it documents no longer exists in the codebase.
+
 ## Problem Statement
 
 Parket depends on two crates that pull incompatible Arrow versions:
@@ -222,14 +236,28 @@ FFI is O(1) per batch (pointer ownership transfer only). IPC is O(n) (serialize 
 
 **Correctness:** Verified via `examples/ffi_vs_ipc.rs` — spot-checks Int64, Utf8, Float64 (with nulls), Timestamp, Boolean, Date32 columns across all batch sizes.
 
-### C. Replace `connectorx` with `connector_arrow` — Needs Investigation
+### C. Replace `connectorx` with `connector_arrow` — Chosen Direction
 
-[`connector_arrow`](https://crates.io/crates/connector_arrow) 0.11.0 is a newer successor to connectorx that may support arrow 57.
+[`connector_arrow`](https://crates.io/crates/connector_arrow) **0.11.0** (released 2026-03-24) is a successor to connectorx.
 
-**Pros:** Could unify on a single arrow version entirely.
-**Cons:** Newer, less battle-tested. API may differ from connectorx. Requires investigation.
+**Verified facts (from vendor/connector_arrow/connector_arrow/Cargo.toml):**
+- **Arrow version:** 58 (matches deltalake 0.32.3 writer target)
+- **MySQL/MariaDB support:** Yes, via `src_mysql` feature (backed by the `mysql` crate)
+- **API:** Streams results via `ResultReader<'stmt>: Iterator<Item = Result<RecordBatch, ConnectorError>>`
+- **Parameterized queries:** Supported (connectorx does not support these)
 
-**Status:** Candidate for v2. Requires a spike to verify arrow 57 support and API compatibility.
+**Pros:**
+- Unified arrow version (58) with writer after deltalake 0.32 upgrade
+- Eliminates dual-arrow setup and conversion layer entirely
+- Parameterized query support (security + flexibility)
+- Active maintenance (2026-03-24 release vs connectorx stale on arrow 54 since 2026-01-18)
+
+**Cons:**
+- Less battle-tested than connectorx
+- Buffers first batch for type inference (minor overhead)
+- No partitioned parallel extraction (not needed — parket is sequential)
+
+**Status:** Chosen for v2. Ready for implementation after deltalake 0.32 upgrade.
 
 ### D. Replace `connectorx` with `sqlx` + Manual Arrow Construction — Deferred
 
@@ -254,28 +282,40 @@ deltalake = { version = "0.31", features = ["s3"] }  # was: ["s3", "datafusion"]
 
 **Effect:** Removes the entire `datafusion 52.4.0` dependency tree (~50 crates), reducing compile time and binary size. Does NOT eliminate the dual-arrow problem (deltalake-core still depends on arrow 57 directly), but significantly reduces its footprint.
 
-**Risk:** Low — we never use DataFusion queries. We only write to Delta tables.
+**Risk (revised 2026-06-06):** Higher than originally assessed. Verified in vendor/delta-rs (0.32+ main): the write-builder path — both deprecated `DeltaOps::write()` and its replacement `DeltaTable::write()` — is gated behind `#[cfg(feature = "datafusion")]`. Removing the feature requires migrating writes to `deltalake::writer::RecordBatchWriter` (not feature-gated, verified in `vendor/delta-rs/crates/core/src/writer/record_batch.rs`). Defer this until the writer is migrated.
 
 ## Comparison Summary
 
-| Approach | Safe? | Zero-copy? | Throughput | v1 Suitability |
+| Approach | Safe? | Zero-copy? | Throughput | Status |
 |---|---|---|---|---|
-| **IPC stream roundtrip** | Yes | No (~2x mem) | 180 MB/s | **Current** |
-| **C Data Interface (FFI)** | Unsafe | Yes (O(1)) | ~107 GB/s | **Recommended** |
+| **IPC stream roundtrip** | Yes | No (~2x mem) | 180 MB/s | **Deleted** — no longer needed (migration complete) |
+| **C Data Interface (FFI)** | Unsafe | Yes (O(1)) | ~107 GB/s | **Not implemented** — IPC was sufficient; FFI remains available if throughput demands it |
 | Raw ArrayData cast | No | Yes | N/A | Rejected |
-| `connector_arrow` | Yes | N/A | N/A | v2 candidate |
-| sqlx + manual Arrow | Yes | Yes | N/A | v2 candidate |
+| **`connector_arrow` 0.11.0** | Yes | N/A | N/A | **Implemented** — arrow 58, MySQL/MariaDB, single arrow version |
+| sqlx + manual Arrow | Yes | Yes | N/A | Not needed |
 | Downgrade deltalake | Yes | N/A | N/A | Not viable |
-| Remove `datafusion` | Yes | N/A | Trivial | Do now |
+| Remove `datafusion` | Yes | N/A | Trivial | Blocked on `RecordBatchWriter` migration (write builder is datafusion-gated) |
 
-## V2 Roadmap
+## V2 Roadmap — Completed Items
 
-1. **Replace IPC with FFI conversion** — 23-590x speedup at zero memory overhead. Requires `unsafe` but data is verified correct.
-2. **Investigate `connector_arrow`** — if it supports arrow 57, replace connectorx and eliminate dual-arrow entirely.
-3. **Or implement sqlx-based extraction** — manual but eliminates the external dependency.
-4. **Remove `datafusion` feature** from deltalake (reduces arrow 57 transitive deps by ~50 crates).
-5. **Upgrade deltalake** when `DeltaTable::create()` and `DeltaTable::write()` ship (0.32+).
-6. **Remove all `#[allow(deprecated)]`** on `DeltaOps` usage.
+1. **Upgrade deltalake to 0.32.3** ✓ — writer now uses arrow 58.
+   - All 5 `#[allow(deprecated)]` `DeltaOps` sites removed; using `DeltaTable::create()` and `DeltaTable::write()`.
+   - `DeltaTable::write()` requires the `datafusion` feature (same as the deprecated path), so it stays enabled.
+   - `ensure_table()` handles both `NotATable` and `KernelError("does not exist")` — deltalake 0.32 returns `KernelError` when the path doesn't exist at all, vs `NotATable` when the path exists but has no `_delta_log/`.
+
+2. **Replace `connectorx` with `connector_arrow` 0.11.0** ✓ — dual-arrow eliminated.
+   - connectorx, arrow 54, and `arrow57` alias all removed from `Cargo.toml`.
+   - `mysql = "28"` added as direct dependency (connector_arrow's mysql crate is not re-exported).
+   - Entire conversion layer deleted: `convert_datatype`, `convert_schema_v54_to_v57`, `convert_v54_to_v57`, `convert_batches`, `CxStreamer` trait, `DefaultCxStreamer`.
+   - `convert_batches()` calls removed from `orchestrator.rs`; batches flow directly extractor → writer.
+   - `examples/ffi_vs_ipc.rs` deleted.
+   - **Type mapping changed** — see note on connector_arrow type differences below.
+
+## Remaining Roadmap
+
+3. **Optional: Replace IPC with FFI** — no longer applicable (IPC is gone; connector_arrow returns arrow 58 natively).
+
+4. **Remove `datafusion` feature** — still blocked on migrating writes to `deltalake::writer::RecordBatchWriter` (not feature-gated). Reduces transitive deps by ~50 crates.
 
 ## Appendix A: `#[allow(deprecated)]` on DeltaOps
 
@@ -294,14 +334,29 @@ warning: use of deprecated method `deltalake::DeltaOps::write`
   → "Use [`DeltaTable::write`] instead"
 ```
 
-In deltalake-core 0.31.1, the replacement methods (`DeltaTable::create()`, `DeltaTable::write()`) **do not exist yet**. The deprecation is a forward-looking announcement. `DeltaOps` is the only way to create/write tables in 0.31.x. Each `#[allow(deprecated)]` site has a comment explaining this:
+**Status (verified in vendor/delta-rs, 2026-06-06):**
 
+In deltalake-core 0.31.1, the replacement methods (`DeltaTable::create()`, `DeltaTable::write()`) do **not exist**. The deprecation is a forward-looking announcement.
+
+In deltalake-core 0.32+ (confirmed in vendor/delta-rs HEAD on main branch), both `DeltaTable::create()` and `DeltaTable::write()` are implemented and available. Therefore, **all 5 `#[allow(deprecated)]` sites can and should be removed during the deltalake 0.32 upgrade**.
+
+Caveat: `DeltaTable::write()` lives in a `#[cfg(feature = "datafusion")]` impl block (vendor/delta-rs/crates/core/src/operations/mod.rs) — the `datafusion` feature must remain enabled to use it. `DeltaTable::create()` and `DeltaTable::try_from_url_with_storage_options()` are not gated.
+
+Current workarounds (0.31.1):
 ```rust
 // NOTE: DeltaOps is deprecated in deltalake 0.31 in favor of
 // DeltaTable::create(), but that API does not exist yet in 0.31.1.
 // Replace with DeltaTable::create() when upgrading to deltalake 0.32+.
 #[allow(deprecated)]
 let ops = deltalake::DeltaOps::try_from_url_with_storage_options(url, storage_options).await?;
+```
+
+After upgrade to 0.32.3 (method names verified in vendor/delta-rs):
+```rust
+// Use DeltaTable methods directly (no deprecation warning)
+let table = deltalake::DeltaTable::try_from_url_with_storage_options(url, storage_options).await?;
+table.create().with_columns(fields).await?;                      // CreateBuilder (not feature-gated)
+table.write(batches).with_save_mode(SaveMode::Append).await?;    // WriteBuilder (requires "datafusion" feature)
 ```
 
 ## Appendix B: Verified Type Coverage via IPC Roundtrip
@@ -327,42 +382,32 @@ All MariaDB types that connectorx extracts pass through the IPC roundtrip withou
 
 FFI verification done via `examples/ffi_vs_ipc.rs` — correctness checks on Int64, Utf8, Float64 (with nulls), Timestamp(Microsecond), Boolean, Date32.
 
-## Production Conversion API (extractor.rs)
+## connector_arrow Type Differences (Important)
 
-All conversion functions are standalone public functions in `src/extractor.rs`. They do **not** modify any existing `BatchExtractor` methods or signatures. When connector-x eventually supports arrow v57 (or is replaced), these functions are simply deleted.
+connector_arrow 0.11.0's MySQL type mapping differs from what connectorx produced. This directly determines what Arrow types the extractor returns, and therefore what the Delta table schema must be. `mariadb_type_to_arrow()` in `orchestrator.rs` was updated to match:
 
-### Public Functions
+| MariaDB Type | connectorx (old) | connector_arrow (current) | Delta schema |
+|---|---|---|---|
+| `DATETIME`, `TIMESTAMP` | `Timestamp(Microsecond, None)` | `Utf8` (e.g. `"2026-03-28T10:00:00.000000"`) | `STRING` |
+| `DECIMAL` | `Float64` | `Utf8` (exact decimal string) | `STRING` |
+| `TINYINT` | `Int32` | `Int8` | `INTEGER` |
+| `BOOLEAN`, `BOOL` | `Boolean` | `Int8` (0 or 1) | `INTEGER` |
+| `BIGINT` | `Int64` | `Int64` | `LONG` (unchanged) |
+| `VARCHAR`, `TEXT`, `JSON` | `Utf8` | `Utf8` | `STRING` (unchanged) |
 
-| Function | Signature | Purpose |
-|---|---|---|
-| `convert_datatype` | `(&arrow::datatypes::DataType) -> Result<deltalake::arrow::datatypes::DataType>` | Map a single v54 DataType to v57. Returns error for unsupported types (List, Struct, Map, etc.). |
-| `convert_schema_v54_to_v57` | `(&arrow::datatypes::Schema) -> Result<Arc<V57Schema>>` | Convert a full Arrow schema (field names, types, nullability preserved). |
-| `convert_v54_to_v57` | `(&arrow::record_batch::RecordBatch) -> Result<V57RecordBatch>` | FFI zero-copy single RecordBatch conversion. Exports v54 data via `arrow::ffi::to_ffi`, copies C ABI structs, imports via `deltalake::arrow::ffi::from_ffi`. |
-| `convert_batches` | `(Vec<arrow::record_batch::RecordBatch>) -> Result<Vec<V57RecordBatch>>` | Apply `convert_v54_to_v57()` over a Vec of batches. |
+**HWM extraction** (`extract_hwm_from_batch()` in `writer.rs`) already handled `Utf8` timestamp columns as a fallback — no change needed there.
 
-### Supported Types
+**Existing Delta tables** written by connectorx (with `Timestamp(Microsecond)` or `Float64` for decimal columns) will encounter schema evolution errors on first run after migration. Overwrite mode tables are unaffected (full replace). Incremental tables need a one-time schema reset (delete and recreate the Delta table).
 
-Null, Boolean, Int8–Int64, UInt8–UInt64, Float16–Float64, Utf8, LargeUtf8, Binary, LargeBinary, Date32, Date64, Timestamp (all 4 time units, with/without timezone).
+## Production Conversion API (extractor.rs) — DELETED
 
-### Usage in Orchestrator
+These functions no longer exist. Documented here as historical reference:
 
-```rust
-use crate::extractor::{convert_batches, convert_schema_v54_to_v57};
-
-// Convert extracted batches (v54 → v57) before writing to Delta
-let v57_batches = convert_batches(v54_batches)?;
-
-// Convert schema for ensure_table() call
-let v57_schema = convert_schema_v54_to_v57(&v54_schema)?;
-writer.ensure_table(table_name, v57_schema).await?;
-```
-
-### Removal Instructions
-
-When connector-x upgrades to arrow v57 (or is replaced by `connector_arrow` / sqlx-based extraction):
-
-1. Delete the four `convert_*` functions from `extractor.rs`
-2. Delete the `arrow57` dependency from `Cargo.toml`
-3. Remove the `ffi` feature from the `arrow` v54 dependency (or remove `arrow` v54 entirely)
-4. Update `BatchExtractor::extract()` to return `Vec<deltalake::arrow::record_batch::RecordBatch>` directly
-5. Update `docs/arrow_v54_to_v57.md` — this entire document becomes obsolete
+| Function | Was in |
+|---|---|
+| `convert_datatype` | `extractor.rs` |
+| `convert_schema_v54_to_v57` | `extractor.rs` |
+| `convert_v54_to_v57` | `extractor.rs` |
+| `convert_batches` | `extractor.rs` |
+| `CxStreamer` trait | `extractor.rs` |
+| `DefaultCxStreamer` struct | `extractor.rs` |

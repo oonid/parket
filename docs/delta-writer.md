@@ -2,6 +2,10 @@
 
 The Delta Writer module (`src/writer.rs`) handles all interactions with Delta Lake on S3/MinIO. It provides table creation, batch writes (Append and Overwrite), and High Watermark (HWM) tracking via Delta `commitInfo` metadata.
 
+## Status Update (2026-06-06) — UPGRADE COMPLETED
+
+**deltalake upgraded 0.31.1 → 0.32.3** and **connectorx replaced with connector_arrow 0.11.0**, both on 2026-06-06. The writer and extractor now use the same arrow version (58). The FFI/IPC conversion layer has been deleted entirely. All `#[allow(deprecated)]` `DeltaOps` workarounds have been removed — the writer now uses `DeltaTable::create()` and `DeltaTable::write()` directly. See `docs/arrow_v54_to_v57.md` for the full migration record.
+
 ## S3 Path Layout
 
 Each MariaDB table maps to one independent Delta table:
@@ -72,7 +76,7 @@ The Arrow schema is converted to a Delta schema via `arrow_schema_to_delta()`, w
 | `Decimal128(p, s)`, `Decimal256(p, s)` | `DECIMAL(p, s)` |
 | Any other type | **Error** (unsupported) |
 
-> **Note:** `DeltaOps` is deprecated in deltalake 0.31 in favor of `DeltaTable::create()`, but that API does not exist yet in 0.31.1. All `#[allow(deprecated)]` sites will be replaced when upgrading to deltalake 0.32+.
+> **Note (2026-06-06):** All 5 `#[allow(deprecated)]` `DeltaOps` sites have been removed. The writer now uses `DeltaTable::create()` (not feature-gated) and `DeltaTable::write()` (requires the `datafusion` feature — same as the deprecated path). The `datafusion` feature remains enabled. Dropping it requires migrating writes to `deltalake::writer::RecordBatchWriter` (not feature-gated). `ensure_table()` handles both `DeltaTableError::NotATable` (path exists, no `_delta_log/`) and `DeltaTableError::KernelError` containing "does not exist" (path itself absent) — deltalake 0.32 changed this error variant for non-existent paths.
 
 ## Write Operations
 
@@ -140,83 +144,73 @@ The HWM is stored in Delta `commitInfo` because:
 2. **Single source of truth**: The HWM always reflects the actual data committed to Delta Lake.
 3. **Trade-off**: Reading HWM requires an S3 round-trip at startup (once per table per run). This is acceptable for a one-shot binary.
 
-## Arrow Version Compatibility (v54 vs v57)
+## Arrow Version Compatibility
 
-Parket depends on two crates that pull incompatible Arrow versions:
+**Current state (as of 2026-06-06, post-migration):**
 
 | Crate | Version | Arrow Dependency |
 |-------|---------|-----------------|
-| `connectorx` 0.4.5 | arrow 54 | extraction produces v54 `RecordBatch` |
-| `deltalake` 0.31.1 | arrow 57 | writer expects v57 `RecordBatch` |
+| `connector_arrow` 0.11.0 | arrow 58 | extraction produces arrow 58 `RecordBatch` |
+| `deltalake` 0.32.3 | arrow 58 | writer expects arrow 58 `RecordBatch` |
 
-### Where the mismatch manifests
+There is now a single arrow version (58) in the dependency tree. No conversion layer exists.
 
 ```
-BatchExtractor (connectorx, arrow v54)
-    produces Vec<RecordBatch> (v54)
+BatchExtractor (connector_arrow 0.11.0, arrow 58)
+    produces Vec<RecordBatch> (arrow 58)
          │
+         ▼  no conversion needed
          ▼
-   Orchestrator ← MUST convert here
-         │
-         ▼
-DeltaWriter (deltalake, arrow v57)
-    expects Vec<RecordBatch> (v57)
+DeltaWriter (deltalake 0.32.3, arrow 58)
+    writes Vec<RecordBatch> (arrow 58)
 ```
 
-The `RecordBatch` types are completely different at the Rust type-system level. Attempting to pass a v54 batch to a v57 function produces `error[E0308]: mismatched types`.
+### Current extraction: connector_arrow (no conversion)
 
-### Current solution: Arrow IPC Stream Roundtrip
-
-Conversion happens in `orchestrator.rs`:
-
-1. Serialize v54 `RecordBatch` to Arrow IPC streaming format (a stable wire format defined by the Apache Arrow specification)
-2. Deserialize the bytes as v57 `RecordBatch`
+Extraction is via `connector_arrow` 0.11.0 (arrow 58). The extractor returns `Vec<deltalake::arrow::record_batch::RecordBatch>` directly — the same type the writer expects. No conversion step exists.
 
 ```rust
-fn convert_v54_to_v57(batch: &arrow::record_batch::RecordBatch)
-    -> Result<deltalake::arrow::record_batch::RecordBatch>
-{
-    let mut buf = Vec::new();
-    {
-        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &*batch.schema())?;
-        writer.write(batch)?;
-        writer.finish()?;
-    }
-    let mut reader = deltalake::arrow::ipc::reader::StreamReader::try_new(Cursor::new(buf), None)?;
-    reader.next().ok_or_else(|| anyhow::anyhow!("empty IPC stream"))?
-}
+// BatchExtractor::extract() in extractor.rs
+let opts = mysql::Opts::from_url(&self.database_url)?;
+let conn = mysql::Conn::new(opts)?;
+let mut ca_conn = connector_arrow::mysql::MySQLConnection::new(conn);
+let mut stmt = ca_conn.query(sql)?;
+let reader = stmt.start([])?;
+let batches: Vec<deltalake::arrow::record_batch::RecordBatch> =
+    reader.collect::<Result<_, _>>()?;
 ```
 
-**Performance**: ~5.8ms per 50,000-row batch, representing ~1-3% of total pipeline time (dominated by MariaDB read + S3 write). No data loss — all types, nullability, and metadata are preserved.
+### Type coverage
 
-### Verified type coverage
+MariaDB types as extracted by connector_arrow 0.11.0:
 
-All MariaDB types that connectorx extracts pass through the IPC roundtrip without data loss:
+| MariaDB Type | Arrow Type | Delta Type | Notes |
+|--------------|------------|------------|-------|
+| `INT`, `MEDIUMINT` | `Int32` | `INTEGER` | |
+| `BIGINT` | `Int64` | `LONG` | |
+| `TINYINT` (signed) | `Int8` | `INTEGER` | |
+| `TINYINT UNSIGNED` | `UInt8` | `INTEGER` | |
+| `SMALLINT` | `Int16` | `INTEGER` | |
+| `FLOAT` | `Float32` | `FLOAT` | |
+| `DOUBLE` | `Float64` | `DOUBLE` | |
+| `DECIMAL` | `Utf8` | `STRING` | Exact decimal string; changed from `Float64` |
+| `VARCHAR`, `TEXT`, `CHAR` | `Utf8` | `STRING` | |
+| `BLOB`, `BINARY` | `Binary` | `BINARY` | |
+| `BOOLEAN`, `BOOL`, `TINYINT(1)` | `Int8` | `INTEGER` | 0 or 1; changed from `Boolean` |
+| `DATE` | `Utf8` | `STRING` | |
+| `DATETIME`, `TIMESTAMP` | `Utf8` | `STRING` | Format: `"YYYY-MM-DDTHH:MM:SS.ffffff"`; changed from `Timestamp(Microsecond, None)` |
+| `JSON` | `Utf8` | `STRING` | Stringified JSON |
 
-| MariaDB Type | Arrow Type | IPC Verified |
-|--------------|------------|-------------|
-| `INT` | `Int32` | Yes |
-| `BIGINT` | `Int64` | Yes |
-| `TINYINT`, `SMALLINT` | `Int8`, `Int16` | Yes |
-| `FLOAT` | `Float32` | Yes |
-| `DOUBLE` | `Float64` | Yes |
-| `VARCHAR`, `TEXT` | `Utf8` | Yes |
-| `BLOB` | `Binary` | Yes |
-| `BOOLEAN` / `TINYINT(1)` | `Boolean` | Yes |
-| `DATE` | `Date32` | Yes |
-| `DATETIME`, `TIMESTAMP` | `Timestamp(Microsecond, None)` | Yes |
-| `DECIMAL(p,s)` | `Decimal128(p,s)` | Yes |
-| `JSON` | `Utf8` (stringified) | Yes |
+### Future improvements
 
-### Future improvements (v2 roadmap)
+| Approach | Status |
+|----------|--------|
+| **Upgrade deltalake to 0.32.3** | **Done** — arrow 58, `DeltaOps` removed |
+| **Replace connectorx with `connector_arrow` 0.11.0** | **Done** — single arrow version (58), no conversion layer |
+| **Remove `datafusion` feature** | Blocked — `DeltaTable::write()` is datafusion-gated; requires migrating to `RecordBatchWriter` first |
+| **Arrow C Data Interface (FFI)** optimization | Not needed — no cross-version boundary exists anymore |
 
-| Approach | Safe? | Zero-copy? | Speedup vs IPC | Status |
-|----------|-------|------------|----------------|--------|
-| **Arrow C Data Interface (FFI)** | `unsafe` | Yes (O(1)) | 23-590x | Recommended for v2 |
-| `connector_arrow` (arrow 57) | Safe | N/A | Eliminates dual-arrow | Needs spike |
-| sqlx + manual Arrow construction | Safe | Yes | Eliminates dual-arrow | v2 candidate |
-
-The FFI approach uses `unsafe` for `from_ffi()` and raw byte copying but benchmarks show 23-590x speedup at zero memory overhead. Correctness verified via `examples/ffi_vs_ipc.rs`.
+**Note on `DATETIME`/`TIMESTAMP` columns:** connector_arrow returns these as `Utf8` strings (format `"YYYY-MM-DDTHH:MM:SS.ffffff"`), not `Timestamp(Microsecond, None)`. `extract_hwm_from_batch()` handles both `Timestamp` and `Utf8` HWM columns — no change needed there. Delta tables created by connectorx (with `Timestamp` schema) will hit schema evolution errors on first incremental run; those tables need a one-time recreate.
 
 ## Table Introspection: `open_table()`
 

@@ -5,15 +5,15 @@
 **Description:** "Parket" is a smart, standalone Rust binary designed to autonomously extract data from MariaDB and load it into Delta Lake (S3/MinIO) using Apache Arrow. It acts as an intelligent Extract & Load (EL) tool that eliminates manual schema mapping through auto-discovery and manages its own memory footprint dynamically based on table metadata.
 
 ## 2. Core Objectives
-* **Zero-Configuration Type Mapping:** Utilize `connector-x` to automatically infer MariaDB column types and map them directly to Apache Arrow memory formats without intermediate Rust structs.
+* **Zero-Configuration Type Mapping:** Utilize `connector_arrow` to automatically infer MariaDB column types and map them directly to Apache Arrow memory formats without intermediate Rust structs.
 * **Auto-Discovery:** Automatically inspect table schemas to determine the extraction mode: `Incremental` (if `updated_at` and `id` exist) or `FullRefresh`.
 * **Dynamic Memory Management:** Calculate row batch limits on the fly based on a configured `TARGET_MEMORY_MB` and the specific table's `AVG_ROW_LENGTH` from `information_schema`.
 * **Idempotent & Resilient Writes:** Write data to S3/MinIO using `delta-rs` (SaveMode::Append) with ACID guarantees. Track High Watermarks (HWM) locally, updating state *only* upon successful Delta Lake commits.
 
 ## 3. Technology Stack
 * **Language:** Rust
-* **Extraction Engine:** `connector-x` (SQL to Arrow)
-* **Lakehouse Engine:** `delta-rs` (Arrow to Delta Lake/Parquet)
+* **Extraction Engine:** `connector_arrow` 0.11.0 (SQL to Arrow, arrow 58)
+* **Lakehouse Engine:** `delta-rs` / `deltalake` 0.32.3 (Arrow to Delta Lake/Parquet, arrow 58)
 * **Schema Inspection:** `sqlx` (MySQL feature, for metadata and query building)
 * **Async Runtime:** `tokio`
 * **Configuration & State:** `dotenvy` (Env vars), `serde_json` (State management)
@@ -34,9 +34,9 @@
 * For `Incremental` mode, utilize a precise windowing query:
   `WHERE (updated_at = ? AND id > ?) OR (updated_at > ?) ORDER BY updated_at ASC, id ASC LIMIT {dynamic_batch_size}`.
 
-### Milestone 4: Core Extraction (connector-x)
-* Execute the dynamic SQL string using `connector-x`.
-* Retrieve the extracted dataset directly as an Apache Arrow `RecordBatch` residing in memory.
+### Milestone 4: Core Extraction (connector_arrow)
+* Execute the dynamic SQL string using `connector_arrow` (`MySQLConnection::query` + `Statement::start`).
+* Retrieve the extracted dataset as Apache Arrow `RecordBatch`es (arrow 58) — same version as the writer, no conversion needed.
 
 ### Milestone 5: Delta Lake Integration (delta-rs)
 * Extract the Arrow `Schema` from the `RecordBatch`.

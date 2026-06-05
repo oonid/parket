@@ -1,6 +1,6 @@
 # Batch Extraction
 
-The batch extraction module (`src/extractor.rs`) reads data from MariaDB via connector-x's streaming API and produces Arrow `RecordBatch`es within configurable memory bounds.
+The batch extraction module (`src/extractor.rs`) reads data from MariaDB via `connector_arrow`'s MySQL API and produces Arrow `RecordBatch`es (arrow 58) within configurable memory bounds.
 
 ## Memory Model
 
@@ -9,7 +9,7 @@ Parket uses a single memory budget (`TARGET_MEMORY_MB`) to control how much Arro
 The flow:
 
 1. **Initial estimate** — `AVG_ROW_LENGTH` from MariaDB `information_schema.tables` is used to calculate a row count per batch: `batch_size = (TARGET_MEMORY_MB * 1024 * 1024) / AVG_ROW_LENGTH`
-2. **Streaming extraction** — connector-x produces `RecordBatch`es with at most `batch_size` rows each
+2. **SQL-limited extraction** — the `LIMIT {batch_size}` clause in the query controls how many rows are fetched per call; connector_arrow internally produces `RecordBatch`es of ~1024 rows each from the result set
 3. **Adaptive adjustment** — after the first batch, actual Arrow memory is measured and `batch_size` is recalibrated if the estimate was off by more than 2x
 4. **Hard ceiling** — if any single batch exceeds `2 * TARGET_MEMORY_MB` bytes, the batch size is halved
 
@@ -54,37 +54,56 @@ The hard ceiling is `2 * TARGET_MEMORY_MB * 1024 * 1024` bytes. If any `RecordBa
 - `batch_size` is halved (minimum 1)
 - This check runs on every batch (not just the first)
 
-## connector-x Streaming API
+## connector_arrow API
 
-Parket uses `connectorx::get_arrow::new_record_batch_iter` — the streaming variant of the connector-x API. This avoids loading the entire result set into memory.
+Parket uses `connector_arrow` 0.11.0 with the `src_mysql` feature. The API is synchronous and uses a prepared-statement model.
 
 ### API Usage
 
 ```rust
-let mut iter = new_record_batch_iter(&source_conn, None, queries, batch_size, None);
-let (_schema_batch, _col_names) = iter.get_schema();
-iter.prepare();
-while let Some(batch) = iter.next_batch() {
-    // process RecordBatch
-}
+use connector_arrow::api::{Connector, Statement};
+use connector_arrow::mysql::MySQLConnection;
+
+let opts = mysql::Opts::from_url(&database_url)?;
+let conn = mysql::Conn::new(opts)?;
+let mut ca_conn = MySQLConnection::new(conn);
+
+let mut stmt = ca_conn.query(sql)?;
+let reader = stmt.start([])?;  // [] = no bound parameters
+// reader implements Iterator<Item = Result<RecordBatch, ConnectorError>>
+let batches: Vec<RecordBatch> = reader.collect::<Result<_, _>>()?;
 ```
 
-- `batch_size` controls the maximum rows per `RecordBatch` produced by connector-x
-- `prepare()` spawns a background thread for data fetching
-- `next_batch()` returns `Option<RecordBatch>` — `None` signals end-of-result
+- A new connection is opened per `extract()` call (connector_arrow does not pool connections)
+- connector_arrow internally produces `RecordBatch`es of ~1024 rows; the SQL `LIMIT` clause controls total row count
+- `stmt.start([])` accepts bind parameters (an improvement over connectorx, which had no parameterized query support)
 
-### Abstraction for Testability
+### MariaDB → Arrow Type Mapping
 
-The `CxStreamer` trait wraps connector-x's `RecordBatchIterator`:
+connector_arrow determines the Arrow type from the MySQL wire protocol column type:
 
-```rust
-pub trait CxStreamer {
-    fn prepare(&mut self);
-    fn next_batch(&mut self) -> Option<RecordBatch>;
-}
-```
+| MariaDB Type | Arrow Type | Notes |
+|---|---|---|
+| `TINYINT` (signed) | `Int8` | |
+| `TINYINT UNSIGNED` | `UInt8` | |
+| `SMALLINT` | `Int16` | |
+| `INT`, `MEDIUMINT` | `Int32` | |
+| `BIGINT` | `Int64` | |
+| `FLOAT` | `Float32` | |
+| `DOUBLE` | `Float64` | |
+| `DECIMAL`, `NUMERIC` | `Utf8` | Exact decimal as string — avoids Float64 precision loss |
+| `VARCHAR`, `TEXT`, `CHAR` | `Utf8` | |
+| `BLOB`, `BINARY` | `Binary` | |
+| `BOOL`, `BOOLEAN` | `Int8` | MySQL TINYINT(1); value is 0 or 1 |
+| `DATETIME`, `TIMESTAMP` | `Utf8` | Format: `"YYYY-MM-DDTHH:MM:SS.ffffff"` — timezone is unknown at extraction time |
+| `DATE` | `Utf8` | Format: `"YYYY-MM-DDTHH:MM:SS.ffffff"` with zeros |
+| `JSON` | `Utf8` | Stringified JSON |
 
-`BatchExtractor::extract_from_stream<S: CxStreamer>()` uses this trait, allowing unit tests to inject a `MockStreamer` without needing a real MariaDB connection.
+These types directly determine the Delta table schema via `mariadb_type_to_arrow()` in `orchestrator.rs`. `arrow_schema_to_delta()` in `writer.rs` then maps `Utf8` → `STRING`, `Int8`/`Int32` → `INTEGER`, `Int64` → `LONG`.
+
+### Testability
+
+Unit tests for `BatchExtractor` construct `deltalake::arrow::record_batch::RecordBatch` objects directly and pass them to `extract_from_stream_ca()`. No real MariaDB connection is needed for unit tests. Integration tests use `testcontainers-modules` with a real MariaDB container.
 
 ## Interaction with Query Builder
 

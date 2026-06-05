@@ -30,8 +30,7 @@ run()
      │   │       └─ loop:
      │   │           ├─ read_hwm(table)
      │   │           ├─ build_incremental_query(table, columns, hwm, batch_size)
-     │   │           ├─ extract(sql)          → v54 batches
-     │   │           ├─ convert_batches()     → v57 batches
+     │   │           ├─ extract(sql)          → arrow 58 batches
      │   │           ├─ extract_hwm_from_batch()
      │   │           ├─ append_batch(table, batches, hwm)
      │   │           ├─ break if 0 rows or partial batch
@@ -41,7 +40,6 @@ run()
      │       └─ process_full_refresh()
      │           ├─ build_full_refresh_query(table, columns)
      │           ├─ extract(sql)
-     │           ├─ convert_batches()
      │           └─ overwrite_table(table, batches)
      │
      └─ update_table(name, state)             → StateManage
@@ -129,23 +127,26 @@ The signal is set from `main.rs` via a `tokio::signal` handler that sends `true`
 
 ## MariaDB to Arrow Type Mapping
 
-Used by `column_info_to_v57_schema()` to build the Delta table schema from MariaDB column metadata:
+Used by `column_info_to_v57_schema()` to build the Delta table schema from MariaDB column metadata. These types are chosen to match what connector_arrow 0.11.0 produces from the MySQL wire protocol, so the extracted batch schema matches the Delta table schema.
 
-| MariaDB Type | Arrow Type |
-|---|---|
-| tinyint | Int32 |
-| smallint | Int16 |
-| int, mediumint | Int32 |
-| bigint | Int64 |
-| float | Float32 |
-| double, decimal | Float64 |
-| varchar, char, text, json | Utf8 |
-| date | Date32 |
-| datetime, timestamp | Timestamp(Microsecond, None) |
-| boolean, bool | Boolean |
-| blob | Binary |
+| MariaDB Type | Arrow Type | Notes |
+|---|---|---|
+| tinyint | `Int8` | connector_arrow maps signed tinyint to Int8 |
+| smallint | `Int16` | |
+| int, mediumint | `Int32` | |
+| bigint | `Int64` | |
+| float | `Float32` | |
+| double | `Float64` | |
+| decimal | `Utf8` | connector_arrow returns exact decimal as string |
+| varchar, char, text, json | `Utf8` | |
+| date | `Date32` | |
+| datetime, timestamp | `Utf8` | connector_arrow returns `"YYYY-MM-DDTHH:MM:SS.ffffff"` string |
+| boolean, bool | `Int8` | connector_arrow maps MySQL TINYINT(1) to Int8 (0 or 1) |
+| blob | `Binary` | |
 
 Unsupported types (e.g., geometry, enum) cause `column_info_to_v57_schema()` to return an error, preventing table creation.
+
+**HWM note:** `extract_hwm_from_batch()` in `writer.rs` handles both `Timestamp(Microsecond, _)` and `Utf8` for the `updated_at` column — incremental watermark tracking works regardless of timestamp representation.
 
 ## State Updates
 

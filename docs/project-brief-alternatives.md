@@ -85,6 +85,8 @@ However, be aware of these caveats:
 - The `COUNT(*)` query on a large table with `WHERE` clause can be expensive if the column isn't indexed.
 - No parameterized queries — HWM values must be interpolated into SQL strings (safe for internal use but worth noting).
 
+> **Outcome (2026-06-06):** connector-x was replaced by **`connector_arrow` 0.11.0**. connector-x stalled on arrow 54 (last release 2026-01-18) while `deltalake` 0.32.3 moved to arrow 58, creating an unbridgeable version gap. `connector_arrow` unifies on arrow 58, eliminating the dual-arrow dependency and its conversion layer entirely. The API uses `MySQLConnection::query()` + `Statement::start([])` (supports parameterized queries). Type mapping differences vs connector-x are documented in `docs/arrow_v54_to_v57.md` and `docs/batch-extraction.md`.
+
 ---
 
 ## 2. Memory Management: Dynamic Batch Sizing
@@ -226,6 +228,8 @@ Replace connector-x entirely with sqlx streaming + manual Arrow construction (as
 ### Recommendation
 
 **Keep dual libraries.** The overhead is negligible and each library serves its strength.
+
+> **Outcome (2026-06-06):** The dual-library approach is still used, but the extraction library changed. `connector_arrow` 0.11.0 replaces connector-x. Internally, connector_arrow uses the `mysql` crate (same underlying protocol library), so connection behavior is similar. `sqlx` remains for schema discovery (`information_schema` queries). A `mysql = "28"` direct dependency was added because connector_arrow does not re-export its `mysql` crate.
 
 ---
 
@@ -723,9 +727,9 @@ The brief's use of "Append" for Incremental is correct but the term "idempotent"
 
 | # | Decision | Brief Prescribes | Recommended Alternative |
 |---|---|---|---|
-| 1 | Extraction engine | connector-x | **connector-x streaming API** (`new_record_batch_iter`) |
+| 1 | Extraction engine | connector-x | ~~connector-x streaming API~~ → **`connector_arrow` 0.11.0** (outcome 2026-06-06: connector-x stalled on arrow 54) |
 | 2 | Memory estimation | `AVG_ROW_LENGTH` formula | **Sample-based + adaptive** (measure Arrow bytes from first batch) |
-| 3 | Connection libraries | sqlx + connector-x | **Keep as-is** (dual libraries) |
+| 3 | Connection libraries | sqlx + connector-x | **sqlx + `connector_arrow`** (outcome 2026-06-06: connector-x replaced; mysql crate added directly) |
 | 4 | State management | `state.json` for HWM | **Delta commit metadata for HWM (source of truth), `state.json` for operational bookkeeping** |
 | 5 | Mode detection | `updated_at` + `id` | **Keep + add config override** |
 | 6 | Concurrency | Sequential (1 table, 1 batch) | **Sequential for v1, `BATCH_PIPELINE_DEPTH` for future pipelining** |
