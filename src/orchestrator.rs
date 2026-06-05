@@ -3,11 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
-use deltalake::arrow::datatypes::{
-    DataType as V57DataType, Field as V57Field, Schema as V57Schema, SchemaRef as V57SchemaRef,
-    TimeUnit as V57TimeUnit,
-};
-use deltalake::arrow::record_batch::RecordBatch as V57RecordBatch;
+use deltalake::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
@@ -15,7 +11,7 @@ use crate::config::{Config, ExtractionMode};
 use crate::discovery::{
     ColumnInfo, compute_schema_hash, detect_mode, filter_unsupported_columns,
 };
-use crate::extractor::{convert_batches, BatchExtractor};
+use crate::extractor::BatchExtractor;
 use crate::query::QueryBuilder;
 use crate::state::{AppState, TableState};
 use crate::writer::{extract_hwm_from_batch, DeltaWriter, Hwm};
@@ -30,28 +26,28 @@ pub trait SchemaInspect: Send + Sync {
 #[cfg_attr(test, mockall::automock)]
 pub trait Extract: Send {
     fn calculate_batch_size(&mut self, avg_row_length: Option<u64>) -> u64;
-    fn extract(&mut self, sql: &str) -> Result<Vec<arrow::record_batch::RecordBatch>>;
+    fn extract(&mut self, sql: &str) -> Result<Vec<deltalake::arrow::record_batch::RecordBatch>>;
     fn batch_size(&self) -> u64;
 }
 
 #[cfg_attr(test, mockall::automock)]
 #[allow(async_fn_in_trait)]
 pub trait DeltaWrite: Send + Sync {
-    async fn ensure_table(&self, table_name: &str, schema: V57SchemaRef) -> Result<()>;
+    async fn ensure_table(&self, table_name: &str, schema: SchemaRef) -> Result<()>;
     async fn append_batch(
         &self,
         table_name: &str,
-        batches: Vec<V57RecordBatch>,
+        batches: Vec<deltalake::arrow::record_batch::RecordBatch>,
         hwm: Option<Hwm>,
     ) -> Result<()>;
     async fn overwrite_table(
         &self,
         table_name: &str,
-        batches: Vec<V57RecordBatch>,
+        batches: Vec<deltalake::arrow::record_batch::RecordBatch>,
         hwm: Option<Hwm>,
     ) -> Result<()>;
     async fn read_hwm(&self, table_name: &str) -> Result<Option<Hwm>>;
-    async fn get_schema(&self, table_name: &str) -> Result<Option<V57SchemaRef>>;
+    async fn get_schema(&self, table_name: &str) -> Result<Option<SchemaRef>>;
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -106,7 +102,7 @@ impl Extract for ExtractorAdapter {
         self.inner.calculate_batch_size(avg_row_length)
     }
 
-    fn extract(&mut self, sql: &str) -> Result<Vec<arrow::record_batch::RecordBatch>> {
+    fn extract(&mut self, sql: &str) -> Result<Vec<deltalake::arrow::record_batch::RecordBatch>> {
         self.inner.extract(sql)
     }
 
@@ -157,7 +153,7 @@ impl DeltaWriterAdapter {
 }
 
 impl DeltaWrite for DeltaWriterAdapter {
-    async fn ensure_table(&self, table_name: &str, schema: V57SchemaRef) -> Result<()> {
+    async fn ensure_table(&self, table_name: &str, schema: SchemaRef) -> Result<()> {
         self.inner.ensure_table(table_name, schema).await?;
         Ok(())
     }
@@ -165,7 +161,7 @@ impl DeltaWrite for DeltaWriterAdapter {
     async fn append_batch(
         &self,
         table_name: &str,
-        batches: Vec<V57RecordBatch>,
+        batches: Vec<deltalake::arrow::record_batch::RecordBatch>,
         hwm: Option<Hwm>,
     ) -> Result<()> {
         self.inner
@@ -176,7 +172,7 @@ impl DeltaWrite for DeltaWriterAdapter {
     async fn overwrite_table(
         &self,
         table_name: &str,
-        batches: Vec<V57RecordBatch>,
+        batches: Vec<deltalake::arrow::record_batch::RecordBatch>,
         hwm: Option<Hwm>,
     ) -> Result<()> {
         self.inner
@@ -188,7 +184,7 @@ impl DeltaWrite for DeltaWriterAdapter {
         self.inner.read_hwm(table_name).await
     }
 
-    async fn get_schema(&self, table_name: &str) -> Result<Option<V57SchemaRef>> {
+    async fn get_schema(&self, table_name: &str) -> Result<Option<SchemaRef>> {
         match self.inner.open_table(table_name).await {
             Ok(table) => {
                 let kernel_schema = table.snapshot()?.schema();
@@ -217,7 +213,7 @@ impl LocalDeltaWriterAdapter {
 }
 
 impl DeltaWrite for LocalDeltaWriterAdapter {
-    async fn ensure_table(&self, table_name: &str, schema: V57SchemaRef) -> Result<()> {
+    async fn ensure_table(&self, table_name: &str, schema: SchemaRef) -> Result<()> {
         self.inner.ensure_table(table_name, schema).await?;
         Ok(())
     }
@@ -225,7 +221,7 @@ impl DeltaWrite for LocalDeltaWriterAdapter {
     async fn append_batch(
         &self,
         table_name: &str,
-        batches: Vec<V57RecordBatch>,
+        batches: Vec<deltalake::arrow::record_batch::RecordBatch>,
         hwm: Option<Hwm>,
     ) -> Result<()> {
         self.inner
@@ -236,7 +232,7 @@ impl DeltaWrite for LocalDeltaWriterAdapter {
     async fn overwrite_table(
         &self,
         table_name: &str,
-        batches: Vec<V57RecordBatch>,
+        batches: Vec<deltalake::arrow::record_batch::RecordBatch>,
         hwm: Option<Hwm>,
     ) -> Result<()> {
         self.inner
@@ -248,7 +244,7 @@ impl DeltaWrite for LocalDeltaWriterAdapter {
         self.inner.read_hwm(table_name).await
     }
 
-    async fn get_schema(&self, table_name: &str) -> Result<Option<V57SchemaRef>> {
+    async fn get_schema(&self, table_name: &str) -> Result<Option<SchemaRef>> {
         match self.inner.open_table(table_name).await {
             Ok(table) => {
                 let kernel_schema = table.snapshot()?.schema();
@@ -262,36 +258,33 @@ impl DeltaWrite for LocalDeltaWriterAdapter {
         }
     }
 }
-fn column_info_to_v57_schema(columns: &[ColumnInfo]) -> Result<V57SchemaRef> {
-    let fields: Result<Vec<V57Field>> = columns
+fn column_info_to_v57_schema(columns: &[ColumnInfo]) -> Result<SchemaRef> {
+    let fields: Result<Vec<Field>> = columns
         .iter()
         .map(|c| {
             let dt = mariadb_type_to_arrow(&c.data_type, &c.column_type)?;
-            Ok(V57Field::new(&c.name, dt, true))
+            Ok(Field::new(&c.name, dt, true))
         })
         .collect();
-    Ok(Arc::new(V57Schema::new(fields?)))
+    Ok(Arc::new(Schema::new(fields?)))
 }
 
-fn mariadb_type_to_arrow(data_type: &str, column_type: &str) -> Result<V57DataType> {
+fn mariadb_type_to_arrow(data_type: &str, column_type: &str) -> Result<DataType> {
     match data_type {
-        "tinyint" => Ok(V57DataType::Int32),
-        "smallint" => Ok(V57DataType::Int16),
-        "int" => Ok(V57DataType::Int32),
-        "mediumint" => Ok(V57DataType::Int32),
-        "bigint" => Ok(V57DataType::Int64),
-        "float" => Ok(V57DataType::Float32),
-        "double" => Ok(V57DataType::Float64),
-        "decimal" => Ok(V57DataType::Float64),
-        "varchar" | "char" | "text" => Ok(V57DataType::Utf8),
-        "json" => Ok(V57DataType::Utf8),
-        "date" => Ok(V57DataType::Date32),
-        "datetime" | "timestamp" => Ok(V57DataType::Timestamp(
-            V57TimeUnit::Microsecond,
-            None,
-        )),
-        "boolean" | "bool" => Ok(V57DataType::Boolean),
-        "blob" => Ok(V57DataType::Binary),
+        "tinyint" => Ok(DataType::Int8),
+        "smallint" => Ok(DataType::Int16),
+        "int" => Ok(DataType::Int32),
+        "mediumint" => Ok(DataType::Int32),
+        "bigint" => Ok(DataType::Int64),
+        "float" => Ok(DataType::Float32),
+        "double" => Ok(DataType::Float64),
+        "decimal" => Ok(DataType::Utf8),
+        "varchar" | "char" | "text" => Ok(DataType::Utf8),
+        "json" => Ok(DataType::Utf8),
+        "date" => Ok(DataType::Date32),
+        "datetime" | "timestamp" => Ok(DataType::Utf8),
+        "boolean" | "bool" => Ok(DataType::Int8),
+        "blob" => Ok(DataType::Binary),
         _ => anyhow::bail!(
             "unsupported MariaDB type for Delta schema: {data_type} ({column_type})"
         ),
@@ -300,7 +293,7 @@ fn mariadb_type_to_arrow(data_type: &str, column_type: &str) -> Result<V57DataTy
 
 fn schema_evolution_check(
     mariadb_columns: &[ColumnInfo],
-    delta_schema: &V57SchemaRef,
+    delta_schema: &SchemaRef,
 ) -> Result<Vec<String>> {
     let delta_names: std::collections::HashSet<&str> = delta_schema
         .fields()
@@ -370,9 +363,9 @@ fn schema_evolution_check(
     Ok(select_columns)
 }
 
-fn types_equivalent(delta_dt: &V57DataType, mariadb_dt: &V57DataType) -> bool {
+fn types_equivalent(delta_dt: &DataType, mariadb_dt: &DataType) -> bool {
     match (delta_dt, mariadb_dt) {
-        (V57DataType::Timestamp(_, tz_a), V57DataType::Timestamp(_, tz_b)) => {
+        (DataType::Timestamp(_, tz_a), DataType::Timestamp(_, tz_b)) => {
             match (tz_a.as_deref(), tz_b.as_deref()) {
                 (Some("UTC"), Some("UTC")) | (None, None) => true,
                 (Some("UTC"), None) | (None, Some("UTC")) => true,
@@ -582,25 +575,24 @@ where
                 batch_size,
             );
 
-            let v54_batches = self.extractor.extract(&sql)?;
-            if v54_batches.is_empty()
-                || v54_batches.iter().all(|b| b.num_rows() == 0)
+            let batches = self.extractor.extract(&sql)?;
+            if batches.is_empty()
+                || batches.iter().all(|b| b.num_rows() == 0)
             {
                 break;
             }
 
-            let batch_rows: u64 = v54_batches.iter().map(|b| b.num_rows() as u64).sum();
-            let arrow_bytes: usize = v54_batches.iter().map(|b| b.get_array_memory_size()).sum();
+            let batch_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+            let arrow_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
             let batch_start = Instant::now();
 
-            let v57_batches = convert_batches(v54_batches)?;
-            let batch_hwm = v57_batches
+            let batch_hwm = batches
                 .last()
                 .and_then(extract_hwm_from_batch)
                 .clone();
 
             self.writer
-                .append_batch(table_name, v57_batches, batch_hwm.clone())
+                .append_batch(table_name, batches, batch_hwm.clone())
                 .await?;
 
             if let Some(h) = batch_hwm {
@@ -645,18 +637,17 @@ where
         columns: &[String],
     ) -> Result<u64> {
         let sql = QueryBuilder::build_full_refresh_query(table_name, columns);
-        let v54_batches = self.extractor.extract(&sql)?;
-        let total_rows: u64 = v54_batches.iter().map(|b| b.num_rows() as u64).sum();
-        let arrow_bytes: usize = v54_batches.iter().map(|b| b.get_array_memory_size()).sum();
+        let batches = self.extractor.extract(&sql)?;
+        let total_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        let arrow_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
         info!(
             table = table_name,
             rows = total_rows,
             arrow_bytes,
             "batch extracted"
         );
-        let v57_batches = convert_batches(v54_batches)?;
         self.writer
-            .overwrite_table(table_name, v57_batches, None)
+            .overwrite_table(table_name, batches, None)
             .await?;
         Ok(total_rows)
     }
@@ -753,7 +744,7 @@ impl SignalHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::record_batch::RecordBatch;
+    use deltalake::arrow::record_batch::RecordBatch;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
@@ -823,9 +814,9 @@ mod tests {
             ColumnInfo { name: "name".into(), data_type: "varchar".into(), column_type: "varchar(255)".into() },
             ColumnInfo { name: "email".into(), data_type: "varchar".into(), column_type: "varchar(255)".into() },
         ];
-        let delta_schema = Arc::new(V57Schema::new(vec![
-            V57Field::new("id", V57DataType::Int64, false),
-            V57Field::new("name", V57DataType::Utf8, false),
+        let delta_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
         ]));
 
         let result = schema_evolution_check(&mariadb_cols, &delta_schema).unwrap();
@@ -837,9 +828,9 @@ mod tests {
         let mariadb_cols = vec![
             ColumnInfo { name: "id".into(), data_type: "bigint".into(), column_type: "bigint(20)".into() },
         ];
-        let delta_schema = Arc::new(V57Schema::new(vec![
-            V57Field::new("id", V57DataType::Int64, false),
-            V57Field::new("name", V57DataType::Utf8, false),
+        let delta_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
         ]));
         let result = schema_evolution_check(&mariadb_cols, &delta_schema);
         assert!(result.is_err());
@@ -852,9 +843,9 @@ mod tests {
             ColumnInfo { name: "id".into(), data_type: "bigint".into(), column_type: "bigint(20)".into() },
             ColumnInfo { name: "name".into(), data_type: "varchar".into(), column_type: "varchar(255)".into() },
         ];
-        let delta_schema = Arc::new(V57Schema::new(vec![
-            V57Field::new("id", V57DataType::Int64, false),
-            V57Field::new("name", V57DataType::Utf8, false),
+        let delta_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
         ]));
         let result = schema_evolution_check(&mariadb_cols, &delta_schema).unwrap();
         assert_eq!(result, vec!["id", "name"]);
@@ -889,12 +880,12 @@ mod tests {
 
     #[test]
     fn mariadb_type_to_arrow_conversions() {
-        assert!(matches!(mariadb_type_to_arrow("bigint", "bigint(20)").unwrap(), V57DataType::Int64));
-        assert!(matches!(mariadb_type_to_arrow("int", "int(11)").unwrap(), V57DataType::Int32));
-        assert!(matches!(mariadb_type_to_arrow("varchar", "varchar(255)").unwrap(), V57DataType::Utf8));
-        assert!(matches!(mariadb_type_to_arrow("timestamp", "timestamp").unwrap(), V57DataType::Timestamp(_, _)));
-        assert!(matches!(mariadb_type_to_arrow("double", "double").unwrap(), V57DataType::Float64));
-        assert!(matches!(mariadb_type_to_arrow("date", "date").unwrap(), V57DataType::Date32));
+        assert!(matches!(mariadb_type_to_arrow("bigint", "bigint(20)").unwrap(), DataType::Int64));
+        assert!(matches!(mariadb_type_to_arrow("int", "int(11)").unwrap(), DataType::Int32));
+        assert!(matches!(mariadb_type_to_arrow("varchar", "varchar(255)").unwrap(), DataType::Utf8));
+        assert!(matches!(mariadb_type_to_arrow("timestamp", "timestamp").unwrap(), DataType::Utf8));
+        assert!(matches!(mariadb_type_to_arrow("double", "double").unwrap(), DataType::Float64));
+        assert!(matches!(mariadb_type_to_arrow("date", "date").unwrap(), DataType::Date32));
         assert!(mariadb_type_to_arrow("geometry", "geometry").is_err());
     }
 
@@ -1121,7 +1112,7 @@ mod tests {
     fn mariadb_type_to_arrow_tinyint() {
         assert!(matches!(
             mariadb_type_to_arrow("tinyint", "tinyint(1)").unwrap(),
-            V57DataType::Int32
+            DataType::Int8
         ));
     }
 
@@ -1129,7 +1120,7 @@ mod tests {
     fn mariadb_type_to_arrow_smallint() {
         assert!(matches!(
             mariadb_type_to_arrow("smallint", "smallint(6)").unwrap(),
-            V57DataType::Int16
+            DataType::Int16
         ));
     }
 
@@ -1137,7 +1128,7 @@ mod tests {
     fn mariadb_type_to_arrow_mediumint() {
         assert!(matches!(
             mariadb_type_to_arrow("mediumint", "mediumint(7)").unwrap(),
-            V57DataType::Int32
+            DataType::Int32
         ));
     }
 
@@ -1145,7 +1136,7 @@ mod tests {
     fn mariadb_type_to_arrow_float() {
         assert!(matches!(
             mariadb_type_to_arrow("float", "float").unwrap(),
-            V57DataType::Float32
+            DataType::Float32
         ));
     }
 
@@ -1153,7 +1144,7 @@ mod tests {
     fn mariadb_type_to_arrow_decimal() {
         assert!(matches!(
             mariadb_type_to_arrow("decimal", "decimal(10,2)").unwrap(),
-            V57DataType::Float64
+            DataType::Utf8
         ));
     }
 
@@ -1161,7 +1152,7 @@ mod tests {
     fn mariadb_type_to_arrow_json() {
         assert!(matches!(
             mariadb_type_to_arrow("json", "json").unwrap(),
-            V57DataType::Utf8
+            DataType::Utf8
         ));
     }
 
@@ -1169,7 +1160,7 @@ mod tests {
     fn mariadb_type_to_arrow_char() {
         assert!(matches!(
             mariadb_type_to_arrow("char", "char(10)").unwrap(),
-            V57DataType::Utf8
+            DataType::Utf8
         ));
     }
 
@@ -1177,7 +1168,7 @@ mod tests {
     fn mariadb_type_to_arrow_text() {
         assert!(matches!(
             mariadb_type_to_arrow("text", "text").unwrap(),
-            V57DataType::Utf8
+            DataType::Utf8
         ));
     }
 
@@ -1185,7 +1176,7 @@ mod tests {
     fn mariadb_type_to_arrow_datetime() {
         assert!(matches!(
             mariadb_type_to_arrow("datetime", "datetime").unwrap(),
-            V57DataType::Timestamp(_, _)
+            DataType::Utf8
         ));
     }
 
@@ -1193,7 +1184,7 @@ mod tests {
     fn mariadb_type_to_arrow_bool() {
         assert!(matches!(
             mariadb_type_to_arrow("bool", "bool").unwrap(),
-            V57DataType::Boolean
+            DataType::Int8
         ));
     }
 
@@ -1201,7 +1192,7 @@ mod tests {
     fn mariadb_type_to_arrow_blob() {
         assert!(matches!(
             mariadb_type_to_arrow("blob", "blob").unwrap(),
-            V57DataType::Binary
+            DataType::Binary
         ));
     }
 
@@ -1211,9 +1202,9 @@ mod tests {
             ColumnInfo { name: "id".into(), data_type: "bigint".into(), column_type: "bigint(20)".into() },
             ColumnInfo { name: "age".into(), data_type: "bigint".into(), column_type: "bigint(20)".into() },
         ];
-        let delta_schema = Arc::new(V57Schema::new(vec![
-            V57Field::new("id", V57DataType::Int64, false),
-            V57Field::new("age", V57DataType::Int32, false),
+        let delta_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("age", DataType::Int32, false),
         ]));
         let result = schema_evolution_check(&mariadb_cols, &delta_schema);
         assert!(result.is_err());
@@ -1265,15 +1256,15 @@ mod tests {
             .returning(move |_| {
                 let count = call_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if count < 2 {
-                    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-                        arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int32, false),
-                        arrow::datatypes::Field::new("val", arrow::datatypes::DataType::Int32, false),
+                    let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                        deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int32, false),
+                        deltalake::arrow::datatypes::Field::new("val", deltalake::arrow::datatypes::DataType::Int32, false),
                     ]));
-                    let batch = arrow::record_batch::RecordBatch::try_new(
+                    let batch = deltalake::arrow::record_batch::RecordBatch::try_new(
                         schema,
                         vec![
-                            Arc::new(arrow::array::Int32Array::from(vec![1i32])),
-                            Arc::new(arrow::array::Int32Array::from(vec![1i32])),
+                            Arc::new(deltalake::arrow::array::Int32Array::from(vec![1i32])),
+                            Arc::new(deltalake::arrow::array::Int32Array::from(vec![1i32])),
                         ],
                     )
                     .unwrap();
@@ -1340,9 +1331,9 @@ mod tests {
 
         let columns = make_columns();
 
-        let existing_schema = Arc::new(V57Schema::new(vec![
-            V57Field::new("id", V57DataType::Int64, false),
-            V57Field::new("name", V57DataType::Utf8, false),
+        let existing_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
         ]));
 
         state_mock
@@ -1444,15 +1435,15 @@ mod tests {
         extract_mock
             .expect_extract()
             .returning(|_| {
-                let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-                    arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
-                    arrow::datatypes::Field::new("name", arrow::datatypes::DataType::Utf8, false),
+                let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                    deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+                    deltalake::arrow::datatypes::Field::new("name", deltalake::arrow::datatypes::DataType::Utf8, false),
                 ]));
-                let batch = arrow::record_batch::RecordBatch::try_new(
+                let batch = deltalake::arrow::record_batch::RecordBatch::try_new(
                     schema,
                     vec![
-                        Arc::new(arrow::array::Int64Array::from(vec![1i64, 2i64])),
-                        Arc::new(arrow::array::StringArray::from(vec!["a", "b"])),
+                        Arc::new(deltalake::arrow::array::Int64Array::from(vec![1i64, 2i64])),
+                        Arc::new(deltalake::arrow::array::StringArray::from(vec!["a", "b"])),
                     ],
                 )
                 .unwrap();
@@ -1515,37 +1506,37 @@ mod tests {
             .returning(move |_| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {
-                    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-                        arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
-                        arrow::datatypes::Field::new(
+                    let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                        deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+                        deltalake::arrow::datatypes::Field::new(
                             "updated_at",
-                            arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                            deltalake::arrow::datatypes::DataType::Timestamp(deltalake::arrow::datatypes::TimeUnit::Microsecond, None),
                             false,
                         ),
                     ]));
                     let batch = RecordBatch::try_new(
                         schema,
                         vec![
-                            Arc::new(arrow::array::Int64Array::from(vec![1i64])),
-                            Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![1743158400000000i64])),
+                            Arc::new(deltalake::arrow::array::Int64Array::from(vec![1i64])),
+                            Arc::new(deltalake::arrow::array::TimestampMicrosecondArray::from(vec![1743158400000000i64])),
                         ],
                     )
                     .unwrap();
                     Ok(vec![batch])
                 } else if count == 1 {
-                    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-                        arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
-                        arrow::datatypes::Field::new(
+                    let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                        deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+                        deltalake::arrow::datatypes::Field::new(
                             "updated_at",
-                            arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                            deltalake::arrow::datatypes::DataType::Timestamp(deltalake::arrow::datatypes::TimeUnit::Microsecond, None),
                             false,
                         ),
                     ]));
                     let batch = RecordBatch::try_new(
                         schema,
                         vec![
-                            Arc::new(arrow::array::Int64Array::from(vec![2i64])),
-                            Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![1743158401000000i64])),
+                            Arc::new(deltalake::arrow::array::Int64Array::from(vec![2i64])),
+                            Arc::new(deltalake::arrow::array::TimestampMicrosecondArray::from(vec![1743158401000000i64])),
                         ],
                     )
                     .unwrap();
@@ -1609,19 +1600,19 @@ mod tests {
             .returning(move |_| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {
-                    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-                        arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
-                        arrow::datatypes::Field::new(
+                    let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                        deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+                        deltalake::arrow::datatypes::Field::new(
                             "updated_at",
-                            arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                            deltalake::arrow::datatypes::DataType::Timestamp(deltalake::arrow::datatypes::TimeUnit::Microsecond, None),
                             false,
                         ),
                     ]));
                     let batch = RecordBatch::try_new(
                         schema,
                         vec![
-                            Arc::new(arrow::array::Int64Array::from(vec![1i64, 2i64, 3i64])),
-                            Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                            Arc::new(deltalake::arrow::array::Int64Array::from(vec![1i64, 2i64, 3i64])),
+                            Arc::new(deltalake::arrow::array::TimestampMicrosecondArray::from(vec![
                                 1743158400000000i64,
                                 1743158400000000i64,
                                 1743158401000000i64,
@@ -1654,9 +1645,9 @@ mod tests {
             ColumnInfo { name: "id".into(), data_type: "bigint".into(), column_type: "bigint(20)".into() },
             ColumnInfo { name: "location".into(), data_type: "geometry".into(), column_type: "geometry".into() },
         ];
-        let delta_schema = Arc::new(V57Schema::new(vec![
-            V57Field::new("id", V57DataType::Int64, false),
-            V57Field::new("location", V57DataType::Binary, false),
+        let delta_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("location", DataType::Binary, false),
         ]));
 
         let result = schema_evolution_check(&mariadb_cols, &delta_schema).unwrap();
@@ -1799,19 +1790,19 @@ mod tests {
             .returning(move |_| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {
-                    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-                        arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
-                        arrow::datatypes::Field::new(
+                    let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                        deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+                        deltalake::arrow::datatypes::Field::new(
                             "updated_at",
-                            arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                            deltalake::arrow::datatypes::DataType::Timestamp(deltalake::arrow::datatypes::TimeUnit::Microsecond, None),
                             false,
                         ),
                     ]));
                     let batch = RecordBatch::try_new(
                         schema,
                         vec![
-                            Arc::new(arrow::array::Int64Array::from(vec![1i64])),
-                            Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![1743158400000000i64])),
+                            Arc::new(deltalake::arrow::array::Int64Array::from(vec![1i64])),
+                            Arc::new(deltalake::arrow::array::TimestampMicrosecondArray::from(vec![1743158400000000i64])),
                         ],
                     )
                     .unwrap();
@@ -1864,12 +1855,12 @@ mod tests {
         extract_mock
             .expect_extract()
             .returning(|_| {
-                let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-                    arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+                let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                    deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
                 ]));
                 let batch = RecordBatch::try_new(
                     schema,
-                    vec![Arc::new(arrow::array::Int64Array::from(vec![1i64]))],
+                    vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![1i64]))],
                 )
                 .unwrap();
                 Ok(vec![batch])
@@ -2046,15 +2037,15 @@ mod tests {
                     let _ = tx_clone.send(true);
                 }
                 if count < 3 {
-                    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-                        arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int32, false),
-                        arrow::datatypes::Field::new("val", arrow::datatypes::DataType::Int32, false),
+                    let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                        deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int32, false),
+                        deltalake::arrow::datatypes::Field::new("val", deltalake::arrow::datatypes::DataType::Int32, false),
                     ]));
-                    let batch = arrow::record_batch::RecordBatch::try_new(
+                    let batch = deltalake::arrow::record_batch::RecordBatch::try_new(
                         schema,
                         vec![
-                            Arc::new(arrow::array::Int32Array::from(vec![1i32])),
-                            Arc::new(arrow::array::Int32Array::from(vec![1i32])),
+                            Arc::new(deltalake::arrow::array::Int32Array::from(vec![1i32])),
+                            Arc::new(deltalake::arrow::array::Int32Array::from(vec![1i32])),
                         ],
                     )
                     .unwrap();
@@ -2149,19 +2140,19 @@ mod tests {
             .returning(move |_| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {
-                    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-                        arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
-                        arrow::datatypes::Field::new(
+                    let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                        deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+                        deltalake::arrow::datatypes::Field::new(
                             "updated_at",
-                            arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                            deltalake::arrow::datatypes::DataType::Timestamp(deltalake::arrow::datatypes::TimeUnit::Microsecond, None),
                             false,
                         ),
                     ]));
                     let batch = RecordBatch::try_new(
                         schema,
                         vec![
-                            Arc::new(arrow::array::Int64Array::from(vec![1i64])),
-                            Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![1743158400000000i64])),
+                            Arc::new(deltalake::arrow::array::Int64Array::from(vec![1i64])),
+                            Arc::new(deltalake::arrow::array::TimestampMicrosecondArray::from(vec![1743158400000000i64])),
                         ],
                     )
                     .unwrap();
