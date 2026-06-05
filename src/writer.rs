@@ -95,25 +95,32 @@ impl DeltaWriter {
                 info!(table = table_name, "Delta table already exists");
                 Ok(table)
             }
-            Err(deltalake::DeltaTableError::NotATable(_)) => {
-                info!(table = table_name, "Creating new Delta table");
-                let delta_schema = arrow_schema_to_delta(&schema)?;
+            Err(e) => {
+                let is_new_table = matches!(
+                    &e,
+                    deltalake::DeltaTableError::NotATable(_)
+                        | deltalake::DeltaTableError::InvalidTableLocation(_)
+                ) || e.to_string().contains("does not exist");
 
-                #[allow(deprecated)]
-                let table = deltalake::DeltaOps::try_from_url_with_storage_options(
-                    url,
-                    self.storage_options.clone(),
-                )
-                .await?
-                .create()
-                .with_columns(delta_schema.fields().cloned())
-                .with_table_name(table_name)
-                .await?;
+                if is_new_table {
+                    info!(table = table_name, "Creating new Delta table");
+                    let delta_schema = arrow_schema_to_delta(&schema)?;
 
-                info!(table = table_name, "Delta table created");
-                Ok(table)
+                    let table = deltalake::DeltaTableBuilder::from_url(url.clone())?
+                        .with_storage_options(self.storage_options.clone())
+                        .build()?;
+
+                    let created = table.create()
+                        .with_columns(delta_schema.fields().cloned())
+                        .with_table_name(table_name)
+                        .await?;
+
+                    info!(table = table_name, "Delta table created");
+                    Ok(created)
+                } else {
+                    Err(e).context(format!("S3 connection error for table {table_name}"))
+                }
             }
-            Err(e) => Err(e).context(format!("S3 connection error for table {table_name}")),
         }
     }
 
@@ -130,24 +137,17 @@ impl DeltaWriter {
         let commit_properties = build_commit_properties(hwm);
 
         let url = self.table_url(table_name)?;
-        // NOTE: DeltaOps deprecated — see ensure_table() comment. Replace with
-        // DeltaTable::write() when upgrading to deltalake 0.32+.
-        #[allow(deprecated)]
-        let ops = deltalake::DeltaOps::try_from_url_with_storage_options(
-            url,
-            self.storage_options.clone(),
-        )
-        .await?;
+        let mut table = deltalake::DeltaTableBuilder::from_url(url)?
+            .with_storage_options(self.storage_options.clone())
+            .build()?;
+        table.load().await?;
 
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
-        #[allow(deprecated)]
-        {
-            ops.write(batches)
-                .with_save_mode(SaveMode::Append)
-                .with_commit_properties(commit_properties)
-                .await?;
-        }
+        table.write(batches)
+            .with_save_mode(SaveMode::Append)
+            .with_commit_properties(commit_properties)
+            .await?;
 
         info!(
             table = table_name,
@@ -172,19 +172,14 @@ impl DeltaWriter {
         let commit_properties = build_commit_properties(hwm);
 
         let url = self.table_url(table_name)?;
-        // NOTE: DeltaOps deprecated — see ensure_table() comment. Replace with
-        // DeltaTable::write() when upgrading to deltalake 0.32+.
-        #[allow(deprecated)]
-        let ops = deltalake::DeltaOps::try_from_url_with_storage_options(
-            url,
-            self.storage_options.clone(),
-        )
-        .await?;
+        let mut table = deltalake::DeltaTableBuilder::from_url(url)?
+            .with_storage_options(self.storage_options.clone())
+            .build()?;
+        table.load().await?;
 
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
-        #[allow(deprecated)]
-        ops.write(batches)
+        table.write(batches)
             .with_save_mode(SaveMode::Overwrite)
             .with_commit_properties(commit_properties)
             .await?;
