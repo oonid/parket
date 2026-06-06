@@ -370,6 +370,13 @@ fn types_equivalent(delta_dt: &DataType, mariadb_dt: &DataType) -> bool {
                 (a, b) => a == b,
             }
         }
+        // Delta stores Int8/Int16/Int32/UInt8/UInt16/UInt32 all as INTEGER,
+        // which round-trips back as Int32. Accept any of those widths when
+        // the Delta side shows Int32.
+        (DataType::Int32, DataType::Int8 | DataType::Int16 | DataType::Int32
+            | DataType::UInt8 | DataType::UInt16 | DataType::UInt32) => true,
+        // Similarly Int64 and UInt64 both map to Delta LONG -> Int64.
+        (DataType::Int64, DataType::Int64 | DataType::UInt64) => true,
         _ => delta_dt == mariadb_dt,
     }
 }
