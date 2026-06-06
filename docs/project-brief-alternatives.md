@@ -515,6 +515,8 @@ FullRefresh implies the table has no reliable change tracking. Overwrite is the 
 
 Edge case: if the extraction fails mid-run, the old data remains intact (Overwrite only commits on success).
 
+> **Outcome (2026-06-06):** FullRefresh was extended to paginate via `LIMIT … OFFSET …` rather than loading the entire table into RAM. Large tables (100M+ rows) previously caused multi-hour runs under swap I/O pressure. The write strategy is: chunk 0 uses `SaveMode::Overwrite` (atomically replaces existing data); chunks 1+ use `SaveMode::Append`. A crash mid-stream leaves partial data — the next run restarts from offset 0 and overwrites again. The "Overwrite is atomic" guarantee now applies only to the first chunk; subsequent appends are individually committed. See [Query Patterns](query-patterns.md) and [Orchestrator](orchestrator.md) for full details.
+
 ---
 
 ## 10. Execution Model

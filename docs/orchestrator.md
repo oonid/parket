@@ -38,9 +38,12 @@ run()
      │   │
      │   └─ if FullRefresh:
      │       └─ process_full_refresh()
-     │           ├─ build_full_refresh_query(table, columns)
-     │           ├─ extract(sql)
-     │           └─ overwrite_table(table, batches)
+     │           └─ loop (chunk_index = 0, 1, 2, …):
+     │               ├─ build_full_refresh_query_paged(table, columns, batch_size, offset)
+     │               ├─ extract(sql)          → arrow 58 batches
+     │               ├─ chunk 0: overwrite_table(table, batches)
+     │               ├─ chunk 1+: append_batch(table, batches)
+     │               └─ break if 0 rows or partial chunk
      │
      └─ update_table(name, state)             → StateManage
 ```
@@ -147,6 +150,33 @@ Used by `column_info_to_v57_schema()` to build the Delta table schema from Maria
 Unsupported types (e.g., geometry, enum) cause `column_info_to_v57_schema()` to return an error, preventing table creation.
 
 **HWM note:** `extract_hwm_from_batch()` in `writer.rs` handles both `Timestamp(Microsecond, _)` and `Utf8` for the `updated_at` column — incremental watermark tracking works regardless of timestamp representation.
+
+## FullRefresh Chunked Write Strategy
+
+FullRefresh uses `LIMIT … OFFSET …` pagination so memory usage is bounded by `TARGET_MEMORY_MB` regardless of table size (see [Query Patterns](query-patterns.md)).
+
+### Write ordering
+
+| Chunk | Method | Effect |
+|---|---|---|
+| 0 (first) | `overwrite_table` (`SaveMode::Overwrite`) | Atomically replaces any existing Delta table contents with the first chunk |
+| 1, 2, … (rest) | `append_batch` (`SaveMode::Append`) | Appends subsequent chunks to the table |
+
+The first chunk's `Overwrite` ensures stale data from a previous run is cleared before new data arrives. Subsequent chunks append without re-reading what was already written.
+
+### Crash behaviour
+
+If the process is killed mid-stream (after chunk 0 commits but before the final chunk), the Delta table contains partial data from the current run. The next run restarts from chunk 0 (offset 0), overwriting the partial state — no manual recovery needed.
+
+### Shutdown signal during FullRefresh
+
+The loop checks `SIGTERM`/`SIGINT` between chunks. On signal, the loop breaks cleanly and the orchestrator marks the table as succeeded with the rows written so far. The next run restarts from offset 0.
+
+### Progress logging
+
+Without `--progress`: one `"batch extracted"` log per chunk (rows, arrow_bytes).
+
+With `--progress`: one `"full refresh chunk"` log per chunk (chunk_index, rows, cumulative_rows, arrow_bytes, chunk_duration_ms). On a large table this provides a log line every few minutes rather than silence for hours.
 
 ## State Updates
 

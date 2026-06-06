@@ -38,15 +38,31 @@ HWM values are interpolated inline (not parameterized) because connector-x does 
 
 ## FullRefresh Mode
 
-FullRefresh extraction reads the entire table in one query.
+FullRefresh extraction reads the entire table in paginated chunks using `LIMIT … OFFSET …`.
 
-### SQL Template
+### SQL Template (per chunk)
 
 ```sql
-SELECT `col1`, `col2`, ... FROM `table`
+SELECT `col1`, `col2`, ... FROM `table` LIMIT <batch_size> OFFSET <chunk_index * batch_size>
 ```
 
-No WHERE clause, no LIMIT, no ORDER BY. connector-x streaming handles memory-bounded reading of the full result set.
+`batch_size` is the same value computed from `TARGET_MEMORY_MB` and `AVG_ROW_LENGTH` that Incremental uses. The orchestrator loops: chunk 0 calls `overwrite_table` (atomic replacement of existing data), chunks 1+ call `append_batch`. The loop exits when a chunk returns fewer rows than `batch_size`.
+
+### Why LIMIT+OFFSET, not a single unbounded query
+
+Without pagination, the entire table is loaded into RAM as `Vec<RecordBatch>` before any data reaches Delta Lake. For tables with tens or hundreds of millions of rows, this causes swap I/O and multi-hour wall-clock times dominated by Parquet serialisation under memory pressure. With chunked pagination, each chunk is extracted, written, and freed before the next is fetched.
+
+### LIMIT+OFFSET performance note
+
+`LIMIT N OFFSET M` on InnoDB without `ORDER BY` performs a sequential scan that reads and discards M rows before returning N — O(N²) total DB read work across all chunks. In practice this is acceptable because the bottleneck is writing to Delta Lake (Parquet encoding), not reading from MariaDB.
+
+If DB read time becomes the bottleneck (very large tables, slow disk), the upgrade path is keyset pagination:
+
+```sql
+SELECT ... FROM `table` WHERE `pk` > <last_pk> ORDER BY `pk` LIMIT <batch_size>
+```
+
+This requires auto-detecting the primary key column from `information_schema` — not yet implemented.
 
 ## Backtick Quoting
 
@@ -80,10 +96,16 @@ Table: `orders`, columns: `id`, batch_size: `5000`
 SELECT `id` FROM `orders` ORDER BY `updated_at` ASC, `id` ASC LIMIT 5000
 ```
 
-### FullRefresh
+### FullRefresh (first chunk)
 
-Table: `customers`, columns: `id, email`
+Table: `customers`, columns: `id, email`, batch_size: `10000`
 
 ```sql
-SELECT `id`, `email` FROM `customers`
+SELECT `id`, `email` FROM `customers` LIMIT 10000 OFFSET 0
+```
+
+### FullRefresh (second chunk)
+
+```sql
+SELECT `id`, `email` FROM `customers` LIMIT 10000 OFFSET 10000
 ```
