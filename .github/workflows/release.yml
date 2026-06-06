@@ -21,6 +21,8 @@ jobs:
           - target: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -51,6 +53,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - name: Download all binaries
         uses: actions/download-artifact@v4
@@ -85,6 +89,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - name: Download musl binaries
         uses: actions/download-artifact@v4
