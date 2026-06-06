@@ -1,0 +1,9 @@
+[submodule "vendor/connector_arrow"]
+	path = vendor/connector_arrow
+	url = git@github.com:aljazerzen/connector_arrow.git
+[submodule "reference/delta-rs"]
+	path = reference/delta-rs
+	url = git@github.com:delta-io/delta-rs.git
+[submodule "reference/connector-x"]
+	path = reference/connector-x
+	url = git@github.com:sfu-db/connector-x.git
