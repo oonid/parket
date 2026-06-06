@@ -641,19 +641,69 @@ where
         table_name: &str,
         columns: &[String],
     ) -> Result<u64> {
-        let sql = QueryBuilder::build_full_refresh_query(table_name, columns);
-        let batches = self.extractor.extract(&sql)?;
-        let total_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
-        let arrow_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
-        info!(
-            table = table_name,
-            rows = total_rows,
-            arrow_bytes,
-            "batch extracted"
-        );
-        self.writer
-            .overwrite_table(table_name, batches, None)
-            .await?;
+        let batch_size = self.extractor.batch_size();
+        let mut total_rows = 0u64;
+        let mut chunk_index: u64 = 0;
+
+        loop {
+            if self.check_shutdown() {
+                info!(table = table_name, "shutdown signal received during full refresh");
+                break;
+            }
+
+            let chunk_start = Instant::now();
+            let offset = chunk_index * batch_size;
+            let sql = QueryBuilder::build_full_refresh_query_paged(
+                table_name, columns, batch_size, offset,
+            );
+
+            let batches = self.extractor.extract(&sql)?;
+
+            if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
+                break;
+            }
+
+            let chunk_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+            let arrow_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+
+            if chunk_index == 0 {
+                self.writer
+                    .overwrite_table(table_name, batches, None)
+                    .await?;
+            } else {
+                self.writer
+                    .append_batch(table_name, batches, None)
+                    .await?;
+            }
+
+            total_rows += chunk_rows;
+            chunk_index += 1;
+            let chunk_elapsed = chunk_start.elapsed();
+
+            if self.progress {
+                info!(
+                    table = table_name,
+                    chunk_index,
+                    rows = chunk_rows,
+                    cumulative_rows = total_rows,
+                    arrow_bytes,
+                    chunk_duration_ms = chunk_elapsed.as_millis(),
+                    "full refresh chunk"
+                );
+            } else {
+                info!(
+                    table = table_name,
+                    rows = chunk_rows,
+                    arrow_bytes,
+                    "batch extracted"
+                );
+            }
+
+            if chunk_rows < batch_size {
+                break;
+            }
+        }
+
         Ok(total_rows)
     }
 }
@@ -1433,6 +1483,9 @@ mod tests {
         extract_mock
             .expect_calculate_batch_size()
             .returning(|_| 10000);
+        extract_mock
+            .expect_batch_size()
+            .returning(|| 10000);
         writer_mock
             .expect_ensure_table()
             .returning(|_, _| Ok(()));
@@ -1853,6 +1906,9 @@ mod tests {
         extract_mock
             .expect_calculate_batch_size()
             .returning(|_| 10000);
+        extract_mock
+            .expect_batch_size()
+            .returning(|| 10000);
         writer_mock
             .expect_ensure_table()
             .returning(|_, _| Ok(()));
@@ -2104,6 +2160,132 @@ mod tests {
     fn signal_handler_watch_channel_starts_false() {
         let (_handler, rx) = SignalHandler::new();
         assert!(!*rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn full_refresh_multi_chunk_overwrite_then_append() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config_with_full_refresh(vec!["products".to_string()]);
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock.expect_load_or_default().returning(|_| AppState::default());
+        schema_mock.expect_discover_columns().returning(move |_| Ok(make_full_refresh_columns()));
+        schema_mock.expect_get_avg_row_length().returning(|_| Ok(Some(100)));
+        extract_mock.expect_calculate_batch_size().returning(|_| 2);
+        extract_mock.expect_batch_size().returning(|| 2);
+        writer_mock.expect_ensure_table().returning(|_, _| Ok(()));
+        writer_mock.expect_get_schema().returning(|_| Ok(None));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        extract_mock.expect_extract().returning(move |_| {
+            let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+            let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+            ]));
+            let rows: Vec<i64> = match count {
+                0 => vec![1, 2],
+                1 => vec![3, 4],
+                2 => vec![5],
+                _ => vec![],
+            };
+            if rows.is_empty() {
+                return Ok(vec![]);
+            }
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![Arc::new(deltalake::arrow::array::Int64Array::from(rows))],
+            ).unwrap();
+            Ok(vec![batch])
+        });
+
+        writer_mock.expect_overwrite_table().times(1).returning(|_, _, _| Ok(()));
+        writer_mock.expect_append_batch().times(2).returning(|_, _, _| Ok(()));
+        state_mock.expect_update_table().returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success));
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn full_refresh_empty_table_writes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config_with_full_refresh(vec!["products".to_string()]);
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock.expect_load_or_default().returning(|_| AppState::default());
+        schema_mock.expect_discover_columns().returning(move |_| Ok(make_full_refresh_columns()));
+        schema_mock.expect_get_avg_row_length().returning(|_| Ok(Some(100)));
+        extract_mock.expect_calculate_batch_size().returning(|_| 10000);
+        extract_mock.expect_batch_size().returning(|| 10000);
+        writer_mock.expect_ensure_table().returning(|_, _| Ok(()));
+        writer_mock.expect_get_schema().returning(|_| Ok(None));
+        extract_mock.expect_extract().returning(|_| Ok(vec![]));
+        state_mock.expect_update_table()
+            .withf(|_, state, _| {
+                state.last_run_status.as_deref() == Some("success")
+                    && state.last_run_rows == Some(0)
+            })
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success));
+    }
+
+    #[tokio::test]
+    async fn full_refresh_second_chunk_append_failure_propagates() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config_with_full_refresh(vec!["products".to_string()]);
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock.expect_load_or_default().returning(|_| AppState::default());
+        schema_mock.expect_discover_columns().returning(move |_| Ok(make_full_refresh_columns()));
+        schema_mock.expect_get_avg_row_length().returning(|_| Ok(Some(100)));
+        extract_mock.expect_calculate_batch_size().returning(|_| 1);
+        extract_mock.expect_batch_size().returning(|| 1);
+        writer_mock.expect_ensure_table().returning(|_, _| Ok(()));
+        writer_mock.expect_get_schema().returning(|_| Ok(None));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        extract_mock.expect_extract().returning(move |_| {
+            let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+            let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+            ]));
+            if count < 2 {
+                let batch = RecordBatch::try_new(
+                    schema,
+                    vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![count as i64 + 1]))],
+                ).unwrap();
+                Ok(vec![batch])
+            } else {
+                Ok(vec![])
+            }
+        });
+
+        writer_mock.expect_overwrite_table().times(1).returning(|_, _, _| Ok(()));
+        writer_mock.expect_append_batch().times(1)
+            .returning(|_, _, _| Err(anyhow::anyhow!("append failed")));
+        state_mock.expect_update_table()
+            .withf(|_, state, _| state.last_run_status.as_deref() == Some("failed"))
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Fatal));
     }
 
     #[tokio::test]
