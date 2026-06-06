@@ -273,18 +273,16 @@ fn mariadb_type_to_arrow(data_type: &str, column_type: &str) -> Result<DataType>
     match data_type {
         "tinyint" => Ok(DataType::Int8),
         "smallint" => Ok(DataType::Int16),
-        "int" => Ok(DataType::Int32),
-        "mediumint" => Ok(DataType::Int32),
+        "int" | "mediumint" => Ok(DataType::Int32),
         "bigint" => Ok(DataType::Int64),
         "float" => Ok(DataType::Float32),
         "double" => Ok(DataType::Float64),
-        "decimal" => Ok(DataType::Utf8),
-        "varchar" | "char" | "text" => Ok(DataType::Utf8),
-        "json" => Ok(DataType::Utf8),
-        "date" => Ok(DataType::Date32),
-        "datetime" | "timestamp" => Ok(DataType::Utf8),
+        "decimal" | "numeric" => Ok(DataType::Utf8),
+        "varchar" | "char" | "text" | "tinytext" | "mediumtext" | "longtext" => Ok(DataType::Utf8),
+        "json" | "enum" | "set" => Ok(DataType::Utf8),
+        "date" | "datetime" | "timestamp" => Ok(DataType::Utf8),
         "boolean" | "bool" => Ok(DataType::Int8),
-        "blob" => Ok(DataType::Binary),
+        "blob" | "tinyblob" | "mediumblob" | "longblob" | "binary" | "varbinary" => Ok(DataType::Binary),
         _ => anyhow::bail!(
             "unsupported MariaDB type for Delta schema: {data_type} ({column_type})"
         ),
@@ -885,7 +883,9 @@ mod tests {
         assert!(matches!(mariadb_type_to_arrow("varchar", "varchar(255)").unwrap(), DataType::Utf8));
         assert!(matches!(mariadb_type_to_arrow("timestamp", "timestamp").unwrap(), DataType::Utf8));
         assert!(matches!(mariadb_type_to_arrow("double", "double").unwrap(), DataType::Float64));
-        assert!(matches!(mariadb_type_to_arrow("date", "date").unwrap(), DataType::Date32));
+        assert!(matches!(mariadb_type_to_arrow("date", "date").unwrap(), DataType::Utf8));
+        assert!(matches!(mariadb_type_to_arrow("mediumtext", "mediumtext").unwrap(), DataType::Utf8));
+        assert!(matches!(mariadb_type_to_arrow("enum", "enum('a','b')").unwrap(), DataType::Utf8));
         assert!(mariadb_type_to_arrow("geometry", "geometry").is_err());
     }
 
@@ -1658,7 +1658,7 @@ mod tests {
     fn column_info_to_v57_schema_unsupported_type() {
         let columns = vec![
             ColumnInfo { name: "id".into(), data_type: "bigint".into(), column_type: "bigint(20)".into() },
-            ColumnInfo { name: "data".into(), data_type: "enum".into(), column_type: "enum('a','b')".into() },
+            ColumnInfo { name: "data".into(), data_type: "geometry".into(), column_type: "geometry".into() },
         ];
         let result = column_info_to_v57_schema(&columns);
         assert!(result.is_err());
