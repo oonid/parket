@@ -42,6 +42,17 @@ impl QueryBuilder {
         let quoted_table = backtick(table);
         format!("SELECT {col_list} FROM {quoted_table}")
     }
+
+    pub fn build_full_refresh_query_paged(
+        table: &str,
+        columns: &[String],
+        batch_size: u64,
+        offset: u64,
+    ) -> String {
+        let col_list = format_columns(columns);
+        let quoted_table = backtick(table);
+        format!("SELECT {col_list} FROM {quoted_table} LIMIT {batch_size} OFFSET {offset}")
+    }
 }
 
 #[cfg(test)]
@@ -229,5 +240,49 @@ mod tests {
             sql,
             "SELECT `id` FROM `orders` ORDER BY `updated_at` ASC, `id` ASC LIMIT 5000"
         );
+    }
+
+    #[test]
+    fn full_refresh_paged_contains_limit_and_offset() {
+        let sql = QueryBuilder::build_full_refresh_query_paged(
+            "orders", &["id".to_string(), "name".to_string()], 5000, 0,
+        );
+        assert!(sql.contains("LIMIT 5000"));
+        assert!(sql.contains("OFFSET 0"));
+        assert!(!sql.contains("WHERE"));
+        assert!(!sql.contains("ORDER BY"));
+    }
+
+    #[test]
+    fn full_refresh_paged_second_page_offset() {
+        let sql = QueryBuilder::build_full_refresh_query_paged(
+            "orders", &["id".to_string()], 5000, 5000,
+        );
+        assert!(sql.contains("LIMIT 5000"));
+        assert!(sql.contains("OFFSET 5000"));
+    }
+
+    #[test]
+    fn full_refresh_paged_exact_output() {
+        let sql = QueryBuilder::build_full_refresh_query_paged(
+            "customers", &["id".to_string(), "email".to_string()], 1000, 2000,
+        );
+        assert_eq!(sql, "SELECT `id`, `email` FROM `customers` LIMIT 1000 OFFSET 2000");
+    }
+
+    #[test]
+    fn full_refresh_paged_backtick_quoting() {
+        let sql = QueryBuilder::build_full_refresh_query_paged(
+            "order", &["id".to_string()], 100, 0,
+        );
+        assert!(sql.contains("FROM `order`"));
+    }
+
+    #[test]
+    fn full_refresh_paged_zero_offset_first_page() {
+        let sql = QueryBuilder::build_full_refresh_query_paged(
+            "t", &["a".to_string()], 10000, 0,
+        );
+        assert!(sql.ends_with("LIMIT 10000 OFFSET 0"));
     }
 }
