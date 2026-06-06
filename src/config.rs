@@ -275,6 +275,20 @@ mod tests {
         }
     }
 
+    struct CwdGuard(std::path::PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    fn no_dotenv() -> CwdGuard {
+        let original = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/"));
+        let _ = std::env::set_current_dir("/tmp");
+        CwdGuard(original)
+    }
+
     #[test]
     #[serial]
     fn load_valid_config_with_all_required_vars() {
@@ -294,6 +308,7 @@ mod tests {
     #[test]
     #[serial]
     fn load_fails_when_database_url_missing() {
+        let _guard = no_dotenv();
         clear_config_env();
         set_required_vars();
         unsafe {
@@ -366,6 +381,7 @@ mod tests {
     #[test]
     #[serial]
     fn load_fails_when_tables_missing() {
+        let _guard = no_dotenv();
         clear_config_env();
         set_required_vars();
         unsafe {
@@ -384,6 +400,7 @@ mod tests {
     #[test]
     #[serial]
     fn load_fails_when_target_memory_mb_missing() {
+        let _guard = no_dotenv();
         clear_config_env();
         set_required_vars();
         unsafe {
@@ -774,6 +791,7 @@ mod tests {
     #[test]
     #[serial]
     fn load_local_fails_without_database_url() {
+        let _guard = no_dotenv();
         clear_config_env();
         unsafe {
             env::set_var("TABLES", "orders");
@@ -787,6 +805,7 @@ mod tests {
     #[test]
     #[serial]
     fn load_local_fails_without_tables() {
+        let _guard = no_dotenv();
         clear_config_env();
         unsafe {
             env::set_var("DATABASE_URL", "mysql://user:pass@host:3306/dbname");
@@ -800,6 +819,7 @@ mod tests {
     #[test]
     #[serial]
     fn load_local_fails_without_target_memory() {
+        let _guard = no_dotenv();
         clear_config_env();
         unsafe {
             env::set_var("DATABASE_URL", "mysql://user:pass@host:3306/dbname");
