@@ -16,6 +16,7 @@ pub mod cli;
 pub mod config;
 pub mod discovery;
 pub mod extractor;
+pub mod inspect;
 pub mod orchestrator;
 pub mod preflight;
 pub mod query;

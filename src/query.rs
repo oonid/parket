@@ -16,22 +16,24 @@ impl QueryBuilder {
     pub fn build_incremental_query(
         table: &str,
         columns: &[String],
+        timestamp_col: &str,
         hwm_updated_at: Option<&str>,
         hwm_last_id: Option<i64>,
         batch_size: u64,
     ) -> String {
         let col_list = format_columns(columns);
         let quoted_table = backtick(table);
+        let ts = backtick(timestamp_col);
 
         match (hwm_updated_at, hwm_last_id) {
             (Some(updated_at), Some(last_id)) => {
                 format!(
-                    "SELECT {col_list} FROM {quoted_table} WHERE (`updated_at` = '{updated_at}' AND `id` > {last_id}) OR (`updated_at` > '{updated_at}') ORDER BY `updated_at` ASC, `id` ASC LIMIT {batch_size}"
+                    "SELECT {col_list} FROM {quoted_table} WHERE ({ts} = '{updated_at}' AND `id` > {last_id}) OR ({ts} > '{updated_at}') ORDER BY {ts} ASC, `id` ASC LIMIT {batch_size}"
                 )
             }
             _ => {
                 format!(
-                    "SELECT {col_list} FROM {quoted_table} ORDER BY `updated_at` ASC, `id` ASC LIMIT {batch_size}"
+                    "SELECT {col_list} FROM {quoted_table} ORDER BY {ts} ASC, `id` ASC LIMIT {batch_size}"
                 )
             }
         }
@@ -68,6 +70,7 @@ mod tests {
                 "name".to_string(),
                 "updated_at".to_string(),
             ],
+            "updated_at",
             Some("2026-03-28 09:00:00"),
             Some(500),
             10000,
@@ -89,6 +92,7 @@ mod tests {
                 "name".to_string(),
                 "updated_at".to_string(),
             ],
+            "updated_at",
             None,
             None,
             10000,
@@ -151,6 +155,7 @@ mod tests {
         let sql = QueryBuilder::build_incremental_query(
             "orders",
             &["id".to_string()],
+            "updated_at",
             Some("2026-01-01 00:00:00"),
             Some(42),
             5000,
@@ -169,6 +174,7 @@ mod tests {
         let sql = QueryBuilder::build_incremental_query(
             "orders",
             &["id".to_string()],
+            "updated_at",
             Some("2026-01-01 00:00:00"),
             None,
             10000,
@@ -185,6 +191,7 @@ mod tests {
         let sql = QueryBuilder::build_incremental_query(
             "orders",
             &["id".to_string()],
+            "updated_at",
             None,
             Some(42),
             10000,
@@ -220,6 +227,7 @@ mod tests {
                 "name".to_string(),
                 "updated_at".to_string(),
             ],
+            "updated_at",
             Some("2026-03-28 09:00:00"),
             Some(500),
             10000,
@@ -234,12 +242,32 @@ mod tests {
     #[test]
     fn incremental_no_hwm_exact_output() {
         let sql =
-            QueryBuilder::build_incremental_query("orders", &["id".to_string()], None, None, 5000);
+            QueryBuilder::build_incremental_query("orders", &["id".to_string()], "updated_at", None, None, 5000);
 
         assert_eq!(
             sql,
             "SELECT `id` FROM `orders` ORDER BY `updated_at` ASC, `id` ASC LIMIT 5000"
         );
+    }
+
+    #[test]
+    fn incremental_custom_timestamp_col() {
+        let sql = QueryBuilder::build_incremental_query(
+            "orders",
+            &[
+                "id".to_string(),
+                "name".to_string(),
+                "completed_at".to_string(),
+            ],
+            "completed_at",
+            Some("2026-03-28 09:00:00"),
+            Some(500),
+            10000,
+        );
+
+        assert!(sql.contains("`completed_at` = '2026-03-28 09:00:00'"));
+        assert!(sql.contains("`completed_at` > '2026-03-28 09:00:00'"));
+        assert!(sql.contains("ORDER BY `completed_at` ASC, `id` ASC"));
     }
 
     #[test]

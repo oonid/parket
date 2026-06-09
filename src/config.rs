@@ -16,6 +16,8 @@ pub struct Config {
     pub default_batch_size: u64,
     pub rust_log: String,
     pub table_modes: HashMap<String, ExtractionMode>,
+    pub table_initial_hwm: HashMap<String, (String, i64)>,
+    pub table_timestamp_col: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -26,6 +28,18 @@ pub enum ExtractionMode {
 }
 
 impl Config {
+    pub fn timestamp_col(&self, table: &str) -> &str {
+        self.table_timestamp_col.get(table).map(|s| s.as_str()).unwrap_or("updated_at")
+    }
+
+    /// Minimal load for `--inspect`: only DATABASE_URL is required.
+    pub fn load_inspect() -> Result<String> {
+        let _ = dotenvy::dotenv();
+        let database_url = env("DATABASE_URL")?;
+        validate_database_url(&database_url)?;
+        Ok(database_url)
+    }
+
     pub fn load() -> Result<Self> {
         let _ = dotenvy::dotenv();
 
@@ -72,6 +86,8 @@ impl Config {
             .unwrap_or_else(|| "info".to_string());
 
         let table_modes = parse_table_modes(&tables);
+        let table_initial_hwm = parse_table_initial_hwm(&tables)?;
+        let table_timestamp_col = parse_table_timestamp_col(&tables);
 
         Ok(Self {
             database_url,
@@ -86,6 +102,8 @@ impl Config {
             default_batch_size,
             rust_log,
             table_modes,
+            table_initial_hwm,
+            table_timestamp_col,
         })
     }
 
@@ -132,6 +150,8 @@ impl Config {
             .unwrap_or_else(|| "info".to_string());
 
         let table_modes = parse_table_modes(&tables);
+        let table_initial_hwm = parse_table_initial_hwm(&tables)?;
+        let table_timestamp_col = parse_table_timestamp_col(&tables);
 
         Ok(Self {
             database_url,
@@ -146,6 +166,8 @@ impl Config {
             default_batch_size,
             rust_log,
             table_modes,
+            table_initial_hwm,
+            table_timestamp_col,
         })
     }
 
@@ -206,6 +228,44 @@ fn parse_table_modes(tables: &[String]) -> HashMap<String, ExtractionMode> {
     modes
 }
 
+fn parse_table_initial_hwm(tables: &[String]) -> Result<HashMap<String, (String, i64)>> {
+    let mut map = HashMap::new();
+    for table in tables {
+        let key = format!("TABLE_HWM_{table}");
+        if let Ok(val) = std::env::var(&key) {
+            let val = val.trim();
+            if val.is_empty() {
+                continue;
+            }
+            let (ua, id_str) = val.split_once(',')
+                .ok_or_else(|| anyhow::anyhow!("{key} must be '<updated_at>,<last_id>', got '{val}'"))?;
+            let ua = ua.trim();
+            let id_str = id_str.trim();
+            if ua.is_empty() {
+                bail!("{key}: updated_at must not be empty");
+            }
+            let last_id: i64 = id_str.parse()
+                .with_context(|| format!("{key}: last_id '{id_str}' is not a valid i64"))?;
+            map.insert(table.clone(), (ua.to_string(), last_id));
+        }
+    }
+    Ok(map)
+}
+
+fn parse_table_timestamp_col(tables: &[String]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for table in tables {
+        let key = format!("TABLE_TIMESTAMP_{table}");
+        if let Ok(val) = std::env::var(&key) {
+            let val = val.trim();
+            if !val.is_empty() {
+                map.insert(table.clone(), val.to_string());
+            }
+        }
+    }
+    map
+}
+
 pub fn mask_database_url(url: &str) -> String {
     url::Url::parse(url)
         .ok()
@@ -259,6 +319,12 @@ mod tests {
                 env::remove_var(var);
             }
             for (key, _) in env::vars().filter(|(k, _)| k.starts_with("TABLE_MODE_")) {
+                env::remove_var(&key);
+            }
+            for (key, _) in env::vars().filter(|(k, _)| k.starts_with("TABLE_HWM_")) {
+                env::remove_var(&key);
+            }
+            for (key, _) in env::vars().filter(|(k, _)| k.starts_with("TABLE_TIMESTAMP_")) {
                 env::remove_var(&key);
             }
         }
@@ -691,6 +757,93 @@ mod tests {
 
     #[test]
     #[serial]
+    fn parse_table_initial_hwm_valid_single_entry() {
+        clear_config_env();
+        unsafe {
+            env::set_var("TABLE_HWM_orders", "2026-01-01T00:00:00.000000,1000");
+        }
+
+        let result = parse_table_initial_hwm(&["orders".to_string()]);
+        assert!(result.is_ok());
+        let map = result.unwrap();
+        assert_eq!(
+            map.get("orders"),
+            Some(&("2026-01-01T00:00:00.000000".to_string(), 1000))
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn parse_table_initial_hwm_missing_comma() {
+        clear_config_env();
+        unsafe {
+            env::set_var("TABLE_HWM_orders", "2026-01-01T00:00:00.000000");
+        }
+
+        let result = parse_table_initial_hwm(&["orders".to_string()]);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("must be '<updated_at>,<last_id>'"));
+    }
+
+    #[test]
+    #[serial]
+    fn parse_table_initial_hwm_non_numeric_last_id() {
+        clear_config_env();
+        unsafe {
+            env::set_var("TABLE_HWM_orders", "2026-01-01T00:00:00.000000,not_a_number");
+        }
+
+        let result = parse_table_initial_hwm(&["orders".to_string()]);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("is not a valid i64"));
+    }
+
+    #[test]
+    #[serial]
+    fn parse_table_initial_hwm_empty_updated_at() {
+        clear_config_env();
+        unsafe {
+            env::set_var("TABLE_HWM_orders", ",5");
+        }
+
+        let result = parse_table_initial_hwm(&["orders".to_string()]);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("updated_at must not be empty"));
+    }
+
+    #[test]
+    #[serial]
+    fn parse_table_initial_hwm_absent_var() {
+        clear_config_env();
+
+        let result = parse_table_initial_hwm(&["orders".to_string()]);
+        assert!(result.is_ok());
+        let map = result.unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn parse_table_initial_hwm_underscore_table_name() {
+        clear_config_env();
+        unsafe {
+            env::set_var("TABLE_HWM_my_orders", "2026-05-01T00:00:00.000000,999");
+        }
+
+        let result = parse_table_initial_hwm(&["my_orders".to_string()]);
+        assert!(result.is_ok());
+        let map = result.unwrap();
+        assert_eq!(
+            map.get("my_orders"),
+            Some(&("2026-05-01T00:00:00.000000".to_string(), 999))
+        );
+    }
+
+    #[test]
+    #[serial]
     fn display_safe_masks_password_in_database_url() {
         clear_config_env();
         set_required_vars();
@@ -875,6 +1028,66 @@ mod tests {
 
     #[test]
     #[serial]
+    fn timestamp_col_default_returns_updated_at() {
+        clear_config_env();
+        set_required_vars();
+
+        let config = Config::load().expect("load should succeed");
+        assert_eq!(config.timestamp_col("orders"), "updated_at");
+    }
+
+    #[test]
+    #[serial]
+    fn timestamp_col_override_present() {
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("TABLE_TIMESTAMP_orders", "completed_at");
+        }
+
+        let config = Config::load().expect("load should succeed");
+        assert_eq!(config.timestamp_col("orders"), "completed_at");
+    }
+
+    #[test]
+    #[serial]
+    fn timestamp_col_override_absent_returns_default() {
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("TABLE_TIMESTAMP_orders", "completed_at");
+        }
+
+        let config = Config::load().expect("load should succeed");
+        assert_eq!(config.timestamp_col("customers"), "updated_at");
+    }
+
+    #[test]
+    #[serial]
+    fn parse_table_timestamp_col_underscore_table_name() {
+        clear_config_env();
+        unsafe {
+            env::set_var("TABLE_TIMESTAMP_my_table", "finished_at");
+        }
+
+        let result = parse_table_timestamp_col(&["my_table".to_string()]);
+        assert_eq!(result.get("my_table").map(|s| s.as_str()), Some("finished_at"));
+    }
+
+    #[test]
+    #[serial]
+    fn parse_table_timestamp_col_empty_value_not_inserted() {
+        clear_config_env();
+        unsafe {
+            env::set_var("TABLE_TIMESTAMP_orders", "");
+        }
+
+        let result = parse_table_timestamp_col(&["orders".to_string()]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    #[serial]
     fn load_local_uses_optional_defaults() {
         clear_config_env();
         unsafe {
@@ -889,5 +1102,59 @@ mod tests {
         assert_eq!(config.default_batch_size, 10000);
         assert_eq!(config.rust_log, "info");
         assert!(config.s3_endpoint.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn load_inspect_valid_database_url() {
+        clear_config_env();
+        unsafe {
+            env::set_var("DATABASE_URL", "mysql://user:pass@host:3306/dbname");
+        }
+
+        let result = Config::load_inspect();
+        assert!(result.is_ok());
+        let url = result.unwrap();
+        assert_eq!(url, "mysql://user:pass@host:3306/dbname");
+    }
+
+    #[test]
+    #[serial]
+    fn load_inspect_missing_database_url() {
+        let _guard = no_dotenv();
+        clear_config_env();
+
+        let result = Config::load_inspect();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("DATABASE_URL"));
+    }
+
+    #[test]
+    #[serial]
+    fn load_inspect_wrong_scheme() {
+        clear_config_env();
+        unsafe {
+            env::set_var("DATABASE_URL", "postgres://user:pass@host:5432/db");
+        }
+
+        let result = Config::load_inspect();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .to_lowercase()
+            .contains("mysql"));
+    }
+
+    #[test]
+    #[serial]
+    fn load_inspect_does_not_require_other_vars() {
+        clear_config_env();
+        unsafe {
+            env::set_var("DATABASE_URL", "mysql://user:pass@host:3306/dbname");
+        }
+
+        let result = Config::load_inspect();
+        assert!(result.is_ok(), "load_inspect should not require S3 or TABLES vars");
     }
 }

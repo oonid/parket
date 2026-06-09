@@ -499,13 +499,25 @@ where
         let columns = self.schema_inspect.discover_columns(table_name).await?;
         let columns = filter_unsupported_columns(&columns);
 
+        let ts_col = self.config.timestamp_col(table_name).to_string();
+        if self.config.table_timestamp_col.contains_key(table_name) {
+            crate::discovery::validate_timestamp_col(&columns, &ts_col)?;
+        }
+
         let mode_override = self.config.table_modes.get(table_name);
-        let mode = detect_mode(&columns, mode_override);
+        let mode = detect_mode(&columns, mode_override, &ts_col);
         let mode_str = match mode {
             ExtractionMode::Incremental => "incremental",
             ExtractionMode::FullRefresh => "full_refresh",
             ExtractionMode::Auto => "auto",
         };
+
+        if mode != ExtractionMode::Incremental && self.config.table_initial_hwm.contains_key(table_name) {
+            anyhow::bail!(
+                "TABLE_HWM_{table_name} is set but table '{table_name}' resolves to {mode_str}; \
+                 a predefined HWM only applies to incremental tables"
+            );
+        }
 
         let avg_row_length = self.schema_inspect.get_avg_row_length(table_name).await?;
         self.extractor.calculate_batch_size(avg_row_length);
@@ -527,7 +539,7 @@ where
 
         let rows = match mode {
             ExtractionMode::Incremental => {
-                self.process_incremental(table_name, &select_columns).await?
+                self.process_incremental(table_name, &select_columns, &ts_col).await?
             }
             ExtractionMode::FullRefresh => {
                 self.process_full_refresh(table_name, &select_columns).await?
@@ -557,8 +569,20 @@ where
         &mut self,
         table_name: &str,
         columns: &[String],
+        ts_col: &str,
     ) -> Result<u64> {
-        let mut current_hwm = self.writer.read_hwm(table_name).await?;
+        let mut current_hwm = match self.writer.read_hwm(table_name).await? {
+            Some(h) => Some(h),
+            None => self.config.table_initial_hwm.get(table_name).map(|(ua, id)| {
+                info!(
+                    table = table_name,
+                    hwm_updated_at = %ua,
+                    hwm_last_id = id,
+                    "seeding HWM from config (no stored HWM)"
+                );
+                Hwm { updated_at: ua.clone(), last_id: *id }
+            }),
+        };
         let mut total_rows = 0u64;
         let mut batch_index: u64 = 0;
 
@@ -575,6 +599,7 @@ where
             let sql = QueryBuilder::build_incremental_query(
                 table_name,
                 columns,
+                ts_col,
                 current_hwm.as_ref().map(|h| h.updated_at.as_str()),
                 current_hwm.as_ref().map(|h| h.last_id),
                 batch_size,
@@ -593,7 +618,7 @@ where
 
             let batch_hwm = batches
                 .last()
-                .and_then(extract_hwm_from_batch)
+                .and_then(|b| extract_hwm_from_batch(b, ts_col))
                 .clone();
 
             self.writer
@@ -838,6 +863,8 @@ mod tests {
             default_batch_size: 10000,
             rust_log: "info".to_string(),
             table_modes: HashMap::new(),
+            table_initial_hwm: HashMap::new(),
+            table_timestamp_col: HashMap::new(),
         }
     }
 
@@ -1459,6 +1486,8 @@ mod tests {
             default_batch_size: 10000,
             rust_log: "info".to_string(),
             table_modes: HashMap::new(),
+            table_initial_hwm: HashMap::new(),
+            table_timestamp_col: HashMap::new(),
         }
     }
 
@@ -2368,6 +2397,230 @@ mod tests {
             dir.path().to_path_buf(),
             true,
         );
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success));
+    }
+
+    #[tokio::test]
+    async fn incremental_seeds_hwm_from_config_when_none_stored() {
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_initial_hwm.insert(
+            "orders".to_string(),
+            ("2026-05-01T00:00:00.000000".to_string(), 999),
+        );
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        extract_mock
+            .expect_batch_size()
+            .returning(|| 10000);
+        writer_mock
+            .expect_ensure_table()
+            .returning(|_, _| Ok(()));
+        writer_mock
+            .expect_get_schema()
+            .returning(|_| Ok(None));
+        writer_mock
+            .expect_read_hwm()
+            .returning(|_| Ok(None));
+        extract_mock
+            .expect_extract()
+            .withf(|sql| sql.contains("2026-05-01T00:00:00.000000") && sql.contains("999"))
+            .returning(|_| Ok(vec![]));
+        writer_mock
+            .expect_append_batch()
+            .returning(|_, _, _| Ok(()));
+        state_mock
+            .expect_update_table()
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success));
+    }
+
+    #[tokio::test]
+    async fn incremental_ignores_config_hwm_when_stored_present() {
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_initial_hwm.insert(
+            "orders".to_string(),
+            ("2026-05-01T00:00:00.000000".to_string(), 999),
+        );
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        extract_mock
+            .expect_batch_size()
+            .returning(|| 10000);
+        writer_mock
+            .expect_ensure_table()
+            .returning(|_, _| Ok(()));
+        writer_mock
+            .expect_get_schema()
+            .returning(|_| Ok(None));
+        writer_mock
+            .expect_read_hwm()
+            .returning(|_| {
+                Ok(Some(Hwm {
+                    updated_at: "2026-09-09T00:00:00.000000".to_string(),
+                    last_id: 5000,
+                }))
+            });
+        extract_mock
+            .expect_extract()
+            .withf(|sql| sql.contains("2026-09-09T00:00:00.000000") && !sql.contains("2026-05-01"))
+            .returning(|_| Ok(vec![]));
+        writer_mock
+            .expect_append_batch()
+            .returning(|_, _, _| Ok(()));
+        state_mock
+            .expect_update_table()
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success));
+    }
+
+    #[tokio::test]
+    async fn rejects_hwm_config_on_full_refresh_table() {
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config_with_full_refresh(vec!["products".to_string()]);
+        config.table_initial_hwm.insert(
+            "products".to_string(),
+            ("2026-05-01T00:00:00.000000".to_string(), 999),
+        );
+        let mut schema_mock = MockSchemaInspect::new();
+        let extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| {
+                Ok(vec![
+                    ColumnInfo {
+                        name: "id".to_string(),
+                        data_type: "bigint".to_string(),
+                        column_type: "bigint(20)".to_string(),
+                    },
+                    ColumnInfo {
+                        name: "name".to_string(),
+                        data_type: "varchar".to_string(),
+                        column_type: "varchar(255)".to_string(),
+                    },
+                ])
+            });
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        writer_mock
+            .expect_ensure_table()
+            .returning(|_, _| Ok(()));
+        state_mock
+            .expect_update_table()
+            .withf(|_, state, _| state.last_run_status.as_deref() == Some("failed"))
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Fatal));
+    }
+
+    #[tokio::test]
+    async fn custom_timestamp_column_incremental() {
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_timestamp_col.insert("orders".to_string(), "completed_at".to_string());
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| {
+                Ok(vec![
+                    ColumnInfo {
+                        name: "id".to_string(),
+                        data_type: "bigint".to_string(),
+                        column_type: "bigint(20)".to_string(),
+                    },
+                    ColumnInfo {
+                        name: "name".to_string(),
+                        data_type: "varchar".to_string(),
+                        column_type: "varchar(255)".to_string(),
+                    },
+                    ColumnInfo {
+                        name: "completed_at".to_string(),
+                        data_type: "timestamp".to_string(),
+                        column_type: "timestamp".to_string(),
+                    },
+                ])
+            });
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        extract_mock
+            .expect_batch_size()
+            .returning(|| 10000);
+        writer_mock
+            .expect_ensure_table()
+            .returning(|_, _| Ok(()));
+        writer_mock
+            .expect_get_schema()
+            .returning(|_| Ok(None));
+        writer_mock
+            .expect_read_hwm()
+            .returning(|_| Ok(None));
+        extract_mock
+            .expect_extract()
+            .withf(|sql| sql.contains("completed_at"))
+            .returning(|_| Ok(vec![]));
+        state_mock
+            .expect_update_table()
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
         let result = orch.run().await;
         assert!(matches!(result, ExitCode::Success));
     }

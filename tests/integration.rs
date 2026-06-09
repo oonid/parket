@@ -55,6 +55,8 @@ fn make_config(db_url: &str, s3_endpoint: &str, tables: Vec<&str>) -> Config {
         default_batch_size: 10000,
         rust_log: "parket=debug".to_string(),
         table_modes: HashMap::new(),
+        table_initial_hwm: HashMap::new(),
+        table_timestamp_col: HashMap::new(),
     }
 }
 

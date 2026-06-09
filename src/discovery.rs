@@ -24,6 +24,22 @@ pub struct ColumnInfo {
     pub column_type: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ColumnDescribe {
+    pub name: String,
+    pub data_type: String,
+    pub column_type: String,
+    pub nullable: bool,
+    pub key: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexInfo {
+    pub name: String,
+    pub unique: bool,
+    pub columns: Vec<String>,
+}
+
 pub struct SchemaInspector {
     pool: MySqlPool,
     database: String,
@@ -96,6 +112,71 @@ impl SchemaInspector {
         }
         Ok(count > 0)
     }
+
+    pub async fn describe_columns(&self, table: &str) -> Result<Vec<ColumnDescribe>> {
+        let rows: Vec<MySqlColumnDescribeRow> = sqlx::query_as(
+            "SELECT COLUMN_NAME AS name, DATA_TYPE AS data_type, COLUMN_TYPE AS column_type, IS_NULLABLE AS is_nullable, COLUMN_KEY AS column_key FROM information_schema.columns WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION"
+        )
+        .bind(&self.database)
+        .bind(table)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("failed to query columns for table {table}"))?;
+
+        if rows.is_empty() {
+            bail!("table {table} does not exist in database {}", self.database);
+        }
+
+        let columns: Vec<ColumnDescribe> = rows
+            .into_iter()
+            .map(|r| ColumnDescribe {
+                name: r.name,
+                data_type: r.data_type,
+                column_type: r.column_type,
+                nullable: r.is_nullable == "YES",
+                key: r.column_key,
+            })
+            .collect();
+
+        Ok(columns)
+    }
+
+    pub async fn discover_indexes(&self, table: &str) -> Result<Vec<IndexInfo>> {
+        // CAST the unsigned information_schema integers to SIGNED so sqlx decodes
+        // them into i64 (MySQL/MariaDB return NON_UNIQUE as an unsigned int, which
+        // does not decode into i64 directly). COLUMN_NAME can be NULL (functional
+        // key parts), so it is Option<String>. SEQ_IN_INDEX is only needed for the
+        // ORDER BY, not selected.
+        let rows: Vec<MySqlIndexRow> = sqlx::query_as(
+            "SELECT INDEX_NAME AS index_name, CAST(NON_UNIQUE AS SIGNED) AS non_unique, COLUMN_NAME AS column_name FROM information_schema.statistics WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY INDEX_NAME, SEQ_IN_INDEX"
+        )
+        .bind(&self.database)
+        .bind(table)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("failed to query indexes for table {table}"))?;
+
+        // Group rows by index name (rows arrive ordered by SEQ_IN_INDEX, so each
+        // index's columns accumulate in key order — columns[0] is the leading column).
+        let mut index_map: std::collections::HashMap<String, (i64, Vec<String>)> = std::collections::HashMap::new();
+        for row in rows {
+            let entry = index_map.entry(row.index_name.clone()).or_insert((row.non_unique, Vec::new()));
+            if let Some(col) = row.column_name {
+                entry.1.push(col);
+            }
+        }
+
+        let indexes: Vec<IndexInfo> = index_map
+            .into_iter()
+            .map(|(name, (non_unique, columns))| IndexInfo {
+                name,
+                unique: non_unique == 0,
+                columns,
+            })
+            .collect();
+
+        Ok(indexes)
+    }
 }
 
 pub fn filter_unsupported_columns(columns: &[ColumnInfo]) -> Vec<ColumnInfo> {
@@ -117,6 +198,7 @@ pub fn filter_unsupported_columns(columns: &[ColumnInfo]) -> Vec<ColumnInfo> {
 pub fn detect_mode(
     columns: &[ColumnInfo],
     override_mode: Option<&ExtractionMode>,
+    timestamp_col: &str,
 ) -> ExtractionMode {
     if let Some(mode) = override_mode
         && *mode != ExtractionMode::Auto
@@ -125,17 +207,26 @@ pub fn detect_mode(
         return mode.clone();
     }
 
-    let has_updated_at = columns.iter().any(|c| {
-        c.name == "updated_at"
+    let has_timestamp = columns.iter().any(|c| {
+        c.name == timestamp_col
             && (c.data_type == "timestamp" || c.data_type == "datetime")
     });
     let has_id = columns.iter().any(|c| c.name == "id");
 
-    if has_updated_at && has_id {
+    if has_timestamp && has_id {
         ExtractionMode::Incremental
     } else {
         ExtractionMode::FullRefresh
     }
+}
+
+pub fn validate_timestamp_col(columns: &[ColumnInfo], timestamp_col: &str) -> anyhow::Result<()> {
+    let ok = columns.iter().any(|c| c.name == timestamp_col
+        && (c.data_type == "timestamp" || c.data_type == "datetime"));
+    if !ok {
+        anyhow::bail!("configured timestamp column '{timestamp_col}' is missing or not a timestamp/datetime column");
+    }
+    Ok(())
 }
 
 pub fn compute_schema_hash(columns: &[ColumnInfo]) -> String {
@@ -159,6 +250,22 @@ struct MySqlColumnRow {
 #[derive(Debug, sqlx::FromRow)]
 struct MySqlAvgRowRow {
     avg_row_length: u64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct MySqlColumnDescribeRow {
+    name: String,
+    data_type: String,
+    column_type: String,
+    is_nullable: String,
+    column_key: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct MySqlIndexRow {
+    index_name: String,
+    non_unique: i64,
+    column_name: Option<String>,
 }
 
 #[cfg(test)]
@@ -282,7 +389,7 @@ mod tests {
             col("name", "varchar", "varchar(255)"),
             col("updated_at", "timestamp", "timestamp"),
         ];
-        let mode = detect_mode(&columns, None);
+        let mode = detect_mode(&columns, None, "updated_at");
         assert_eq!(mode, ExtractionMode::Incremental);
     }
 
@@ -292,7 +399,7 @@ mod tests {
             col("id", "int", "int(11)"),
             col("updated_at", "datetime", "datetime"),
         ];
-        let mode = detect_mode(&columns, None);
+        let mode = detect_mode(&columns, None, "updated_at");
         assert_eq!(mode, ExtractionMode::Incremental);
     }
 
@@ -302,7 +409,7 @@ mod tests {
             col("id", "int", "int(11)"),
             col("name", "varchar", "varchar(255)"),
         ];
-        let mode = detect_mode(&columns, None);
+        let mode = detect_mode(&columns, None, "updated_at");
         assert_eq!(mode, ExtractionMode::FullRefresh);
     }
 
@@ -312,14 +419,14 @@ mod tests {
             col("name", "varchar", "varchar(255)"),
             col("updated_at", "timestamp", "timestamp"),
         ];
-        let mode = detect_mode(&columns, None);
+        let mode = detect_mode(&columns, None, "updated_at");
         assert_eq!(mode, ExtractionMode::FullRefresh);
     }
 
     #[test]
     fn detect_mode_full_refresh_no_relevant_columns() {
         let columns = vec![col("data", "json", "json")];
-        let mode = detect_mode(&columns, None);
+        let mode = detect_mode(&columns, None, "updated_at");
         assert_eq!(mode, ExtractionMode::FullRefresh);
     }
 
@@ -329,7 +436,7 @@ mod tests {
             col("id", "int", "int(11)"),
             col("updated_at", "varchar", "varchar(255)"),
         ];
-        let mode = detect_mode(&columns, None);
+        let mode = detect_mode(&columns, None, "updated_at");
         assert_eq!(mode, ExtractionMode::FullRefresh);
     }
 
@@ -339,21 +446,21 @@ mod tests {
             col("id", "int", "int(11)"),
             col("updated_at", "timestamp", "timestamp"),
         ];
-        let mode = detect_mode(&columns, Some(&ExtractionMode::FullRefresh));
+        let mode = detect_mode(&columns, Some(&ExtractionMode::FullRefresh), "updated_at");
         assert_eq!(mode, ExtractionMode::FullRefresh);
     }
 
     #[test]
     fn detect_mode_override_incremental_forces_incremental() {
         let columns = vec![col("name", "varchar", "varchar(255)")];
-        let mode = detect_mode(&columns, Some(&ExtractionMode::Incremental));
+        let mode = detect_mode(&columns, Some(&ExtractionMode::Incremental), "updated_at");
         assert_eq!(mode, ExtractionMode::Incremental);
     }
 
     #[test]
     fn detect_mode_override_auto_same_as_none() {
         let columns = vec![col("data", "json", "json")];
-        let mode = detect_mode(&columns, Some(&ExtractionMode::Auto));
+        let mode = detect_mode(&columns, Some(&ExtractionMode::Auto), "updated_at");
         assert_eq!(mode, ExtractionMode::FullRefresh);
     }
 
@@ -427,5 +534,60 @@ mod tests {
             );
         }
         assert_eq!(UNSUPPORTED_DATA_TYPES.len(), expected.len());
+    }
+
+    #[test]
+    fn detect_mode_custom_timestamp_col() {
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("completed_at", "timestamp", "timestamp"),
+        ];
+        let mode = detect_mode(&columns, None, "completed_at");
+        assert_eq!(mode, ExtractionMode::Incremental);
+    }
+
+    #[test]
+    fn validate_timestamp_col_present_and_timestamp() {
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("completed_at", "timestamp", "timestamp"),
+        ];
+        let result = validate_timestamp_col(&columns, "completed_at");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_timestamp_col_present_and_datetime() {
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("finished_at", "datetime", "datetime"),
+        ];
+        let result = validate_timestamp_col(&columns, "finished_at");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_timestamp_col_missing() {
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("updated_at", "timestamp", "timestamp"),
+        ];
+        let result = validate_timestamp_col(&columns, "completed_at");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("completed_at"));
+        assert!(err.contains("missing or not a timestamp/datetime column"));
+    }
+
+    #[test]
+    fn validate_timestamp_col_wrong_type() {
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("completed_at", "varchar", "varchar(255)"),
+        ];
+        let result = validate_timestamp_col(&columns, "completed_at");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("completed_at"));
     }
 }

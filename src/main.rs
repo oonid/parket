@@ -3,12 +3,14 @@ use std::path::PathBuf;
 use clap::Parser;
 use parket::cli::Cli;
 use parket::config;
+use parket::inspect::{InspectCommand, InspectIntrospectAdapter};
 use parket::orchestrator::{
     DeltaWriterAdapter, ExtractorAdapter, LocalDeltaWriterAdapter, Orchestrator,
     SchemaInspectorAdapter, SignalHandler, StateManageAdapter,
 };
 use parket::preflight::{
-    NoopPreflightStorage, PreflightCheck, PreflightInspectAdapter, PreflightStorageAdapter,
+    NoopPreflightStorage, PreflightCheck, PreflightHwmAdapter, PreflightInspectAdapter,
+    PreflightStorageAdapter,
 };
 
 fn init_tracing() {
@@ -62,6 +64,35 @@ async fn main() {
 
     init_tracing();
 
+    // Handle --inspect early (before full config load)
+    if let Some(ref table) = cli.inspect {
+        let database_url = match config::Config::load_inspect() {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("configuration error: {e}");
+                std::process::exit(2);
+            }
+        };
+        let pool = match sqlx::MySqlPool::connect(&database_url).await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("database connection error: {e}");
+                std::process::exit(2);
+            }
+        };
+        let database = extract_database_name(&database_url);
+        let configured_ts = std::env::var(format!("TABLE_TIMESTAMP_{table}"))
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let introspect = InspectIntrospectAdapter::new(pool, database);
+        let cmd = InspectCommand::new(introspect, table.clone(), configured_ts);
+        if let Err(e) = cmd.run().await {
+            eprintln!("inspect failed: {e:#}");
+            std::process::exit(2);
+        }
+        std::process::exit(0);
+    }
+
     let local_dir = cli.local.as_deref().map(|p| p.to_path_buf());
 
     let config = if local_dir.is_some() {
@@ -96,12 +127,9 @@ async fn main() {
         let database = extract_database_name(&config.database_url);
         let inspect = PreflightInspectAdapter::new(pool, database);
 
-        if local_dir.is_some() {
-            println!(
-                "{:<30} {:<15} {:<10} {:<15}",
-                "TABLE", "MODE", "COLUMNS", "AVG_ROW_LEN"
-            );
-            let check = PreflightCheck::new(config, inspect, NoopPreflightStorage);
+        if let Some(ref dir) = local_dir {
+            let hwm = PreflightHwmAdapter::new_local(dir);
+            let check = PreflightCheck::new(config, inspect, NoopPreflightStorage, hwm);
             if let Err(e) = check.run().await {
                 eprintln!("pre-flight check failed: {e}");
                 std::process::exit(2);
@@ -110,11 +138,8 @@ async fn main() {
             std::process::exit(0);
         } else {
             let storage = PreflightStorageAdapter::new(&config);
-            println!(
-                "{:<30} {:<15} {:<10} {:<15}",
-                "TABLE", "MODE", "COLUMNS", "AVG_ROW_LEN"
-            );
-            let check = PreflightCheck::new(config, inspect, storage);
+            let hwm = PreflightHwmAdapter::new(&config);
+            let check = PreflightCheck::new(config, inspect, storage, hwm);
             if let Err(e) = check.run().await {
                 eprintln!("pre-flight check failed: {e}");
                 std::process::exit(2);
@@ -341,6 +366,8 @@ mod tests {
             default_batch_size: 10000,
             rust_log: "info".to_string(),
             table_modes: std::collections::HashMap::new(),
+            table_initial_hwm: std::collections::HashMap::new(),
+            table_timestamp_col: std::collections::HashMap::new(),
         };
 
         log_startup_banner(&config, None);
@@ -367,6 +394,8 @@ mod tests {
             default_batch_size: 10000,
             rust_log: "info".to_string(),
             table_modes: std::collections::HashMap::new(),
+            table_initial_hwm: std::collections::HashMap::new(),
+            table_timestamp_col: std::collections::HashMap::new(),
         };
 
         log_startup_banner(&config, Some(std::path::Path::new("/tmp/delta")));

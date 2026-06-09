@@ -26,6 +26,13 @@ pub struct Cli {
         help = "Write Delta Lake files to local directory instead of S3 (skips S3 config & connectivity)"
     )]
     pub local: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "TABLE",
+        help = "Evaluate a single table's columns, indexes, and cursor suitability, then exit (needs only DATABASE_URL)"
+    )]
+    pub inspect: Option<String>,
 }
 
 #[cfg(test)]
@@ -145,6 +152,30 @@ mod tests {
         assert!(
             output.contains("--local"),
             "help should mention --local flag"
+        );
+    }
+
+    #[test]
+    fn inspect_flag_with_table_name() {
+        let cli = Cli::try_parse_from(["parket", "--inspect", "orders"]).unwrap();
+        assert_eq!(cli.inspect.as_deref(), Some("orders"));
+    }
+
+    #[test]
+    fn inspect_flag_absent() {
+        let cli = Cli::try_parse_from(["parket"]).unwrap();
+        assert!(cli.inspect.is_none());
+    }
+
+    #[test]
+    fn help_mentions_inspect_flag() {
+        let result = Cli::try_parse_from(["parket", "--help"]);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let output = format!("{err}");
+        assert!(
+            output.contains("--inspect"),
+            "help should mention --inspect flag"
         );
     }
 }

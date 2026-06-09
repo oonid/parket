@@ -20,6 +20,12 @@ pub trait PreflightStorage: Send + Sync {
     async fn check_writable(&self) -> Result<()>;
 }
 
+#[cfg_attr(test, mockall::automock)]
+#[allow(async_fn_in_trait)]
+pub trait PreflightHwm: Send + Sync {
+    async fn read_hwm(&self, table: &str) -> Result<Option<crate::writer::Hwm>>;
+}
+
 pub struct NoopPreflightStorage;
 
 impl PreflightStorage for NoopPreflightStorage {
@@ -28,22 +34,25 @@ impl PreflightStorage for NoopPreflightStorage {
     }
 }
 
-pub struct PreflightCheck<I, S> {
+pub struct PreflightCheck<I, S, H> {
     config: Config,
     inspect: I,
     storage: Option<S>,
+    hwm: H,
 }
 
-impl<I, S> PreflightCheck<I, S>
+impl<I, S, H> PreflightCheck<I, S, H>
 where
     I: PreflightInspect + Send + Sync,
     S: PreflightStorage + Send + Sync,
+    H: PreflightHwm + Send + Sync,
 {
-    pub fn new(config: Config, inspect: I, storage: S) -> Self {
+    pub fn new(config: Config, inspect: I, storage: S, hwm: H) -> Self {
         Self {
             config,
             inspect,
             storage: Some(storage),
+            hwm,
         }
     }
 
@@ -54,6 +63,8 @@ where
         } else {
             info!("S3 connectivity check skipped (local mode)");
         }
+
+        println!("{:<30} {:<15} {:<10} {:<15} {:<20} {:<15}", "TABLE", "MODE", "COLUMNS", "AVG_ROW_LEN", "KEY", "HWM");
 
         let mut errors = 0u32;
         for table_name in &self.config.tables {
@@ -75,22 +86,68 @@ where
     async fn check_table(&self, table_name: &str) -> Result<()> {
         let columns = self.inspect.discover_columns(table_name).await?;
         let columns = filter_unsupported_columns(&columns);
+        let ts_col = self.config.timestamp_col(table_name).to_string();
+        if self.config.table_timestamp_col.contains_key(table_name) {
+            crate::discovery::validate_timestamp_col(&columns, &ts_col)?;
+        }
         let mode_override = self.config.table_modes.get(table_name);
-        let mode = detect_mode(&columns, mode_override);
+        let mode = detect_mode(&columns, mode_override, &ts_col);
+
+        if mode != crate::config::ExtractionMode::Incremental
+            && self.config.table_initial_hwm.contains_key(table_name)
+        {
+            anyhow::bail!("TABLE_HWM_{table_name} set but table is not incremental");
+        }
+
         let avg_row_length = self.inspect.get_avg_row_length(table_name).await?;
+        let hwm = self.hwm.read_hwm(table_name).await?;
+
+        // Compute KEY based on mode and override
+        let key = if mode_override.is_some() && mode_override != Some(&crate::config::ExtractionMode::Auto) {
+            "override".to_string()
+        } else {
+            match mode {
+                crate::config::ExtractionMode::Incremental => format!("id, {ts_col}"),
+                crate::config::ExtractionMode::FullRefresh => {
+                    // Determine why it's FullRefresh
+                    let has_id = columns.iter().any(|c| c.name == "id");
+                    let has_ts = columns.iter().any(|c| {
+                        c.name == ts_col
+                            && (c.data_type == "timestamp" || c.data_type == "datetime")
+                    });
+                    match (has_id, has_ts) {
+                        (false, false) => format!("no id/{ts_col}"),
+                        (false, true) => "no id".to_string(),
+                        (true, false) => format!("no {ts_col}"),
+                        (true, true) => unreachable!(), // Would be Incremental
+                    }
+                }
+                crate::config::ExtractionMode::Auto => unreachable!(), // detect_mode never returns Auto
+            }
+        };
+
+        // Format HWM
+        let hwm_str = match hwm {
+            Some(h) => format!("{} / {}", h.updated_at, h.last_id),
+            None => "—".to_string(),
+        };
+
+        let mode_str = match mode {
+            crate::config::ExtractionMode::Incremental => "incremental",
+            crate::config::ExtractionMode::FullRefresh => "full_refresh",
+            crate::config::ExtractionMode::Auto => "auto",
+        };
 
         println!(
-            "{:<30} {:<15} {:<10} {:<15}",
+            "{:<30} {:<15} {:<10} {:<15} {:<20} {:<15}",
             table_name,
-            match mode {
-                crate::config::ExtractionMode::Incremental => "incremental",
-                crate::config::ExtractionMode::FullRefresh => "full_refresh",
-                crate::config::ExtractionMode::Auto => "auto",
-            },
+            mode_str,
             columns.len(),
             avg_row_length
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "N/A".to_string()),
+            key,
+            hwm_str,
         );
 
         Ok(())
@@ -167,6 +224,37 @@ impl PreflightStorage for PreflightStorageAdapter {
     }
 }
 
+pub struct PreflightHwmAdapter {
+    inner: crate::writer::DeltaWriter,
+}
+
+impl PreflightHwmAdapter {
+    pub fn new(config: &Config) -> Self {
+        Self {
+            inner: crate::writer::DeltaWriter::new(
+                &config.s3_bucket,
+                &config.s3_prefix,
+                config.s3_endpoint.as_deref(),
+                &config.s3_region,
+                &config.s3_access_key_id,
+                &config.s3_secret_access_key,
+            ),
+        }
+    }
+
+    pub fn new_local(dir: &std::path::Path) -> Self {
+        Self {
+            inner: crate::writer::DeltaWriter::new_local(&dir.to_string_lossy()),
+        }
+    }
+}
+
+impl PreflightHwm for PreflightHwmAdapter {
+    async fn read_hwm(&self, table: &str) -> Result<Option<crate::writer::Hwm>> {
+        self.inner.read_hwm(table).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +275,8 @@ mod tests {
             default_batch_size: 10000,
             rust_log: "info".to_string(),
             table_modes: HashMap::new(),
+            table_initial_hwm: HashMap::new(),
+            table_timestamp_col: HashMap::new(),
         }
     }
 
@@ -218,8 +308,10 @@ mod tests {
         let config = make_config(vec!["orders".to_string(), "products".to_string()]);
         let mut inspect = MockPreflightInspect::new();
         let mut storage = MockPreflightStorage::new();
+        let mut hwm = MockPreflightHwm::new();
 
         storage.expect_check_writable().returning(|| Ok(()));
+        hwm.expect_read_hwm().returning(|_| Ok(None));
         inspect
             .expect_discover_columns()
             .withf(|t| t == "orders")
@@ -237,7 +329,37 @@ mod tests {
             .withf(|t| t == "products")
             .returning(|_| Ok(None));
 
-        let check = PreflightCheck::new(config, inspect, storage);
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
+        let result = check.run().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn hwm_read_succeeds_with_some_value() {
+        let config = make_config(vec!["orders".to_string()]);
+        let mut inspect = MockPreflightInspect::new();
+        let mut storage = MockPreflightStorage::new();
+        let mut hwm = MockPreflightHwm::new();
+
+        storage.expect_check_writable().returning(|| Ok(()));
+        hwm.expect_read_hwm()
+            .withf(|t| t == "orders")
+            .returning(|_| {
+                Ok(Some(crate::writer::Hwm {
+                    updated_at: "2026-01-01T00:00:00.000000".to_string(),
+                    last_id: 1000,
+                }))
+            });
+        inspect
+            .expect_discover_columns()
+            .withf(|t| t == "orders")
+            .returning(|_| Ok(incremental_columns()));
+        inspect
+            .expect_get_avg_row_length()
+            .withf(|t| t == "orders")
+            .returning(|_| Ok(Some(128)));
+
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
         assert!(result.is_ok());
     }
@@ -247,12 +369,13 @@ mod tests {
         let config = make_config(vec!["orders".to_string()]);
         let inspect = MockPreflightInspect::new();
         let mut storage = MockPreflightStorage::new();
+        let hwm = MockPreflightHwm::new();
 
         storage
             .expect_check_writable()
             .returning(|| Err(anyhow::anyhow!("bucket not found")));
 
-        let check = PreflightCheck::new(config, inspect, storage);
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -267,13 +390,14 @@ mod tests {
         let config = make_config(vec!["missing".to_string()]);
         let mut inspect = MockPreflightInspect::new();
         let mut storage = MockPreflightStorage::new();
+        let hwm = MockPreflightHwm::new();
 
         storage.expect_check_writable().returning(|| Ok(()));
         inspect
             .expect_discover_columns()
             .returning(|_| Err(anyhow::anyhow!("table does not exist")));
 
-        let check = PreflightCheck::new(config, inspect, storage);
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -288,8 +412,10 @@ mod tests {
         let config = make_config(vec!["good".to_string(), "bad".to_string()]);
         let mut inspect = MockPreflightInspect::new();
         let mut storage = MockPreflightStorage::new();
+        let mut hwm = MockPreflightHwm::new();
 
         storage.expect_check_writable().returning(|| Ok(()));
+        hwm.expect_read_hwm().returning(|_| Ok(None));
         inspect
             .expect_discover_columns()
             .withf(|t| t == "good")
@@ -303,7 +429,7 @@ mod tests {
             .withf(|t| t == "bad")
             .returning(|_| Err(anyhow::anyhow!("not found")));
 
-        let check = PreflightCheck::new(config, inspect, storage);
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -321,8 +447,10 @@ mod tests {
         };
         let mut inspect = MockPreflightInspect::new();
         let mut storage = MockPreflightStorage::new();
+        let mut hwm = MockPreflightHwm::new();
 
         storage.expect_check_writable().returning(|| Ok(()));
+        hwm.expect_read_hwm().returning(|_| Ok(None));
         inspect
             .expect_discover_columns()
             .returning(|_| Ok(full_refresh_columns()));
@@ -330,7 +458,7 @@ mod tests {
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
 
-        let check = PreflightCheck::new(config, inspect, storage);
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
         assert!(result.is_ok());
     }
@@ -345,6 +473,7 @@ mod tests {
     async fn local_mode_skips_s3_check_with_noop() {
         let config = make_config(vec!["orders".to_string()]);
         let mut inspect = MockPreflightInspect::new();
+        let mut hwm = MockPreflightHwm::new();
 
         inspect
             .expect_discover_columns()
@@ -352,8 +481,9 @@ mod tests {
         inspect
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(128)));
+        hwm.expect_read_hwm().returning(|_| Ok(None));
 
-        let check = PreflightCheck::new(config, inspect, NoopPreflightStorage);
+        let check = PreflightCheck::new(config, inspect, NoopPreflightStorage, hwm);
         let result = check.run().await;
         assert!(result.is_ok());
     }
@@ -362,14 +492,65 @@ mod tests {
     async fn local_mode_table_error_still_fails() {
         let config = make_config(vec!["missing".to_string()]);
         let mut inspect = MockPreflightInspect::new();
+        let hwm = MockPreflightHwm::new();
 
         inspect
             .expect_discover_columns()
             .returning(|_| Err(anyhow::anyhow!("table does not exist")));
 
-        let check = PreflightCheck::new(config, inspect, NoopPreflightStorage);
+        let check = PreflightCheck::new(config, inspect, NoopPreflightStorage, hwm);
         let result = check.run().await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("1 table(s) failed"));
+    }
+
+    #[tokio::test]
+    async fn rejects_hwm_config_on_non_incremental_table() {
+        let mut config = make_config(vec!["products".to_string()]);
+        config.table_initial_hwm.insert(
+            "products".to_string(),
+            ("2026-05-01T00:00:00.000000".to_string(), 999),
+        );
+        let mut inspect = MockPreflightInspect::new();
+        let mut storage = MockPreflightStorage::new();
+        let mut hwm = MockPreflightHwm::new();
+
+        storage.expect_check_writable().returning(|| Ok(()));
+        hwm.expect_read_hwm().returning(|_| Ok(None));
+        inspect
+            .expect_discover_columns()
+            .returning(|_| Ok(full_refresh_columns()));
+        inspect
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
+        let result = check.run().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("1 table(s) failed"));
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_timestamp_column_config() {
+        let mut config = make_config(vec!["products".to_string()]);
+        config.table_timestamp_col.insert("products".to_string(), "nonexistent_col".to_string());
+        let mut inspect = MockPreflightInspect::new();
+        let mut storage = MockPreflightStorage::new();
+        let hwm = MockPreflightHwm::new();
+
+        storage.expect_check_writable().returning(|| Ok(()));
+        inspect
+            .expect_discover_columns()
+            .returning(|_| Ok(full_refresh_columns()));
+        inspect
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
+        let result = check.run().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("1 table(s) failed"));
     }
 }
