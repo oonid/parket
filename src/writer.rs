@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use deltalake::arrow::array::{Array, Int64Array, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray};
+use deltalake::arrow::array::{Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt32Array, UInt64Array};
 use deltalake::arrow::datatypes::{DataType, Schema as ArrowSchema, SchemaRef, TimeUnit};
 use deltalake::arrow::record_batch::RecordBatch;
 use deltalake::kernel::StructType;
@@ -263,17 +263,17 @@ pub fn extract_hwm_from_batch(batch: &RecordBatch) -> Option<Hwm> {
     }
 
     let timestamp_strings = extract_timestamp_as_strings(updated_at_col)?;
-    let ids = id_col.as_any().downcast_ref::<Int64Array>()?;
+    let ids = extract_id_as_i64(id_col)?;
 
     let mut max_ts: &str = &timestamp_strings[0];
-    let mut max_id = ids.value(0);
+    let mut max_id = ids[0];
 
     for (i, ts) in timestamp_strings.iter().enumerate().skip(1) {
         if ts.as_str() > max_ts
-            || (ts.as_str() == max_ts && ids.value(i) > max_id)
+            || (ts.as_str() == max_ts && ids[i] > max_id)
         {
             max_ts = ts.as_str();
-            max_id = ids.value(i);
+            max_id = ids[i];
         }
     }
 
@@ -337,6 +337,24 @@ fn extract_timestamp_as_strings(col: &std::sync::Arc<dyn Array>) -> Option<Vec<S
             .downcast_ref::<StringArray>()
             .map(|s| (0..s.len()).map(|i| s.value(i).to_string()).collect())
     }
+}
+
+// connector_arrow maps INT → Int32, BIGINT → Int64, INT UNSIGNED → UInt32,
+// BIGINT UNSIGNED → UInt64. All fit safely in i64 for typical auto-increment ids.
+fn extract_id_as_i64(col: &std::sync::Arc<dyn Array>) -> Option<Vec<i64>> {
+    if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+        return Some((0..a.len()).map(|i| a.value(i)).collect());
+    }
+    if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
+        return Some((0..a.len()).map(|i| a.value(i) as i64).collect());
+    }
+    if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
+        return Some((0..a.len()).map(|i| a.value(i) as i64).collect());
+    }
+    if let Some(a) = col.as_any().downcast_ref::<UInt32Array>() {
+        return Some((0..a.len()).map(|i| a.value(i) as i64).collect());
+    }
+    None
 }
 
 fn micros_to_string(micros: i64) -> String {
@@ -563,6 +581,40 @@ mod tests {
         );
         let hwm = extract_hwm_from_batch(&batch).unwrap();
         assert_eq!(hwm.last_id, 50);
+    }
+
+    #[test]
+    fn extract_hwm_int32_id_column() {
+        // connector_arrow maps INT (not BIGINT) to Int32Array — must not return None
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("updated_at", DataType::Utf8, false),
+        ]));
+        let id_arr = Int32Array::from(vec![10i32, 20i32, 5i32]);
+        let ts_arr = StringArray::from(vec!["2026-01-01T00:00:01.000000", "2026-01-01T00:00:03.000000", "2026-01-01T00:00:02.000000"]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(ts_arr)]).unwrap();
+        let hwm = extract_hwm_from_batch(&batch).expect("Int32 id must produce a HWM");
+        assert_eq!(hwm.last_id, 20);
+        assert!(hwm.updated_at.contains("00:03"));
+    }
+
+    #[test]
+    fn extract_hwm_utf8_timestamp_connector_arrow_format() {
+        // connector_arrow returns datetime as Utf8 "YYYY-MM-DDTHH:MM:SS.ffffff"
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("updated_at", DataType::Utf8, false),
+        ]));
+        let id_arr = Int64Array::from(vec![1i64, 2i64, 3i64]);
+        let ts_arr = StringArray::from(vec![
+            "2026-06-07T12:00:00.000000",
+            "2026-06-07T13:00:00.000000",
+            "2026-06-07T12:30:00.000000",
+        ]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(ts_arr)]).unwrap();
+        let hwm = extract_hwm_from_batch(&batch).expect("Utf8 timestamp must produce a HWM");
+        assert_eq!(hwm.last_id, 2);
+        assert_eq!(hwm.updated_at, "2026-06-07T13:00:00.000000");
     }
 
     #[test]
@@ -1020,7 +1072,8 @@ mod tests {
     }
 
     #[test]
-    fn extract_hwm_non_int64_id_returns_none() {
+    fn extract_hwm_int32_id_returns_hwm() {
+        // INT (not BIGINT) maps to Int32 in connector_arrow — must succeed
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new(
@@ -1029,11 +1082,12 @@ mod tests {
                 false,
             ),
         ]));
-        let id_arr = deltalake::arrow::array::Int32Array::from(vec![1i32]);
+        let id_arr = Int32Array::from(vec![1i32]);
         let ts_arr = TimestampMicrosecondArray::from(vec![1000000i64]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(ts_arr)]).unwrap();
 
-        assert!(extract_hwm_from_batch(&batch).is_none());
+        let hwm = extract_hwm_from_batch(&batch).expect("Int32 id must produce a HWM");
+        assert_eq!(hwm.last_id, 1);
     }
 
     #[test]
