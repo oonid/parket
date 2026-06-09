@@ -50,17 +50,23 @@ TABLE_MODE_products=full_refresh
 
 ## VM Sizing for `TARGET_MEMORY_MB`
 
-`TARGET_MEMORY_MB` is divided by `AVG_ROW_LENGTH` (MariaDB's on-disk byte estimate, not the Arrow in-memory size). Arrow's columnar format typically expands 2–4× over the disk representation. Set `TARGET_MEMORY_MB` conservatively enough that the first batch does not exhaust available RAM before the adaptive sizing corrects the estimate.
+`TARGET_MEMORY_MB` sets the per-batch memory budget. The initial batch row count is `TARGET_MEMORY_MB × 1024 × 1024 / AVG_ROW_LENGTH`; after the first batch, adaptive sizing measures the actual Arrow footprint and corrects the estimate (see [Batch Extraction](batch-extraction.md)). It bounds memory the same way for both Incremental batches and FullRefresh chunks.
 
-| Available RAM | Recommended `TARGET_MEMORY_MB` | Notes |
+| Available RAM | Recommended `TARGET_MEMORY_MB` | Status |
 |---|---|---|
-| 4 GB | 128 | Leaves ~3.6 GB for OS, delta-rs Parquet encoding overhead, and Arrow buffers |
-| 8 GB | 256–512 | Comfortable headroom for large Parquet column encoding |
-| 16 GB+ | 512–1024 | Use 1024 only if `AVG_ROW_LENGTH` is reliably close to actual Arrow row size |
+| 16 GB | 1024 | Proven: 8-table run incl. a 112M-row FullRefresh table, ~28 min, 3.7 GB Parquet |
+| 8 GB | 512 | Recommended starting point (proportional); re-test on your data |
+| 4 GB | 256 | Recommended starting point (proportional); re-test on your data |
 
-**Why `AVG_ROW_LENGTH` underestimates Arrow memory:** MariaDB stores compressed, variable-length row data on disk. Arrow stores each column in fixed-width, uncompressed buffers with validity bitmaps. A row that is 50 bytes on disk may expand to 150–200 bytes in Arrow for wide or text-heavy tables.
+**Measured reality:** in the proven 16 GB run, observed per-batch `arrow_bytes` was ~260–320 MB even with `TARGET_MEMORY_MB=1024` — the target is a ceiling, not a tight fit. delta-rs needs additional working memory to encode each batch into Parquet, so keep the target well below total RAM and watch the `arrow_bytes` field in `--progress` logs to tune.
 
-**FullRefresh on large tables:** prior to chunked pagination, FullRefresh loaded the entire table into RAM in one call. With the LIMIT+OFFSET loop now in place, `TARGET_MEMORY_MB` bounds each FullRefresh chunk the same way it bounds each Incremental batch. A `TARGET_MEMORY_MB=128` setting on a 4 GB VM keeps peak Arrow memory around 400 MB per chunk, leaving room for the OS and delta-rs.
+**`TARGET_MEMORY_MB` does not change total output size or correctness.** A 112M-row table produces the same ~GB of Parquet whether written in 12 large chunks or 44 small ones — only the file count and per-chunk memory differ. If you see output disk usage explode (e.g. one table dwarfing all others), that is a bug, not a tuning problem — see below.
+
+**FullRefresh trade-off at small values:** FullRefresh paginates with `LIMIT … OFFSET …`. Without `ORDER BY`, `OFFSET M` makes MariaDB scan and discard M rows per chunk — O(N²) total read work across chunks. Smaller `TARGET_MEMORY_MB` means more chunks and more redundant scanning. This costs DB read time, not disk space. (Keyset pagination would remove this; see [Query Patterns](query-patterns.md).)
+
+**Runaway disk usage is a symptom of a stuck Incremental loop, not memory tuning.** If an Incremental table re-reads its first page forever (HWM never advances), it appends the same rows on every iteration and never terminates — disk grows without bound and one table dwarfs the rest. The HWM must advance each batch; `extract_hwm_from_batch` supports `id` columns of type Int32/Int64/UInt32/UInt64 and `updated_at` as either a timestamp or a connector_arrow Utf8 string. If you hit this, the output is corrupt — delete the table directory and re-run after fixing the cause.
+
+**Cleaning up between runs:** Delta Lake does not vacuum superseded Parquet files automatically. After an aborted or buggy run, remove the affected table directory and start fresh rather than letting tombstoned files accumulate.
 
 ## Validation Rules
 
