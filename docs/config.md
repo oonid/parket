@@ -48,6 +48,37 @@ TABLE_MODE_products=full_refresh
 # customers uses auto-detection
 ```
 
+## Per-Table Initial High Watermark (HWM)
+
+For incremental tables, you can predefine a starting High Watermark (HWM) to seed the first incremental run:
+
+```
+TABLE_HWM_<TABLENAME>=<updated_at>,<last_id>
+```
+
+**Semantics:** The predefined HWM is used **only** if no stored HWM exists (first run or after deletion). Once a stored HWM is recorded, it always takes precedence over the config value.
+
+**Format:**
+- `<updated_at>`: ISO 8601 timestamp (e.g., `2026-01-01T00:00:00.000000`)
+- `<last_id>`: Integer (valid i64)
+- **Separator:** First comma only; both parts are trimmed of whitespace
+
+**Validation (fail at startup):**
+- Missing comma → error
+- Empty `updated_at` → error
+- Non-numeric `last_id` → error
+- Set on a non-incremental table → error (caught at runtime, surfaces in `--check`)
+
+**Example:**
+
+```env
+TABLES=orders,customers,products
+TABLE_HWM_orders=2026-05-01T00:00:00.000000,999
+# First run resumes as if the last extracted row were
+# (updated_at=2026-05-01T00:00:00.000000, id=999): only rows with a greater
+# (updated_at, id) are extracted. Ignored once a real HWM is committed.
+```
+
 ## VM Sizing for `TARGET_MEMORY_MB`
 
 `TARGET_MEMORY_MB` sets the per-batch memory budget. The initial batch row count is `TARGET_MEMORY_MB × 1024 × 1024 / AVG_ROW_LENGTH`; after the first batch, adaptive sizing measures the actual Arrow footprint and corrects the estimate (see [Batch Extraction](batch-extraction.md)). It bounds memory the same way for both Incremental batches and FullRefresh chunks.
@@ -68,6 +99,42 @@ TABLE_MODE_products=full_refresh
 
 **Cleaning up between runs:** Delta Lake does not vacuum superseded Parquet files automatically. After an aborted or buggy run, remove the affected table directory and start fresh rather than letting tombstoned files accumulate.
 
+## Verifying Memory Fit Before Deploying to a Constrained VM
+
+Before provisioning a small VM (e.g. 4 GB), measure parket's peak memory on your current machine against your real data. Always build `--release` first — debug builds use more memory and run far slower, and the VM will run release:
+
+```bash
+cargo build --release
+```
+
+**Definitive test — enforce the cap with no swap (cgroup v2, simulates the VM exactly):**
+
+```bash
+systemd-run --user --scope -p MemoryMax=3500M -p MemorySwapMax=0 \
+  ./target/release/parket --local /path/to/out --progress
+```
+
+- `MemoryMax=3500M` leaves ~500 MB for the OS inside a 4 GB VM — adjust to your target.
+- `MemorySwapMax=0` forbids swap, so it tests "fits in RAM" honestly rather than silently thrashing.
+- Completes → it fits. Kernel OOM-kills it → it does not; confirm with `journalctl --user -e | grep -i oom`.
+
+**Quick peak-RSS number (no enforcement):**
+
+```bash
+/usr/bin/time -v ./target/release/parket --local /path/to/out --progress 2>&1 \
+  | grep "Maximum resident"
+```
+
+Divide the reported kbytes by 1024 for MB. Run the binary directly — `/usr/bin/time` measures only the process it launches, so `cargo run` would report cargo's RSS, not parket's.
+
+**Live high-water mark while running (second terminal):**
+
+```bash
+watch -n2 'grep VmHWM /proc/$(pgrep -f target/release/parket)/status'
+```
+
+`VmHWM` is the peak resident set size reached so far. Peak RSS ≈ one Arrow batch (bounded by `TARGET_MEMORY_MB`, up to the 2× hard ceiling) + delta-rs Parquet encode buffers + MySQL result buffering + allocator slack.
+
 ## Validation Rules
 
 Parket validates configuration at startup and exits with code 2 on any failure:
@@ -81,99 +148,9 @@ Error messages identify the specific missing or invalid variable.
 
 ## CLI Usage
 
-```
-parket                    Run the extractor (default mode)
-parket --check            Validate config and connectivity without extracting
-parket --progress         Emit per-batch progress logs with timing and row counts
-parket --local <dir>      Write Delta Lake files to local directory instead of S3
-parket --version          Print version
-parket --help             Show help
-```
-
-### `--check` (Pre-flight Mode)
-
-Connects to the database and S3 bucket, verifies all configured tables exist in `information_schema`, checks S3 writability (write + delete a tiny test object), and prints a per-table mode detection summary:
-
-```
-TABLE                           MODE            COLUMNS    AVG_ROW_LEN
-orders                          incremental     5          128
-products                        full_refresh    3          N/A
-pre-flight check passed
-```
-
-Exits with code 0 if all OK, code 2 on any failure. No data is extracted.
-
-When combined with `--local`, the S3 connectivity check is skipped (only database connectivity and table discovery are validated).
-
-### `--local <dir>` (Local Mode)
-
-Writes Delta Lake files to a local directory instead of S3. When set:
-
-- S3 credentials (`S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`) are **not required** and ignored if present.
-- `Config::load_local()` is used instead of `Config::load()`, so validation only requires `DATABASE_URL`, `TABLES`, and `TARGET_MEMORY_MB`.
-- Pre-flight (`--check`) skips the S3 writability check.
-- The orchestrator uses `DeltaWriter::new_local(dir)` to write Delta tables on the local filesystem.
-
-```
-parket --local /data/delta
-parket --local ./output --check
-```
-
-### `--progress` (Progress Logging)
-
-When set, emits structured INFO logs for each batch with detailed timing and cumulative statistics. Without this flag, only a concise per-batch summary is logged.
-
-Progress log fields for Incremental mode (`"batch progress"` log):
-
-| Field | Description |
-|-------|-------------|
-| `table` | Table name |
-| `batch_index` | 1-based batch counter |
-| `rows` | Rows in this batch |
-| `cumulative_rows` | Total rows extracted so far for this table |
-| `arrow_bytes` | Arrow batch size in bytes |
-| `batch_duration_ms` | Wall-clock time for this batch in milliseconds |
-
-Progress log fields for FullRefresh mode (`"full refresh chunk"` log):
-
-| Field | Description |
-|-------|-------------|
-| `table` | Table name |
-| `chunk_index` | 1-based chunk counter |
-| `rows` | Rows in this chunk |
-| `cumulative_rows` | Total rows written so far for this table |
-| `arrow_bytes` | Arrow chunk size in bytes |
-| `chunk_duration_ms` | Wall-clock time for this chunk (extract + write) in milliseconds |
-
-Without `--progress`, both modes emit a concise `"batch extracted"` log per batch/chunk.
-
-### `--version` and `--help`
-
-`--version` prints the version from `Cargo.toml`. `--help` prints self-documenting usage with all flags and their descriptions.
-
-### Startup Banner
-
-On every normal invocation (not `--check`), parket logs an INFO-level startup banner:
-
-```
-parket v0.1.0 starting  version=0.1.0 tables=3 database_host="mysql://****:****@dbhost:3306" s3_bucket=data-lake
-```
-
-In local mode:
-
-```
-parket v0.1.0 starting (local mode)  version=0.1.0 tables=3 database_host="mysql://****:****@dbhost:3306" local_dir=/data/delta
-```
-
-Sensitive values (database password, S3 secret key) are masked in all log output via `Config::display_safe()`.
-
-### Exit Codes
-
-| Code | Condition |
-|------|-----------|
-| 0 | All tables extracted successfully (or `--check` passed, or signal received after graceful shutdown) |
-| 1 | Partial failure — some tables failed, others succeeded |
-| 2 | Fatal error — config invalid, database unreachable, `--check` failed |
+Command-line flags (`--check`, `--progress`, `--local`, `--version`, `--help`),
+the startup banner, and exit codes are documented in the dedicated
+[CLI Reference](cli.md).
 
 ## Example `.env`
 
@@ -190,4 +167,5 @@ TARGET_MEMORY_MB=512
 DEFAULT_BATCH_SIZE=10000
 RUST_LOG=parket=info
 TABLE_MODE_orders=incremental
+TABLE_HWM_orders=2026-05-01T00:00:00.000000,999
 ```
