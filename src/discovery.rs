@@ -96,6 +96,17 @@ impl SchemaInspector {
         }
     }
 
+    /// MAX of a timestamp/datetime column as a string (CAST to CHAR so it comes back
+    /// as text regardless of sqlx type mapping). None if the table is empty / all NULL.
+    pub async fn max_timestamp(&self, table: &str, col: &str) -> Result<Option<String>> {
+        let sql = format!("SELECT CAST(MAX(`{col}`) AS CHAR) AS m FROM `{table}`");
+        let row: Option<(Option<String>,)> = sqlx::query_as(&sql)
+            .fetch_optional(&self.pool)
+            .await
+            .with_context(|| format!("failed to query MAX({col}) for table {table}"))?;
+        Ok(row.and_then(|(m,)| m))
+    }
+
     pub async fn check_updated_at_index(&self, table: &str) -> Result<bool> {
         let row: Option<(i64,)> = sqlx::query_as(
             "SELECT COUNT(*) FROM information_schema.statistics WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = 'updated_at'"
@@ -226,6 +237,23 @@ pub fn validate_timestamp_col(columns: &[ColumnInfo], timestamp_col: &str) -> an
     if !ok {
         anyhow::bail!("configured timestamp column '{timestamp_col}' is missing or not a timestamp/datetime column");
     }
+    Ok(())
+}
+
+pub fn validate_two_stream_cursors(
+    columns: &[ColumnInfo],
+    insert_col: &str,
+    update_col: &str,
+) -> anyhow::Result<()> {
+    let is_int = |c: &ColumnInfo| matches!(c.data_type.as_str(),
+        "tinyint" | "smallint" | "mediumint" | "int" | "bigint");
+    let insert_ok = columns.iter().any(|c| c.name == insert_col && is_int(c));
+    if !insert_ok {
+        anyhow::bail!("two-stream insert cursor '{insert_col}' is missing or not an integer column");
+    }
+    // reuse the timestamp/datetime check
+    validate_timestamp_col(columns, update_col)
+        .map_err(|_| anyhow::anyhow!("two-stream update cursor '{update_col}' is missing or not a timestamp/datetime column"))?;
     Ok(())
 }
 
@@ -544,6 +572,70 @@ mod tests {
         ];
         let mode = detect_mode(&columns, None, "completed_at");
         assert_eq!(mode, ExtractionMode::Incremental);
+    }
+
+    #[test]
+    fn validate_two_stream_cursors_both_valid() {
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("user_id", "bigint", "bigint(20)"),
+            col("updated_at", "timestamp", "timestamp"),
+        ];
+        let result = validate_two_stream_cursors(&columns, "user_id", "updated_at");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_two_stream_cursors_insert_missing() {
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("updated_at", "timestamp", "timestamp"),
+        ];
+        let result = validate_two_stream_cursors(&columns, "missing_col", "updated_at");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("two-stream insert cursor"));
+        assert!(err.contains("missing_col"));
+    }
+
+    #[test]
+    fn validate_two_stream_cursors_insert_not_integer() {
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("key", "varchar", "varchar(255)"),
+            col("updated_at", "timestamp", "timestamp"),
+        ];
+        let result = validate_two_stream_cursors(&columns, "key", "updated_at");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("two-stream insert cursor"));
+        assert!(err.contains("not an integer column"));
+    }
+
+    #[test]
+    fn validate_two_stream_cursors_update_missing() {
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("user_id", "bigint", "bigint(20)"),
+        ];
+        let result = validate_two_stream_cursors(&columns, "user_id", "completed_at");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("two-stream update cursor"));
+        assert!(err.contains("completed_at"));
+    }
+
+    #[test]
+    fn validate_two_stream_cursors_update_not_timestamp() {
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("user_id", "bigint", "bigint(20)"),
+            col("completed_at", "varchar", "varchar(255)"),
+        ];
+        let result = validate_two_stream_cursors(&columns, "user_id", "completed_at");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("two-stream update cursor"));
     }
 
     #[test]

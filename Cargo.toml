@@ -26,6 +26,7 @@ openssl = { version = "0.10", features = ["vendored"] }
 sha2 = "0.10"
 url = "2.5.8"
 object_store = { version = "0.12", features = ["aws"] }
+libc = "0.2"
 
 [dev-dependencies]
 aws-sdk-s3 = "1"

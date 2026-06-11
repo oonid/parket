@@ -90,20 +90,38 @@ where
         if self.config.table_timestamp_col.contains_key(table_name) {
             crate::discovery::validate_timestamp_col(&columns, &ts_col)?;
         }
-        let mode_override = self.config.table_modes.get(table_name);
-        let mode = detect_mode(&columns, mode_override, &ts_col);
 
-        if mode != crate::config::ExtractionMode::Incremental
+        // Resolve TwoStream mode from configuration
+        let has_insert = self.config.table_insert_cursor.contains_key(table_name);
+        let has_update = self.config.table_update_cursor.contains_key(table_name);
+        if has_insert ^ has_update {
+            anyhow::bail!("two-stream requires BOTH TABLE_INSERT_CURSOR_{table_name} and TABLE_UPDATE_CURSOR_{table_name}");
+        }
+        let mode = if let Some((ins, upd)) = self.config.two_stream(table_name) {
+            crate::discovery::validate_two_stream_cursors(&columns, &ins, &upd)?;
+            crate::config::ExtractionMode::TwoStream
+        } else {
+            let mode_override = self.config.table_modes.get(table_name);
+            detect_mode(&columns, mode_override, &ts_col)
+        };
+
+        if !matches!(mode, crate::config::ExtractionMode::Incremental | crate::config::ExtractionMode::TwoStream)
             && self.config.table_initial_hwm.contains_key(table_name)
         {
-            anyhow::bail!("TABLE_HWM_{table_name} set but table is not incremental");
+            anyhow::bail!("TABLE_HWM_{table_name} set but table is not incremental or two-stream");
         }
 
         let avg_row_length = self.inspect.get_avg_row_length(table_name).await?;
         let hwm = self.hwm.read_hwm(table_name).await?;
 
         // Compute KEY based on mode and override
-        let key = if mode_override.is_some() && mode_override != Some(&crate::config::ExtractionMode::Auto) {
+        let key = if matches!(mode, crate::config::ExtractionMode::TwoStream) {
+            if let Some((ins, upd)) = self.config.two_stream(table_name) {
+                format!("two-stream: {} + {}", ins, upd)
+            } else {
+                unreachable!() // mode is TwoStream, so two_stream() must return Some
+            }
+        } else if matches!(self.config.table_modes.get(table_name), Some(m) if m != &crate::config::ExtractionMode::Auto) {
             "override".to_string()
         } else {
             match mode {
@@ -122,6 +140,7 @@ where
                         (true, true) => unreachable!(), // Would be Incremental
                     }
                 }
+                crate::config::ExtractionMode::TwoStream => unreachable!(), // Already handled above
                 crate::config::ExtractionMode::Auto => unreachable!(), // detect_mode never returns Auto
             }
         };
@@ -135,6 +154,7 @@ where
         let mode_str = match mode {
             crate::config::ExtractionMode::Incremental => "incremental",
             crate::config::ExtractionMode::FullRefresh => "full_refresh",
+            crate::config::ExtractionMode::TwoStream => "two_stream",
             crate::config::ExtractionMode::Auto => "auto",
         };
 
@@ -269,6 +289,8 @@ mod tests {
             s3_secret_access_key: "secret".to_string(),
             tables,
             target_memory_mb: 512,
+            merge_memory_mb: 512,
+            merge_spill_dir: None,
             s3_endpoint: None,
             s3_region: "us-east-1".to_string(),
             s3_prefix: "parket".to_string(),
@@ -277,6 +299,8 @@ mod tests {
             table_modes: HashMap::new(),
             table_initial_hwm: HashMap::new(),
             table_timestamp_col: HashMap::new(),
+            table_insert_cursor: HashMap::new(),
+            table_update_cursor: HashMap::new(),
         }
     }
 
@@ -552,5 +576,127 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("1 table(s) failed"));
+    }
+
+    #[tokio::test]
+    async fn two_stream_both_cursors_valid_succeeds() {
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_insert_cursor.insert("orders".to_string(), "id".to_string());
+        config.table_update_cursor.insert("orders".to_string(), "updated_at".to_string());
+
+        let mut inspect = MockPreflightInspect::new();
+        let mut storage = MockPreflightStorage::new();
+        let mut hwm = MockPreflightHwm::new();
+
+        storage.expect_check_writable().returning(|| Ok(()));
+        hwm.expect_read_hwm().returning(|_| Ok(None));
+        inspect
+            .expect_discover_columns()
+            .returning(|_| Ok(incremental_columns()));
+        inspect
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(128)));
+
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
+        let result = check.run().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn two_stream_only_insert_cursor_fails() {
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_insert_cursor.insert("orders".to_string(), "id".to_string());
+
+        let mut inspect = MockPreflightInspect::new();
+        let mut storage = MockPreflightStorage::new();
+        let hwm = MockPreflightHwm::new();
+
+        storage.expect_check_writable().returning(|| Ok(()));
+        inspect
+            .expect_discover_columns()
+            .returning(|_| Ok(incremental_columns()));
+        inspect
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(128)));
+
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
+        let result = check.run().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("1 table(s) failed"), "error message: {err}");
+    }
+
+    #[tokio::test]
+    async fn two_stream_only_update_cursor_fails() {
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_update_cursor.insert("orders".to_string(), "updated_at".to_string());
+
+        let mut inspect = MockPreflightInspect::new();
+        let mut storage = MockPreflightStorage::new();
+        let hwm = MockPreflightHwm::new();
+
+        storage.expect_check_writable().returning(|| Ok(()));
+        inspect
+            .expect_discover_columns()
+            .returning(|_| Ok(incremental_columns()));
+        inspect
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(128)));
+
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
+        let result = check.run().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("1 table(s) failed"), "error message: {err}");
+    }
+
+    #[tokio::test]
+    async fn two_stream_insert_cursor_not_integer_fails() {
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_insert_cursor.insert("orders".to_string(), "name".to_string());
+        config.table_update_cursor.insert("orders".to_string(), "updated_at".to_string());
+
+        let mut inspect = MockPreflightInspect::new();
+        let mut storage = MockPreflightStorage::new();
+        let hwm = MockPreflightHwm::new();
+
+        storage.expect_check_writable().returning(|| Ok(()));
+        inspect
+            .expect_discover_columns()
+            .returning(|_| Ok(incremental_columns()));
+        inspect
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(128)));
+
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
+        let result = check.run().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("1 table(s) failed"), "error message: {err}");
+    }
+
+    #[tokio::test]
+    async fn two_stream_update_cursor_not_timestamp_fails() {
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_insert_cursor.insert("orders".to_string(), "id".to_string());
+        config.table_update_cursor.insert("orders".to_string(), "name".to_string());
+
+        let mut inspect = MockPreflightInspect::new();
+        let mut storage = MockPreflightStorage::new();
+        let hwm = MockPreflightHwm::new();
+
+        storage.expect_check_writable().returning(|| Ok(()));
+        inspect
+            .expect_discover_columns()
+            .returning(|_| Ok(incremental_columns()));
+        inspect
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(128)));
+
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
+        let result = check.run().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("1 table(s) failed"), "error message: {err}");
     }
 }

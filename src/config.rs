@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 
@@ -10,6 +11,11 @@ pub struct Config {
     pub s3_secret_access_key: String,
     pub tables: Vec<String>,
     pub target_memory_mb: u64,
+    /// Memory budget (MB) for the two-stream MERGE's datafusion session (bounded
+    /// FairSpillPool). Independent of `target_memory_mb`; defaults to it when unset.
+    pub merge_memory_mb: u64,
+    /// Optional spill directory for the MERGE's external sort; None = system temp.
+    pub merge_spill_dir: Option<PathBuf>,
     pub s3_endpoint: Option<String>,
     pub s3_region: String,
     pub s3_prefix: String,
@@ -18,6 +24,8 @@ pub struct Config {
     pub table_modes: HashMap<String, ExtractionMode>,
     pub table_initial_hwm: HashMap<String, (String, i64)>,
     pub table_timestamp_col: HashMap<String, String>,
+    pub table_insert_cursor: HashMap<String, String>,
+    pub table_update_cursor: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -25,11 +33,20 @@ pub enum ExtractionMode {
     Auto,
     Incremental,
     FullRefresh,
+    TwoStream,
 }
 
 impl Config {
     pub fn timestamp_col(&self, table: &str) -> &str {
         self.table_timestamp_col.get(table).map(|s| s.as_str()).unwrap_or("updated_at")
+    }
+
+    /// Returns (insert_cursor, update_cursor) when both are configured for the table.
+    pub fn two_stream(&self, table: &str) -> Option<(String, String)> {
+        match (self.table_insert_cursor.get(table), self.table_update_cursor.get(table)) {
+            (Some(i), Some(u)) => Some((i.clone(), u.clone())),
+            _ => None,
+        }
     }
 
     /// Minimal load for `--inspect`: only DATABASE_URL is required.
@@ -64,6 +81,23 @@ impl Config {
             bail!("TARGET_MEMORY_MB must be greater than 0");
         }
 
+        // MERGE memory budget: optional, defaults to TARGET_MEMORY_MB. Bounds the
+        // two-stream MERGE's datafusion session so it spills to disk instead of OOM.
+        let merge_memory_mb: u64 = std::env::var("MERGE_MEMORY_MB")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse())
+            .transpose()
+            .context("MERGE_MEMORY_MB must be a positive integer")?
+            .unwrap_or(target_memory_mb);
+        if merge_memory_mb == 0 {
+            bail!("MERGE_MEMORY_MB must be greater than 0");
+        }
+        let merge_spill_dir = std::env::var("MERGE_SPILL_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+
         let s3_endpoint = std::env::var("S3_ENDPOINT").ok().filter(|s| !s.is_empty());
         let s3_region = std::env::var("S3_REGION")
             .ok()
@@ -88,6 +122,8 @@ impl Config {
         let table_modes = parse_table_modes(&tables);
         let table_initial_hwm = parse_table_initial_hwm(&tables)?;
         let table_timestamp_col = parse_table_timestamp_col(&tables);
+        let table_insert_cursor = parse_table_insert_cursor(&tables);
+        let table_update_cursor = parse_table_update_cursor(&tables);
 
         Ok(Self {
             database_url,
@@ -96,6 +132,8 @@ impl Config {
             s3_secret_access_key,
             tables,
             target_memory_mb,
+            merge_memory_mb,
+            merge_spill_dir,
             s3_endpoint,
             s3_region,
             s3_prefix,
@@ -104,6 +142,8 @@ impl Config {
             table_modes,
             table_initial_hwm,
             table_timestamp_col,
+            table_insert_cursor,
+            table_update_cursor,
         })
     }
 
@@ -128,6 +168,23 @@ impl Config {
             bail!("TARGET_MEMORY_MB must be greater than 0");
         }
 
+        // MERGE memory budget: optional, defaults to TARGET_MEMORY_MB. Bounds the
+        // two-stream MERGE's datafusion session so it spills to disk instead of OOM.
+        let merge_memory_mb: u64 = std::env::var("MERGE_MEMORY_MB")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse())
+            .transpose()
+            .context("MERGE_MEMORY_MB must be a positive integer")?
+            .unwrap_or(target_memory_mb);
+        if merge_memory_mb == 0 {
+            bail!("MERGE_MEMORY_MB must be greater than 0");
+        }
+        let merge_spill_dir = std::env::var("MERGE_SPILL_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+
         let s3_endpoint = std::env::var("S3_ENDPOINT").ok().filter(|s| !s.is_empty());
         let s3_region = std::env::var("S3_REGION")
             .ok()
@@ -152,6 +209,8 @@ impl Config {
         let table_modes = parse_table_modes(&tables);
         let table_initial_hwm = parse_table_initial_hwm(&tables)?;
         let table_timestamp_col = parse_table_timestamp_col(&tables);
+        let table_insert_cursor = parse_table_insert_cursor(&tables);
+        let table_update_cursor = parse_table_update_cursor(&tables);
 
         Ok(Self {
             database_url,
@@ -160,6 +219,8 @@ impl Config {
             s3_secret_access_key: String::new(),
             tables,
             target_memory_mb,
+            merge_memory_mb,
+            merge_spill_dir,
             s3_endpoint,
             s3_region,
             s3_prefix,
@@ -168,6 +229,8 @@ impl Config {
             table_modes,
             table_initial_hwm,
             table_timestamp_col,
+            table_insert_cursor,
+            table_update_cursor,
         })
     }
 
@@ -266,6 +329,34 @@ fn parse_table_timestamp_col(tables: &[String]) -> HashMap<String, String> {
     map
 }
 
+fn parse_table_insert_cursor(tables: &[String]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for table in tables {
+        let key = format!("TABLE_INSERT_CURSOR_{table}");
+        if let Ok(val) = std::env::var(&key) {
+            let val = val.trim();
+            if !val.is_empty() {
+                map.insert(table.clone(), val.to_string());
+            }
+        }
+    }
+    map
+}
+
+fn parse_table_update_cursor(tables: &[String]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for table in tables {
+        let key = format!("TABLE_UPDATE_CURSOR_{table}");
+        if let Ok(val) = std::env::var(&key) {
+            let val = val.trim();
+            if !val.is_empty() {
+                map.insert(table.clone(), val.to_string());
+            }
+        }
+    }
+    map
+}
+
 pub fn mask_database_url(url: &str) -> String {
     url::Url::parse(url)
         .ok()
@@ -306,6 +397,8 @@ mod tests {
         "S3_SECRET_ACCESS_KEY",
         "TABLES",
         "TARGET_MEMORY_MB",
+        "MERGE_MEMORY_MB",
+        "MERGE_SPILL_DIR",
         "S3_ENDPOINT",
         "S3_REGION",
         "S3_PREFIX",
@@ -325,6 +418,12 @@ mod tests {
                 env::remove_var(&key);
             }
             for (key, _) in env::vars().filter(|(k, _)| k.starts_with("TABLE_TIMESTAMP_")) {
+                env::remove_var(&key);
+            }
+            for (key, _) in env::vars().filter(|(k, _)| k.starts_with("TABLE_INSERT_CURSOR_")) {
+                env::remove_var(&key);
+            }
+            for (key, _) in env::vars().filter(|(k, _)| k.starts_with("TABLE_UPDATE_CURSOR_")) {
                 env::remove_var(&key);
             }
         }
@@ -550,6 +649,76 @@ mod tests {
 
         let result = Config::load();
         assert!(result.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn merge_memory_mb_defaults_to_target_when_unset() {
+        let _cwd = no_dotenv(); // isolate from a real .env that may set MERGE_MEMORY_MB
+        clear_config_env();
+        set_required_vars(); // TARGET_MEMORY_MB=512, MERGE_MEMORY_MB unset
+
+        let config = Config::load().expect("load should succeed");
+
+        assert_eq!(config.merge_memory_mb, 512, "should default to target_memory_mb");
+        assert_eq!(config.merge_spill_dir, None, "spill dir defaults to None (system temp)");
+    }
+
+    #[test]
+    #[serial]
+    fn merge_memory_mb_override_parsed() {
+        let _cwd = no_dotenv();
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("MERGE_MEMORY_MB", "2048");
+        }
+
+        let config = Config::load().expect("load should succeed");
+
+        assert_eq!(config.merge_memory_mb, 2048);
+        assert_eq!(config.target_memory_mb, 512, "extract budget stays independent");
+    }
+
+    #[test]
+    #[serial]
+    fn load_fails_when_merge_memory_mb_zero() {
+        let _cwd = no_dotenv();
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("MERGE_MEMORY_MB", "0");
+        }
+
+        assert!(Config::load().is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn load_fails_when_merge_memory_mb_non_numeric() {
+        let _cwd = no_dotenv();
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("MERGE_MEMORY_MB", "lots");
+        }
+
+        assert!(Config::load().is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn merge_spill_dir_parsed_when_set() {
+        let _cwd = no_dotenv();
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("MERGE_SPILL_DIR", "/tmp/parket-spill");
+        }
+
+        let config = Config::load().expect("load should succeed");
+
+        assert_eq!(config.merge_spill_dir, Some(PathBuf::from("/tmp/parket-spill")));
     }
 
     #[test]
@@ -1156,5 +1325,141 @@ mod tests {
 
         let result = Config::load_inspect();
         assert!(result.is_ok(), "load_inspect should not require S3 or TABLES vars");
+    }
+
+    #[test]
+    #[serial]
+    fn parse_table_insert_cursor_both_set_returns_some() {
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("TABLE_INSERT_CURSOR_orders", "insert_id");
+            env::set_var("TABLE_UPDATE_CURSOR_orders", "update_id");
+        }
+
+        let config = Config::load().expect("load should succeed");
+        let result = config.two_stream("orders");
+        assert_eq!(
+            result,
+            Some(("insert_id".to_string(), "update_id".to_string()))
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn parse_table_insert_cursor_only_insert_set_returns_none() {
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("TABLE_INSERT_CURSOR_orders", "insert_id");
+        }
+
+        let config = Config::load().expect("load should succeed");
+        assert_eq!(config.two_stream("orders"), None);
+        assert_eq!(
+            config.table_insert_cursor.get("orders").map(|s| s.as_str()),
+            Some("insert_id")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn parse_table_insert_cursor_only_update_set_returns_none() {
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("TABLE_UPDATE_CURSOR_orders", "update_id");
+        }
+
+        let config = Config::load().expect("load should succeed");
+        assert_eq!(config.two_stream("orders"), None);
+        assert_eq!(
+            config.table_update_cursor.get("orders").map(|s| s.as_str()),
+            Some("update_id")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn parse_table_insert_cursor_neither_set_returns_none() {
+        clear_config_env();
+        set_required_vars();
+
+        let config = Config::load().expect("load should succeed");
+        assert_eq!(config.two_stream("orders"), None);
+        assert!(config.table_insert_cursor.is_empty());
+        assert!(config.table_update_cursor.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn parse_table_insert_cursor_underscore_table_name() {
+        clear_config_env();
+        unsafe {
+            env::set_var("TABLE_INSERT_CURSOR_my_table", "cursor_a");
+            env::set_var("TABLE_UPDATE_CURSOR_my_table", "cursor_b");
+        }
+
+        let result_insert = parse_table_insert_cursor(&["my_table".to_string()]);
+        let result_update = parse_table_update_cursor(&["my_table".to_string()]);
+        assert_eq!(result_insert.get("my_table").map(|s| s.as_str()), Some("cursor_a"));
+        assert_eq!(result_update.get("my_table").map(|s| s.as_str()), Some("cursor_b"));
+    }
+
+    #[test]
+    #[serial]
+    fn parse_table_insert_cursor_empty_value_not_inserted() {
+        clear_config_env();
+        unsafe {
+            env::set_var("TABLE_INSERT_CURSOR_orders", "");
+            env::set_var("TABLE_UPDATE_CURSOR_orders", "");
+        }
+
+        let result_insert = parse_table_insert_cursor(&["orders".to_string()]);
+        let result_update = parse_table_update_cursor(&["orders".to_string()]);
+        assert!(result_insert.is_empty());
+        assert!(result_update.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn parse_table_insert_cursor_multiple_tables() {
+        clear_config_env();
+        unsafe {
+            env::set_var("TABLE_INSERT_CURSOR_orders", "orders_insert");
+            env::set_var("TABLE_UPDATE_CURSOR_orders", "orders_update");
+            env::set_var("TABLE_INSERT_CURSOR_customers", "customers_insert");
+            env::set_var("TABLE_UPDATE_CURSOR_customers", "customers_update");
+        }
+
+        let config = Config {
+            database_url: "mysql://u:p@h/db".to_string(),
+            s3_bucket: "bucket".to_string(),
+            s3_access_key_id: "key".to_string(),
+            s3_secret_access_key: "secret".to_string(),
+            tables: vec!["orders".to_string(), "customers".to_string()],
+            target_memory_mb: 512,
+            merge_memory_mb: 512,
+            merge_spill_dir: None,
+            s3_endpoint: None,
+            s3_region: "us-east-1".to_string(),
+            s3_prefix: "parket".to_string(),
+            default_batch_size: 10000,
+            rust_log: "info".to_string(),
+            table_modes: HashMap::new(),
+            table_initial_hwm: HashMap::new(),
+            table_timestamp_col: HashMap::new(),
+            table_insert_cursor: parse_table_insert_cursor(&["orders".to_string(), "customers".to_string()]),
+            table_update_cursor: parse_table_update_cursor(&["orders".to_string(), "customers".to_string()]),
+        };
+
+        assert_eq!(
+            config.two_stream("orders"),
+            Some(("orders_insert".to_string(), "orders_update".to_string()))
+        );
+        assert_eq!(
+            config.two_stream("customers"),
+            Some(("customers_insert".to_string(), "customers_update".to_string()))
+        );
     }
 }

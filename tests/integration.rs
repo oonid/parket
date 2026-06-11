@@ -49,6 +49,8 @@ fn make_config(db_url: &str, s3_endpoint: &str, tables: Vec<&str>) -> Config {
         s3_secret_access_key: "minioadmin".to_string(),
         tables: tables.into_iter().map(|s| s.to_string()).collect(),
         target_memory_mb: 64,
+        merge_memory_mb: 64,
+        merge_spill_dir: None,
         s3_endpoint: Some(s3_endpoint.to_string()),
         s3_region: "us-east-1".to_string(),
         s3_prefix: "parket".to_string(),
@@ -57,6 +59,8 @@ fn make_config(db_url: &str, s3_endpoint: &str, tables: Vec<&str>) -> Config {
         table_modes: HashMap::new(),
         table_initial_hwm: HashMap::new(),
         table_timestamp_col: HashMap::new(),
+        table_insert_cursor: HashMap::new(),
+        table_update_cursor: HashMap::new(),
     }
 }
 
@@ -294,6 +298,27 @@ async fn count_delta_rows(env: &TestEnv, table_name: &str) -> usize {
         total += batch.num_rows();
     }
     total
+}
+
+/// Count rows in a Delta table matching a SQL WHERE clause (via datafusion over the table provider).
+async fn count_matching(env: &TestEnv, table_name: &str, where_clause: &str) -> i64 {
+    let t = env.open_delta_table(table_name).await;
+    let ctx = deltalake::datafusion::prelude::SessionContext::new();
+    let provider = t.table_provider().await.expect("table_provider failed");
+    ctx.register_table(table_name, provider).unwrap();
+    let batches = ctx
+        .sql(&format!("SELECT COUNT(*) AS c FROM {table_name} WHERE {where_clause}"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<deltalake::arrow::array::Int64Array>()
+        .expect("COUNT(*) should be Int64")
+        .value(0)
 }
 
 #[tokio::test]
@@ -585,6 +610,134 @@ async fn crash_recovery_hwm_advances_and_only_new_rows_appended() {
         hwm2.updated_at,
     );
     assert_eq!(hwm2.last_id, 5, "run 2: HWM last_id should be 5");
+}
+
+/// Two-stream (insert + update MERGE) end-to-end across two runs:
+/// - insert stream appends new rows by PK `id`;
+/// - update stream MERGEs mutations by the `completed_at` cursor;
+/// - bootstrap seeds the update watermark so run 1 merges nothing redundant;
+/// - run 2 captures: a mutated existing row, a NULL->set transition, new inserts, and
+///   crucially does NOT duplicate a row caught by BOTH streams.
+#[tokio::test]
+#[serial_test::serial]
+async fn two_stream_inserts_and_merges_mutations_across_runs() {
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let mut env = TestEnv::new(vec!["orders"]).await;
+    // Enable two-stream for `orders`: insert cursor = id (PK), update cursor = completed_at.
+    env.config
+        .table_insert_cursor
+        .insert("orders".to_string(), "id".to_string());
+    env.config
+        .table_update_cursor
+        .insert("orders".to_string(), "completed_at".to_string());
+
+    sqlx::query(
+        "CREATE TABLE orders (\
+            id BIGINT PRIMARY KEY, \
+            name VARCHAR(255), \
+            qty INT, \
+            completed_at DATETIME(6) NULL\
+        )",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create orders table");
+
+    sqlx::query("CREATE INDEX idx_orders_completed_at ON orders (completed_at, id)")
+        .execute(&env.pool)
+        .await
+        .expect("failed to create index");
+
+    // Run 1 seed: row 2 is not yet completed (completed_at NULL).
+    sqlx::query(
+        "INSERT INTO orders (id, name, qty, completed_at) VALUES \
+            (1, 'widget', 10, '2026-01-01 10:00:00.000000'), \
+            (2, 'gadget', 5, NULL), \
+            (3, 'doohickey', 3, '2026-01-02 09:00:00.000000')",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert run-1 rows");
+
+    let mut run1 = env.make_orchestrator();
+    let exit1 = run1.run().await;
+    assert!(matches!(exit1, ExitCode::Success), "run 1: expected Success, got {exit1:?}");
+
+    // Insert stream appended all 3 rows in their current state (incl. the NULL-completed row 2).
+    assert_eq!(count_delta_rows(&env, "orders").await, 3, "run 1: expected 3 rows");
+
+    let writer = DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    );
+    assert_eq!(
+        writer.read_insert_hwm("orders").await.unwrap(),
+        Some(3),
+        "run 1: insert HWM should be max id = 3"
+    );
+
+    // --- between runs: mutate existing rows + insert new ones ---
+    // Existing row 1 mutated (qty + completed_at advance) — must be captured by the update MERGE:
+    sqlx::query(
+        "UPDATE orders SET qty = 99, completed_at = '2026-01-06 09:00:00.000000' WHERE id = 1",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to mutate row 1");
+    // Row 2 transitions NULL -> set (Feature E x two-stream): must now be captured:
+    sqlx::query(
+        "UPDATE orders SET completed_at = '2026-01-05 12:00:00.000000' WHERE id = 2",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to complete row 2");
+    // New rows by id > 3. Row 5 is ALSO completed after the seed, so it is caught by BOTH the
+    // insert stream (id > 3) AND the update stream (completed_at > seed) — must NOT duplicate.
+    sqlx::query(
+        "INSERT INTO orders (id, name, qty, completed_at) VALUES \
+            (4, 'thingamajig', 7, NULL), \
+            (5, 'gizmo', 8, '2026-01-03 14:00:00.000000')",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert run-2 rows");
+
+    let mut run2 = env.make_orchestrator();
+    let exit2 = run2.run().await;
+    assert!(matches!(exit2, ExitCode::Success), "run 2: expected Success, got {exit2:?}");
+
+    // CRITICAL: exactly 5 distinct rows — no duplicates despite row 5 being in both streams.
+    assert_eq!(
+        count_delta_rows(&env, "orders").await,
+        5,
+        "run 2: expected 5 distinct rows (no duplicates from the two streams)"
+    );
+    // Mutation captured by the update MERGE (qty 10 -> 99):
+    assert_eq!(
+        count_matching(&env, "orders", "id = 1 AND qty = 99").await,
+        1,
+        "run 2: row 1 mutation should be merged (qty=99)"
+    );
+    // NULL -> set transition captured:
+    assert_eq!(
+        count_matching(&env, "orders", "id = 2 AND completed_at IS NOT NULL").await,
+        1,
+        "run 2: row 2 completion should be merged (completed_at now set)"
+    );
+    // Insert watermark advanced past the new rows:
+    assert_eq!(
+        writer.read_insert_hwm("orders").await.unwrap(),
+        Some(5),
+        "run 2: insert HWM should advance to 5"
+    );
 }
 
 #[tokio::test]

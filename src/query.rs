@@ -28,12 +28,12 @@ impl QueryBuilder {
         match (hwm_updated_at, hwm_last_id) {
             (Some(updated_at), Some(last_id)) => {
                 format!(
-                    "SELECT {col_list} FROM {quoted_table} WHERE ({ts} = '{updated_at}' AND `id` > {last_id}) OR ({ts} > '{updated_at}') ORDER BY {ts} ASC, `id` ASC LIMIT {batch_size}"
+                    "SELECT {col_list} FROM {quoted_table} WHERE {ts} IS NOT NULL AND (({ts} = '{updated_at}' AND `id` > {last_id}) OR ({ts} > '{updated_at}')) ORDER BY {ts} ASC, `id` ASC LIMIT {batch_size}"
                 )
             }
             _ => {
                 format!(
-                    "SELECT {col_list} FROM {quoted_table} ORDER BY {ts} ASC, `id` ASC LIMIT {batch_size}"
+                    "SELECT {col_list} FROM {quoted_table} WHERE {ts} IS NOT NULL ORDER BY {ts} ASC, `id` ASC LIMIT {batch_size}"
                 )
             }
         }
@@ -54,6 +54,28 @@ impl QueryBuilder {
         let col_list = format_columns(columns);
         let quoted_table = backtick(table);
         format!("SELECT {col_list} FROM {quoted_table} LIMIT {batch_size} OFFSET {offset}")
+    }
+
+    /// Insert-stream query: rows with key greater than the watermark, ordered by key.
+    /// `key_col` is the monotonic PK (e.g. `id`). First run (None) has no WHERE.
+    pub fn build_insert_stream_query(
+        table: &str,
+        columns: &[String],
+        key_col: &str,
+        hwm_id: Option<i64>,
+        batch_size: u64,
+    ) -> String {
+        let col_list = format_columns(columns);
+        let quoted_table = backtick(table);
+        let key = backtick(key_col);
+        match hwm_id {
+            Some(id) => format!(
+                "SELECT {col_list} FROM {quoted_table} WHERE {key} > {id} ORDER BY {key} ASC LIMIT {batch_size}"
+            ),
+            None => format!(
+                "SELECT {col_list} FROM {quoted_table} ORDER BY {key} ASC LIMIT {batch_size}"
+            ),
+        }
     }
 }
 
@@ -77,7 +99,8 @@ mod tests {
         );
 
         assert!(sql.contains("SELECT `id`, `name`, `updated_at` FROM `orders`"));
-        assert!(sql.contains("WHERE (`updated_at` = '2026-03-28 09:00:00' AND `id` > 500)"));
+        assert!(sql.contains("WHERE `updated_at` IS NOT NULL AND"));
+        assert!(sql.contains("(`updated_at` = '2026-03-28 09:00:00' AND `id` > 500)"));
         assert!(sql.contains("OR (`updated_at` > '2026-03-28 09:00:00')"));
         assert!(sql.contains("ORDER BY `updated_at` ASC, `id` ASC"));
         assert!(sql.contains("LIMIT 10000"));
@@ -99,7 +122,7 @@ mod tests {
         );
 
         assert!(sql.contains("SELECT `id`, `name`, `updated_at` FROM `orders`"));
-        assert!(!sql.contains("WHERE"));
+        assert!(sql.contains("WHERE `updated_at` IS NOT NULL"));
         assert!(sql.contains("ORDER BY `updated_at` ASC, `id` ASC"));
         assert!(sql.contains("LIMIT 10000"));
     }
@@ -181,9 +204,10 @@ mod tests {
         );
 
         assert!(
-            !sql.contains("WHERE"),
-            "Partial HWM should be treated as no HWM"
+            sql.contains("WHERE `updated_at` IS NOT NULL"),
+            "Partial HWM should be treated as no HWM (with NULL filter)"
         );
+        assert!(!sql.contains("AND ("), "No conditional HWM clauses");
     }
 
     #[test]
@@ -198,9 +222,10 @@ mod tests {
         );
 
         assert!(
-            !sql.contains("WHERE"),
-            "Partial HWM should be treated as no HWM"
+            sql.contains("WHERE `updated_at` IS NOT NULL"),
+            "Partial HWM should be treated as no HWM (with NULL filter)"
         );
+        assert!(!sql.contains("AND ("), "No conditional HWM clauses");
     }
 
     #[test]
@@ -235,7 +260,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "SELECT `id`, `name`, `updated_at` FROM `orders` WHERE (`updated_at` = '2026-03-28 09:00:00' AND `id` > 500) OR (`updated_at` > '2026-03-28 09:00:00') ORDER BY `updated_at` ASC, `id` ASC LIMIT 10000"
+            "SELECT `id`, `name`, `updated_at` FROM `orders` WHERE `updated_at` IS NOT NULL AND ((`updated_at` = '2026-03-28 09:00:00' AND `id` > 500) OR (`updated_at` > '2026-03-28 09:00:00')) ORDER BY `updated_at` ASC, `id` ASC LIMIT 10000"
         );
     }
 
@@ -246,7 +271,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "SELECT `id` FROM `orders` ORDER BY `updated_at` ASC, `id` ASC LIMIT 5000"
+            "SELECT `id` FROM `orders` WHERE `updated_at` IS NOT NULL ORDER BY `updated_at` ASC, `id` ASC LIMIT 5000"
         );
     }
 
@@ -312,5 +337,108 @@ mod tests {
             "t", &["a".to_string()], 10000, 0,
         );
         assert!(sql.ends_with("LIMIT 10000 OFFSET 0"));
+    }
+
+    #[test]
+    fn incremental_null_filter_in_both_branches() {
+        // Test with HWM
+        let sql_with_hwm = QueryBuilder::build_incremental_query(
+            "orders",
+            &["id".to_string()],
+            "updated_at",
+            Some("2026-03-28 09:00:00"),
+            Some(500),
+            10000,
+        );
+        assert!(sql_with_hwm.contains("WHERE `updated_at` IS NOT NULL AND"));
+
+        // Test without HWM
+        let sql_without_hwm = QueryBuilder::build_incremental_query(
+            "orders",
+            &["id".to_string()],
+            "updated_at",
+            None,
+            None,
+            10000,
+        );
+        assert!(sql_without_hwm.contains("WHERE `updated_at` IS NOT NULL"));
+    }
+
+    #[test]
+    fn insert_stream_with_hwm() {
+        let sql = QueryBuilder::build_insert_stream_query(
+            "orders",
+            &["id".to_string(), "name".to_string()],
+            "id",
+            Some(1000),
+            5000,
+        );
+
+        assert!(sql.contains("SELECT `id`, `name` FROM `orders`"));
+        assert!(sql.contains("WHERE `id` > 1000"));
+        assert!(sql.contains("ORDER BY `id` ASC"));
+        assert!(sql.contains("LIMIT 5000"));
+    }
+
+    #[test]
+    fn insert_stream_first_run_no_hwm() {
+        let sql = QueryBuilder::build_insert_stream_query(
+            "orders",
+            &["id".to_string(), "name".to_string()],
+            "id",
+            None,
+            5000,
+        );
+
+        assert!(sql.contains("SELECT `id`, `name` FROM `orders`"));
+        assert!(!sql.contains("WHERE"));
+        assert!(sql.contains("ORDER BY `id` ASC"));
+        assert!(sql.contains("LIMIT 5000"));
+    }
+
+    #[test]
+    fn insert_stream_custom_key_column() {
+        let sql = QueryBuilder::build_insert_stream_query(
+            "orders",
+            &["id".to_string()],
+            "order_id",
+            Some(100),
+            1000,
+        );
+
+        assert!(sql.contains("WHERE `order_id` > 100"));
+        assert!(sql.contains("ORDER BY `order_id` ASC"));
+    }
+
+    #[test]
+    fn insert_stream_exact_output_with_hwm() {
+        let sql = QueryBuilder::build_insert_stream_query(
+            "events",
+            &["id".to_string(), "data".to_string()],
+            "id",
+            Some(500),
+            10000,
+        );
+
+        assert_eq!(
+            sql,
+            "SELECT `id`, `data` FROM `events` WHERE `id` > 500 ORDER BY `id` ASC LIMIT 10000"
+        );
+    }
+
+    #[test]
+    fn insert_stream_exact_output_no_hwm() {
+        let sql = QueryBuilder::build_insert_stream_query(
+            "events",
+            &["id".to_string()],
+            "id",
+            None,
+            1000,
+        );
+
+        assert_eq!(
+            sql,
+            "SELECT `id` FROM `events` ORDER BY `id` ASC LIMIT 1000"
+        );
     }
 }

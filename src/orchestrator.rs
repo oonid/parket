@@ -21,6 +21,7 @@ use crate::writer::{extract_hwm_from_batch, DeltaWriter, Hwm};
 pub trait SchemaInspect: Send + Sync {
     async fn discover_columns(&self, table: &str) -> Result<Vec<ColumnInfo>>;
     async fn get_avg_row_length(&self, table: &str) -> Result<Option<u64>>;
+    async fn max_timestamp(&self, table: &str, col: &str) -> Result<Option<String>>;
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -48,6 +49,22 @@ pub trait DeltaWrite: Send + Sync {
     ) -> Result<()>;
     async fn read_hwm(&self, table_name: &str) -> Result<Option<Hwm>>;
     async fn get_schema(&self, table_name: &str) -> Result<Option<SchemaRef>>;
+    async fn merge_batch(
+        &self,
+        table_name: &str,
+        batches: Vec<deltalake::arrow::record_batch::RecordBatch>,
+        key_col: String,
+        insert_id: Option<i64>,
+        update_hwm: Option<Hwm>,
+    ) -> Result<()>;
+    async fn read_insert_hwm(&self, table_name: &str) -> Result<Option<i64>>;
+    async fn append_two_stream(
+        &self,
+        table_name: &str,
+        batches: Vec<deltalake::arrow::record_batch::RecordBatch>,
+        insert_id: Option<i64>,
+        update_hwm: Option<Hwm>,
+    ) -> Result<()>;
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -77,6 +94,12 @@ impl SchemaInspect for SchemaInspectorAdapter {
     async fn get_avg_row_length(&self, table: &str) -> Result<Option<u64>> {
         crate::discovery::SchemaInspector::new(self.pool.clone(), self.database.clone())
             .get_avg_row_length(table)
+            .await
+    }
+
+    async fn max_timestamp(&self, table: &str, col: &str) -> Result<Option<String>> {
+        crate::discovery::SchemaInspector::new(self.pool.clone(), self.database.clone())
+            .max_timestamp(table, col)
             .await
     }
 }
@@ -147,7 +170,8 @@ impl DeltaWriterAdapter {
                 &config.s3_region,
                 &config.s3_access_key_id,
                 &config.s3_secret_access_key,
-            ),
+            )
+            .with_merge_limits(config.merge_memory_mb, config.merge_spill_dir.clone()),
         }
     }
 }
@@ -197,6 +221,35 @@ impl DeltaWrite for DeltaWriterAdapter {
             Err(_) => Ok(None),
         }
     }
+
+    async fn merge_batch(
+        &self,
+        table_name: &str,
+        batches: Vec<deltalake::arrow::record_batch::RecordBatch>,
+        key_col: String,
+        insert_id: Option<i64>,
+        update_hwm: Option<Hwm>,
+    ) -> Result<()> {
+        self.inner
+            .merge_batch(table_name, batches, &key_col, insert_id, update_hwm.as_ref())
+            .await
+    }
+
+    async fn read_insert_hwm(&self, table_name: &str) -> Result<Option<i64>> {
+        self.inner.read_insert_hwm(table_name).await
+    }
+
+    async fn append_two_stream(
+        &self,
+        table_name: &str,
+        batches: Vec<deltalake::arrow::record_batch::RecordBatch>,
+        insert_id: Option<i64>,
+        update_hwm: Option<Hwm>,
+    ) -> Result<()> {
+        self.inner
+            .append_two_stream(table_name, batches, insert_id, update_hwm.as_ref())
+            .await
+    }
 }
 
 
@@ -205,9 +258,10 @@ pub struct LocalDeltaWriterAdapter {
 }
 
 impl LocalDeltaWriterAdapter {
-    pub fn new(dir: &Path) -> Self {
+    pub fn new(dir: &Path, config: &Config) -> Self {
         Self {
-            inner: DeltaWriter::new_local(&dir.to_string_lossy()),
+            inner: DeltaWriter::new_local(&dir.to_string_lossy())
+                .with_merge_limits(config.merge_memory_mb, config.merge_spill_dir.clone()),
         }
     }
 }
@@ -256,6 +310,35 @@ impl DeltaWrite for LocalDeltaWriterAdapter {
             }
             Err(_) => Ok(None),
         }
+    }
+
+    async fn merge_batch(
+        &self,
+        table_name: &str,
+        batches: Vec<deltalake::arrow::record_batch::RecordBatch>,
+        key_col: String,
+        insert_id: Option<i64>,
+        update_hwm: Option<Hwm>,
+    ) -> Result<()> {
+        self.inner
+            .merge_batch(table_name, batches, &key_col, insert_id, update_hwm.as_ref())
+            .await
+    }
+
+    async fn read_insert_hwm(&self, table_name: &str) -> Result<Option<i64>> {
+        self.inner.read_insert_hwm(table_name).await
+    }
+
+    async fn append_two_stream(
+        &self,
+        table_name: &str,
+        batches: Vec<deltalake::arrow::record_batch::RecordBatch>,
+        insert_id: Option<i64>,
+        update_hwm: Option<Hwm>,
+    ) -> Result<()> {
+        self.inner
+            .append_two_stream(table_name, batches, insert_id, update_hwm.as_ref())
+            .await
     }
 }
 fn column_info_to_v57_schema(columns: &[ColumnInfo]) -> Result<SchemaRef> {
@@ -504,18 +587,31 @@ where
             crate::discovery::validate_timestamp_col(&columns, &ts_col)?;
         }
 
-        let mode_override = self.config.table_modes.get(table_name);
-        let mode = detect_mode(&columns, mode_override, &ts_col);
+        // Resolve TwoStream mode from configuration
+        let has_insert = self.config.table_insert_cursor.contains_key(table_name);
+        let has_update = self.config.table_update_cursor.contains_key(table_name);
+        if has_insert ^ has_update {
+            anyhow::bail!("two-stream requires BOTH TABLE_INSERT_CURSOR_{table_name} and TABLE_UPDATE_CURSOR_{table_name}");
+        }
+        let mode = if let Some((ins, upd)) = self.config.two_stream(table_name) {
+            crate::discovery::validate_two_stream_cursors(&columns, &ins, &upd)?;
+            ExtractionMode::TwoStream
+        } else {
+            let mode_override = self.config.table_modes.get(table_name);
+            detect_mode(&columns, mode_override, &ts_col)
+        };
+
         let mode_str = match mode {
             ExtractionMode::Incremental => "incremental",
             ExtractionMode::FullRefresh => "full_refresh",
+            ExtractionMode::TwoStream => "two_stream",
             ExtractionMode::Auto => "auto",
         };
 
-        if mode != ExtractionMode::Incremental && self.config.table_initial_hwm.contains_key(table_name) {
+        if !matches!(mode, ExtractionMode::Incremental | ExtractionMode::TwoStream) && self.config.table_initial_hwm.contains_key(table_name) {
             anyhow::bail!(
                 "TABLE_HWM_{table_name} is set but table '{table_name}' resolves to {mode_str}; \
-                 a predefined HWM only applies to incremental tables"
+                 a predefined HWM only applies to incremental or two-stream tables"
             );
         }
 
@@ -527,7 +623,7 @@ where
 
         let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
         let select_columns = match mode {
-            ExtractionMode::Incremental => {
+            ExtractionMode::Incremental | ExtractionMode::TwoStream => {
                 if let Some(existing_schema) = self.writer.get_schema(table_name).await? {
                     schema_evolution_check(&columns, &existing_schema)?
                 } else {
@@ -543,6 +639,11 @@ where
             }
             ExtractionMode::FullRefresh => {
                 self.process_full_refresh(table_name, &select_columns).await?
+            }
+            ExtractionMode::TwoStream => {
+                let (insert_col, update_col) = self.config.two_stream(table_name)
+                    .expect("two_stream config present for TwoStream mode");
+                self.process_two_stream(table_name, &select_columns, &insert_col, &update_col).await?
             }
             ExtractionMode::Auto => unreachable!(),
         };
@@ -731,6 +832,122 @@ where
 
         Ok(total_rows)
     }
+
+    async fn process_two_stream(
+        &mut self,
+        table_name: &str,
+        columns: &[String],
+        insert_col: &str,
+        update_col: &str,
+    ) -> Result<u64> {
+        use crate::writer::extract_max_id;
+        let mut hwm_id = self.writer.read_insert_hwm(table_name).await?;
+        let mut update_hwm = self.writer.read_hwm(table_name).await?;
+        let mut total_rows = 0u64;
+
+        // Bootstrap seeding: on first run (no stored update HWM), seed from the current
+        // MAX(update_col) so the update stream only catches completions after the bootstrap
+        // (the insert stream already loaded every row's current state). Avoids the redundant
+        // — and previously crashing — full re-merge of existing completions.
+        let seed = if update_hwm.is_none() {
+            self.schema_inspect.max_timestamp(table_name, update_col).await?
+        } else {
+            None
+        };
+        if let Some(seed) = seed {
+            if self.progress {
+                info!(table = table_name, seed = %seed, "two-stream: seeding update watermark (skip already-loaded completions)");
+            }
+            update_hwm = Some(Hwm { updated_at: seed, last_id: i64::MAX });
+        }
+
+        // ---- Stream A: new rows by insert cursor (append) ----
+        loop {
+            if self.check_shutdown() { break; }
+            let batch_size = self.extractor.batch_size();
+            if self.progress { info!(table = table_name, after_id = ?hwm_id, "two-stream insert: fetching chunk"); }
+            let t_extract = Instant::now();
+            let sql = QueryBuilder::build_insert_stream_query(table_name, columns, insert_col, hwm_id, batch_size);
+            let batches = self.extractor.extract(&sql)?;
+            let extract_ms = t_extract.elapsed().as_millis();
+            if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) { break; }
+            let chunk_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+            let arrow_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+            let new_max = batches.iter().filter_map(|b| extract_max_id(b, insert_col)).max();
+            if self.progress { info!(table = table_name, rows = chunk_rows, extract_ms, "two-stream insert: extracted, appending"); }
+            let t_write = Instant::now();
+            self.writer.append_two_stream(table_name, batches, new_max.or(hwm_id), update_hwm.clone()).await?;
+            let write_ms = t_write.elapsed().as_millis();
+            if let Some(m) = new_max { hwm_id = Some(hwm_id.map_or(m, |c| c.max(m))); }
+            total_rows += chunk_rows;
+            if self.progress {
+                let cumulative_rows = total_rows;
+                info!(
+                    table = table_name,
+                    rows = chunk_rows,
+                    cumulative_rows,
+                    extract_ms,
+                    write_ms,
+                    "two-stream insert: appended"
+                );
+            } else {
+                info!(
+                    table = table_name,
+                    rows = chunk_rows,
+                    arrow_bytes,
+                    "batch extracted"
+                );
+            }
+            if chunk_rows < batch_size { break; }
+        }
+
+        // ---- Stream B: completions by update cursor (merge key = insert_col) ----
+        loop {
+            if self.check_shutdown() { break; }
+            let batch_size = self.extractor.batch_size();
+            if self.progress { info!(table = table_name, after_hwm = ?update_hwm, "two-stream update: fetching chunk"); }
+            let t_extract = Instant::now();
+            let sql = QueryBuilder::build_incremental_query(
+                table_name, columns, update_col,
+                update_hwm.as_ref().map(|h| h.updated_at.as_str()),
+                update_hwm.as_ref().map(|h| h.last_id),
+                batch_size,
+            );
+            let batches = self.extractor.extract(&sql)?;
+            let extract_ms = t_extract.elapsed().as_millis();
+            if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) { break; }
+            let chunk_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+            let arrow_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+            let new_hwm = batches.last().and_then(|b| extract_hwm_from_batch(b, update_col));
+            if self.progress { info!(table = table_name, rows = chunk_rows, extract_ms, "two-stream update: extracted, merging"); }
+            let t_write = Instant::now();
+            self.writer.merge_batch(table_name, batches, insert_col.to_string(), hwm_id, new_hwm.clone()).await?;
+            let write_ms = t_write.elapsed().as_millis();
+            if let Some(h) = new_hwm { update_hwm = Some(h); }
+            total_rows += chunk_rows;
+            if self.progress {
+                let cumulative_rows = total_rows;
+                info!(
+                    table = table_name,
+                    rows = chunk_rows,
+                    cumulative_rows,
+                    extract_ms,
+                    write_ms,
+                    "two-stream update: merged"
+                );
+            } else {
+                info!(
+                    table = table_name,
+                    rows = chunk_rows,
+                    arrow_bytes,
+                    "batch extracted"
+                );
+            }
+            if chunk_rows < batch_size { break; }
+        }
+
+        Ok(total_rows)
+    }
 }
 
 fn format_timestamp_now() -> String {
@@ -857,6 +1074,8 @@ mod tests {
             s3_secret_access_key: "secret".to_string(),
             tables,
             target_memory_mb: 512,
+            merge_memory_mb: 512,
+            merge_spill_dir: None,
             s3_endpoint: None,
             s3_region: "us-east-1".to_string(),
             s3_prefix: "parket".to_string(),
@@ -865,6 +1084,8 @@ mod tests {
             table_modes: HashMap::new(),
             table_initial_hwm: HashMap::new(),
             table_timestamp_col: HashMap::new(),
+            table_insert_cursor: HashMap::new(),
+            table_update_cursor: HashMap::new(),
         }
     }
 
@@ -1480,6 +1701,8 @@ mod tests {
             s3_secret_access_key: "secret".to_string(),
             tables,
             target_memory_mb: 512,
+            merge_memory_mb: 512,
+            merge_spill_dir: None,
             s3_endpoint: None,
             s3_region: "us-east-1".to_string(),
             s3_prefix: "parket".to_string(),
@@ -1488,6 +1711,8 @@ mod tests {
             table_modes: HashMap::new(),
             table_initial_hwm: HashMap::new(),
             table_timestamp_col: HashMap::new(),
+            table_insert_cursor: HashMap::new(),
+            table_update_cursor: HashMap::new(),
         }
     }
 
@@ -2616,6 +2841,322 @@ mod tests {
             .expect_extract()
             .withf(|sql| sql.contains("completed_at"))
             .returning(|_| Ok(vec![]));
+        state_mock
+            .expect_update_table()
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success));
+    }
+
+    #[tokio::test]
+    async fn two_stream_insert_stream_merges_new_rows_then_stops() {
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_insert_cursor.insert("orders".to_string(), "id".to_string());
+        config.table_update_cursor.insert("orders".to_string(), "updated_at".to_string());
+
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        schema_mock
+            .expect_max_timestamp()
+            .returning(|_, _| Ok(None));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        extract_mock
+            .expect_batch_size()
+            .returning(|| 10000);
+        writer_mock
+            .expect_ensure_table()
+            .returning(|_, _| Ok(()));
+        writer_mock
+            .expect_get_schema()
+            .returning(|_| Ok(None));
+        writer_mock
+            .expect_read_insert_hwm()
+            .returning(|_| Ok(None));
+        writer_mock
+            .expect_read_hwm()
+            .returning(|_| Ok(None));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        extract_mock
+            .expect_extract()
+            .returning(move |_| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    // First call: insert stream returns one batch
+                    let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                        deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+                        deltalake::arrow::datatypes::Field::new("name", deltalake::arrow::datatypes::DataType::Utf8, false),
+                        deltalake::arrow::datatypes::Field::new(
+                            "updated_at",
+                            deltalake::arrow::datatypes::DataType::Timestamp(deltalake::arrow::datatypes::TimeUnit::Microsecond, None),
+                            false,
+                        ),
+                    ]));
+                    let batch = RecordBatch::try_new(
+                        schema,
+                        vec![
+                            Arc::new(deltalake::arrow::array::Int64Array::from(vec![1i64, 2i64])),
+                            Arc::new(deltalake::arrow::array::StringArray::from(vec!["a", "b"])),
+                            Arc::new(deltalake::arrow::array::TimestampMicrosecondArray::from(vec![1743158400000000i64, 1743158400000000i64])),
+                        ],
+                    )
+                    .unwrap();
+                    Ok(vec![batch])
+                } else {
+                    // All subsequent calls return empty (both streams finish)
+                    Ok(vec![])
+                }
+            });
+
+        writer_mock
+            .expect_append_two_stream()
+            .returning(|_, _, _, _| Ok(()));
+        state_mock
+            .expect_update_table()
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success));
+    }
+
+    #[tokio::test]
+    async fn two_stream_only_insert_cursor_fails() {
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_insert_cursor.insert("orders".to_string(), "id".to_string());
+
+        let mut schema_mock = MockSchemaInspect::new();
+        let extract_mock = MockExtract::new();
+        let writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| Ok(make_columns()));
+        state_mock
+            .expect_update_table()
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Fatal));
+    }
+
+    #[tokio::test]
+    async fn two_stream_only_update_cursor_fails() {
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_update_cursor.insert("orders".to_string(), "updated_at".to_string());
+
+        let mut schema_mock = MockSchemaInspect::new();
+        let extract_mock = MockExtract::new();
+        let writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| Ok(make_columns()));
+        state_mock
+            .expect_update_table()
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Fatal));
+    }
+
+    #[tokio::test]
+    async fn two_stream_update_stream_merges_completions() {
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_insert_cursor.insert("orders".to_string(), "id".to_string());
+        config.table_update_cursor.insert("orders".to_string(), "updated_at".to_string());
+
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        schema_mock
+            .expect_max_timestamp()
+            .returning(|_, _| Ok(None));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        extract_mock
+            .expect_batch_size()
+            .returning(|| 10000);
+        writer_mock
+            .expect_ensure_table()
+            .returning(|_, _| Ok(()));
+        writer_mock
+            .expect_get_schema()
+            .returning(|_| Ok(None));
+        writer_mock
+            .expect_read_insert_hwm()
+            .returning(|_| Ok(Some(100)));
+        writer_mock
+            .expect_read_hwm()
+            .returning(|_| Ok(Some(Hwm {
+                updated_at: "2026-06-01T00:00:00.000000".to_string(),
+                last_id: 50,
+            })));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        extract_mock
+            .expect_extract()
+            .returning(move |_| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    // Insert stream returns empty immediately
+                    Ok(vec![])
+                } else if count == 1 {
+                    // Update stream returns a batch
+                    let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                        deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+                        deltalake::arrow::datatypes::Field::new("name", deltalake::arrow::datatypes::DataType::Utf8, false),
+                        deltalake::arrow::datatypes::Field::new(
+                            "updated_at",
+                            deltalake::arrow::datatypes::DataType::Timestamp(deltalake::arrow::datatypes::TimeUnit::Microsecond, None),
+                            false,
+                        ),
+                    ]));
+                    let batch = RecordBatch::try_new(
+                        schema,
+                        vec![
+                            Arc::new(deltalake::arrow::array::Int64Array::from(vec![50i64, 51i64])),
+                            Arc::new(deltalake::arrow::array::StringArray::from(vec!["x", "y"])),
+                            Arc::new(deltalake::arrow::array::TimestampMicrosecondArray::from(vec![1743158400000000i64, 1743158401000000i64])),
+                        ],
+                    )
+                    .unwrap();
+                    Ok(vec![batch])
+                } else {
+                    Ok(vec![])
+                }
+            });
+
+        writer_mock
+            .expect_append_two_stream()
+            .times(0)
+            .returning(|_, _, _, _| Ok(()));
+        writer_mock
+            .expect_merge_batch()
+            .returning(|_, _, _, _, _| Ok(()));
+        state_mock
+            .expect_update_table()
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success));
+    }
+
+    #[tokio::test]
+    async fn two_stream_seeds_update_hwm_when_none_stored() {
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_insert_cursor.insert("orders".to_string(), "id".to_string());
+        config.table_update_cursor.insert("orders".to_string(), "updated_at".to_string());
+
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        schema_mock
+            .expect_max_timestamp()
+            .returning(|_, _| Ok(Some("2026-06-01T00:00:00.000000".to_string())));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        extract_mock
+            .expect_batch_size()
+            .returning(|| 10000);
+        writer_mock
+            .expect_ensure_table()
+            .returning(|_, _| Ok(()));
+        writer_mock
+            .expect_get_schema()
+            .returning(|_| Ok(None));
+        writer_mock
+            .expect_read_insert_hwm()
+            .returning(|_| Ok(None));
+        writer_mock
+            .expect_read_hwm()
+            .returning(|_| Ok(None));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        extract_mock
+            .expect_extract()
+            .returning(move |sql| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                // Verify seed reached the update stream query
+                if count == 0 {
+                    // Insert stream returns empty (insert loop ends immediately)
+                    Ok(vec![])
+                } else if count == 1 {
+                    // Update stream: verify seed is in the SQL query
+                    assert!(sql.contains("2026-06-01T00:00:00.000000"), "seed should be in update stream SQL");
+                    Ok(vec![])
+                } else {
+                    Ok(vec![])
+                }
+            });
+
+        writer_mock
+            .expect_append_two_stream()
+            .times(0)
+            .returning(|_, _, _, _| Ok(()));
+        writer_mock
+            .expect_merge_batch()
+            .times(0)
+            .returning(|_, _, _, _, _| Ok(()));
         state_mock
             .expect_update_table()
             .returning(|_, _, _| Ok(()));

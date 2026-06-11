@@ -4,6 +4,10 @@ use anyhow::{Context, Result};
 use deltalake::arrow::array::{Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt32Array, UInt64Array};
 use deltalake::arrow::datatypes::{DataType, Schema as ArrowSchema, SchemaRef, TimeUnit};
 use deltalake::arrow::record_batch::RecordBatch;
+use deltalake::datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+use deltalake::datafusion::execution::memory_pool::FairSpillPool;
+use deltalake::datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use deltalake::datafusion::prelude::{SessionConfig, SessionContext};
 use deltalake::kernel::StructType;
 use deltalake::protocol::SaveMode;
 use deltalake::DeltaTable;
@@ -21,6 +25,10 @@ pub struct DeltaWriter {
     prefix: String,
     storage_options: HashMap<String, String>,
     use_local_fs: bool,
+    /// Memory budget (MB) for the MERGE datafusion session's bounded FairSpillPool.
+    merge_memory_mb: u64,
+    /// Optional spill dir for the MERGE external sort; None = system temp.
+    merge_spill_dir: Option<std::path::PathBuf>,
 }
 
 impl DeltaWriter {
@@ -47,6 +55,8 @@ impl DeltaWriter {
             prefix: prefix.to_string(),
             storage_options,
             use_local_fs: false,
+            merge_memory_mb: 512,
+            merge_spill_dir: None,
         }
     }
 
@@ -56,7 +66,16 @@ impl DeltaWriter {
             prefix: base_dir.to_string(),
             storage_options: HashMap::new(),
             use_local_fs: true,
+            merge_memory_mb: 512,
+            merge_spill_dir: None,
         }
+    }
+
+    /// Override the MERGE memory budget + spill dir (called by the writer adapters from config).
+    pub fn with_merge_limits(mut self, merge_memory_mb: u64, merge_spill_dir: Option<std::path::PathBuf>) -> Self {
+        self.merge_memory_mb = merge_memory_mb;
+        self.merge_spill_dir = merge_spill_dir;
+        self
     }
 
     fn table_url(&self, table_name: &str) -> Result<Url> {
@@ -192,6 +211,121 @@ impl DeltaWriter {
         Ok(())
     }
 
+    /// Upsert `batches` into the table, matching on `key_col`: existing keys updated
+    /// (non-key columns only), new keys inserted. Both stream watermarks ride the commit.
+    /// The table must already exist (caller runs ensure_table first).
+    ///
+    /// Deduplicates the source by `key_col` before merging to prevent MERGE cardinality
+    /// violations when the source contains duplicate keys.
+    pub async fn merge_batch(
+        &self,
+        table_name: &str,
+        batches: Vec<RecordBatch>,
+        key_col: &str,
+        insert_id: Option<i64>,
+        update_hwm: Option<&Hwm>,
+    ) -> Result<()> {
+        if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
+            return Ok(());
+        }
+        let url = self.table_url(table_name)?;
+        let mut table = deltalake::DeltaTableBuilder::from_url(url)?
+            .with_storage_options(self.storage_options.clone())
+            .build()?;
+        table.load().await?;
+
+        let schema = batches[0].schema();
+        let merged = deltalake::arrow::compute::concat_batches(&schema, &batches)?;
+        let total_rows = merged.num_rows();
+
+        let pool_bytes = (self.merge_memory_mb as usize) * 1024 * 1024;
+        // Route the external sort's spill to the configured dir (MERGE_SPILL_DIR); else system temp.
+        let disk_builder = match &self.merge_spill_dir {
+            Some(dir) => DiskManagerBuilder::default()
+                .with_mode(DiskManagerMode::Directories(vec![dir.clone()])),
+            None => DiskManagerBuilder::default(),
+        };
+        let runtime = std::sync::Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(std::sync::Arc::new(FairSpillPool::new(pool_bytes)))
+                .with_disk_manager_builder(disk_builder)
+                .build()?,
+        );
+        let mut session_config = SessionConfig::new();
+        // Force a spillable SortMergeJoin — datafusion 53's HashJoin does NOT spill, so under a
+        // bounded pool it would error instead of spilling.
+        session_config.options_mut().optimizer.prefer_hash_join = false;
+        // Optional tuning: override datafusion's `sort_spill_reservation_bytes` (default 10 MB),
+        // the memory reserved for the external sort's merge phase. On "Not enough memory to
+        // continue external sort", a SMALLER value shrinks the merge's reservation request and
+        // can let a bounded pool finish (datafusion's own hint). Read from env (advanced knob).
+        if let Ok(raw) = std::env::var("MERGE_SORT_RESERVATION_MB")
+            && let Ok(mb) = raw.trim().parse::<usize>()
+        {
+            session_config.options_mut().execution.sort_spill_reservation_bytes = mb * 1024 * 1024;
+            info!(
+                table = table_name,
+                merge_sort_reservation_mb = mb,
+                "merge: sort_spill_reservation_bytes overridden"
+            );
+        }
+        // Pin the external sort to a single partition by default. datafusion runs one external
+        // sorter per partition (default = CPU count), and they ALL share this one FairSpillPool,
+        // so fan-out fragments the pool and the merge phase starves even with a large pool
+        // ("Failed to allocate … for ExternalSorterMerge[N]"). One partition = one sorter owns the
+        // whole pool → fewer runs, the merge fits. Override via MERGE_TARGET_PARTITIONS (>0).
+        let merge_partitions = std::env::var("MERGE_TARGET_PARTITIONS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1);
+        session_config.options_mut().execution.target_partitions = merge_partitions;
+        let ctx = SessionContext::new_with_config_rt(session_config, runtime);
+        info!(
+            table = table_name,
+            merge_memory_mb = self.merge_memory_mb,
+            merge_target_partitions = merge_partitions,
+            "merge: bounded datafusion session (spills to disk)"
+        );
+
+        ctx.register_batch("merge_source_raw", merged)?;
+
+        let col_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+        let col_list = col_names.join(", ");
+        let dedup_sql = format!(
+            "SELECT {col_list} FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY {key_col} ORDER BY {key_col}) AS __rn FROM merge_source_raw) WHERE __rn = 1"
+        );
+        let source = ctx.sql(&dedup_sql).await?;
+
+        use deltalake::datafusion::prelude::col;
+        let predicate = col(format!("target.{key_col}")).eq(col(format!("source.{key_col}")));
+        let commit_properties = build_two_stream_commit_properties(insert_id, update_hwm);
+
+        table
+            .merge(source, predicate)
+            .with_source_alias("source")
+            .with_target_alias("target")
+            .with_commit_properties(commit_properties)
+            .with_session_state(std::sync::Arc::new(ctx.state()))
+            .when_matched_update(|mut update| {
+                for name in &col_names {
+                    if name == key_col { continue; }
+                    update = update.update(name.clone(), col(format!("source.{name}")));
+                }
+                update
+            })?
+            .when_not_matched_insert(|mut insert| {
+                for name in &col_names {
+                    insert = insert.set(name.clone(), col(format!("source.{name}")));
+                }
+                insert
+            })?
+            .await?;
+
+        info!(table = table_name, rows = total_rows, "merge committed");
+        Ok(())
+    }
+
     pub async fn read_hwm(&self, table_name: &str) -> Result<Option<Hwm>> {
         let table = match self.open_table(table_name).await {
             Ok(t) => t,
@@ -236,6 +370,55 @@ impl DeltaWriter {
             }
         }
     }
+
+    /// Append new rows (insert stream of two-stream mode) carrying BOTH watermarks on
+    /// the commit. Insert-stream rows are strictly new ids, so append (not merge) is
+    /// correct and cheap.
+    pub async fn append_two_stream(
+        &self,
+        table_name: &str,
+        batches: Vec<RecordBatch>,
+        insert_id: Option<i64>,
+        update_hwm: Option<&Hwm>,
+    ) -> Result<()> {
+        if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
+            return Ok(());
+        }
+        let url = self.table_url(table_name)?;
+        let mut table = deltalake::DeltaTableBuilder::from_url(url)?
+            .with_storage_options(self.storage_options.clone())
+            .build()?;
+        table.load().await?;
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let commit_properties = build_two_stream_commit_properties(insert_id, update_hwm);
+
+        table
+            .write(batches)
+            .with_save_mode(SaveMode::Append)
+            .with_commit_properties(commit_properties)
+            .await?;
+
+        info!(table = table_name, rows = total_rows, "two-stream insert appended");
+        Ok(())
+    }
+
+    pub async fn read_insert_hwm(&self, table_name: &str) -> Result<Option<i64>> {
+        let table = match self.open_table(table_name).await {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+        let mut history = table.history(Some(1)).await?.collect::<Vec<_>>();
+        let commit_info = match history.pop() {
+            Some(ci) => ci,
+            None => return Ok(None),
+        };
+        match commit_info.info.get("hwm_insert_id") {
+            Some(serde_json::Value::String(s)) =>
+                Ok(Some(s.parse().context("invalid hwm_insert_id in commitInfo")?)),
+            _ => Ok(None),
+        }
+    }
 }
 
 fn build_commit_properties(hwm: Option<&Hwm>) -> deltalake::kernel::transaction::CommitProperties {
@@ -253,6 +436,21 @@ fn build_commit_properties(hwm: Option<&Hwm>) -> deltalake::kernel::transaction:
     deltalake::kernel::transaction::CommitProperties::default().with_metadata(metadata)
 }
 
+fn build_two_stream_commit_properties(
+    insert_id: Option<i64>,
+    update: Option<&Hwm>,
+) -> deltalake::kernel::transaction::CommitProperties {
+    let mut metadata = HashMap::new();
+    if let Some(id) = insert_id {
+        metadata.insert("hwm_insert_id".to_string(), serde_json::Value::String(id.to_string()));
+    }
+    if let Some(h) = update {
+        metadata.insert("hwm_updated_at".to_string(), serde_json::Value::String(h.updated_at.clone()));
+        metadata.insert("hwm_last_id".to_string(), serde_json::Value::String(h.last_id.to_string()));
+    }
+    deltalake::kernel::transaction::CommitProperties::default().with_metadata(metadata)
+}
+
 pub fn extract_hwm_from_batch(batch: &RecordBatch, timestamp_col: &str) -> Option<Hwm> {
     let timestamp_col_data = batch.column_by_name(timestamp_col)?;
     let id_col = batch.column_by_name("id")?;
@@ -265,22 +463,38 @@ pub fn extract_hwm_from_batch(batch: &RecordBatch, timestamp_col: &str) -> Optio
     let timestamp_strings = extract_timestamp_as_strings(timestamp_col_data)?;
     let ids = extract_id_as_i64(id_col)?;
 
-    let mut max_ts: &str = &timestamp_strings[0];
-    let mut max_id = ids[0];
+    // Build candidate list filtering out empty (NULL) timestamps
+    let candidates: Vec<(usize, &str, i64)> = timestamp_strings
+        .iter()
+        .enumerate()
+        .filter(|(_, ts)| !ts.is_empty())
+        .map(|(i, ts)| (i, ts.as_str(), ids[i]))
+        .collect();
 
-    for (i, ts) in timestamp_strings.iter().enumerate().skip(1) {
-        if ts.as_str() > max_ts
-            || (ts.as_str() == max_ts && ids[i] > max_id)
-        {
-            max_ts = ts.as_str();
-            max_id = ids[i];
-        }
+    if candidates.is_empty() {
+        return None;
     }
+
+    // Find max by (ts, id)
+    let (_, max_ts, max_id) = candidates.iter().max_by(|a, b| {
+        match a.1.cmp(b.1) {
+            std::cmp::Ordering::Equal => a.2.cmp(&b.2),
+            other => other,
+        }
+    })?;
 
     Some(Hwm {
         updated_at: max_ts.to_string(),
-        last_id: max_id,
+        last_id: *max_id,
     })
+}
+
+/// Max integer key in a batch — the insert-stream watermark. `key_col` is the
+/// monotonic PK (e.g. `id`). None for an empty batch or unreadable column.
+pub fn extract_max_id(batch: &RecordBatch, key_col: &str) -> Option<i64> {
+    let col = batch.column_by_name(key_col)?;
+    let ids = extract_id_as_i64(col)?;
+    ids.into_iter().max()
 }
 
 fn extract_timestamp_as_strings(col: &std::sync::Arc<dyn Array>) -> Option<Vec<String>> {
@@ -1276,6 +1490,41 @@ mod tests {
     }
 
     #[test]
+    fn extract_hwm_mixed_null_and_real_timestamps() {
+        // Mixed NULL and real timestamps — should skip NULLs and find max non-NULL
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("updated_at", DataType::Utf8, true),
+        ]));
+        let id_arr = Int64Array::from(vec![1i64, 2i64, 3i64, 4i64]);
+        let ts_arr = StringArray::from(vec![
+            None,
+            Some("2026-03-28 09:00:00"),
+            Some("2026-03-28 11:00:00"),
+            None,
+        ]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(ts_arr)]).unwrap();
+
+        let hwm = extract_hwm_from_batch(&batch, "updated_at").unwrap();
+        assert_eq!(hwm.last_id, 3);
+        assert_eq!(hwm.updated_at, "2026-03-28 11:00:00");
+    }
+
+    #[test]
+    fn extract_hwm_all_null_timestamps_returns_none() {
+        // All timestamps are NULL — should return None
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("updated_at", DataType::Utf8, true),
+        ]));
+        let id_arr = Int64Array::from(vec![1i64, 2i64, 3i64]);
+        let ts_arr = StringArray::from(vec![None as Option<&str>, None, None]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(ts_arr)]).unwrap();
+
+        assert!(extract_hwm_from_batch(&batch, "updated_at").is_none());
+    }
+
+    #[test]
     fn format_naive_datetime_trailing_zeros() {
         let result = format_naive_datetime(0, 123_456_000);
         assert_eq!(result, "1970-01-01 00:00:00.123456");
@@ -1638,5 +1887,561 @@ mod tests {
 
         let hwm = writer.read_hwm("nonexistent").await.unwrap();
         assert!(hwm.is_none());
+    }
+
+    #[test]
+    fn extract_max_id_int64_basic() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let id_arr = Int64Array::from(vec![3i64, 1i64, 2i64]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr)]).unwrap();
+        let max_id = extract_max_id(&batch, "id");
+        assert_eq!(max_id, Some(3));
+    }
+
+    #[test]
+    fn extract_max_id_int32_column() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let id_arr = Int32Array::from(vec![3i32, 1i32, 2i32]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr)]).unwrap();
+        let max_id = extract_max_id(&batch, "id");
+        assert_eq!(max_id, Some(3));
+    }
+
+    #[test]
+    fn extract_max_id_empty_batch() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let id_arr = Int64Array::from(Vec::<i64>::new());
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr)]).unwrap();
+        let max_id = extract_max_id(&batch, "id");
+        assert!(max_id.is_none());
+    }
+
+    #[test]
+    fn extract_max_id_custom_key_column_name() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("pk", DataType::Int64, false),
+        ]));
+        let id_arr = Int64Array::from(vec![10i64, 5i64, 15i64]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr)]).unwrap();
+        let max_id = extract_max_id(&batch, "pk");
+        assert_eq!(max_id, Some(15));
+    }
+
+    #[test]
+    fn extract_max_id_missing_column() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let id_arr = Int64Array::from(vec![3i64, 1i64, 2i64]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr)]).unwrap();
+        let max_id = extract_max_id(&batch, "nonexistent");
+        assert!(max_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_insert_hwm_nonexistent_table() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let insert_hwm = writer.read_insert_hwm("nonexistent").await.unwrap();
+        assert!(insert_hwm.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_insert_hwm_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+        ]));
+
+        writer
+            .ensure_table("test_table", schema.clone())
+            .await
+            .unwrap();
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![1i64, 2i64]))],
+        )
+        .unwrap();
+
+        let update_hwm = Hwm {
+            updated_at: "2026-03-28 10:00:00".to_string(),
+            last_id: 5,
+        };
+
+        let table = writer.open_table("test_table").await.unwrap();
+        table.write(vec![batch])
+            .with_save_mode(SaveMode::Append)
+            .with_commit_properties(build_two_stream_commit_properties(Some(42), Some(&update_hwm)))
+            .await
+            .unwrap();
+
+        let insert_hwm = writer.read_insert_hwm("test_table").await.unwrap();
+        assert_eq!(insert_hwm, Some(42));
+    }
+
+    #[tokio::test]
+    async fn merge_batch_upsert_workflow() {
+        use deltalake::arrow::array::StringViewArray;
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+
+        writer
+            .ensure_table("t", schema.clone())
+            .await
+            .unwrap();
+
+        // First merge: insert (1,"a") and (2,"b")
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2i64])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+
+        writer
+            .merge_batch("t", vec![batch1], "id", Some(2), None)
+            .await
+            .unwrap();
+
+        // Second merge: update (1,"A") and insert (3,"c")
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 3i64])),
+                Arc::new(StringArray::from(vec!["A", "c"])),
+            ],
+        )
+        .unwrap();
+
+        writer
+            .merge_batch("t", vec![batch2], "id", Some(3), None)
+            .await
+            .unwrap();
+
+        // Read back and verify final state
+        let t = writer.open_table("t").await.unwrap();
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        let provider = t.table_provider().await.unwrap();
+        ctx.register_table("t", provider).unwrap();
+        let batches = ctx
+            .sql("SELECT id, value FROM t ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 3);
+
+        let id_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let value_col = batch.column(1);
+
+        // Check id values
+        assert_eq!(id_col.value(0), 1i64);
+        assert_eq!(id_col.value(1), 2i64);
+        assert_eq!(id_col.value(2), 3i64);
+
+        // Check string values (may be StringArray or StringViewArray)
+        let value_0 = if let Some(str_arr) = value_col.as_any().downcast_ref::<StringArray>() {
+            str_arr.value(0).to_string()
+        } else if let Some(str_view_arr) = value_col.as_any().downcast_ref::<StringViewArray>() {
+            str_view_arr.value(0).to_string()
+        } else {
+            panic!("Unexpected value column type");
+        };
+
+        let value_1 = if let Some(str_arr) = value_col.as_any().downcast_ref::<StringArray>() {
+            str_arr.value(1).to_string()
+        } else if let Some(str_view_arr) = value_col.as_any().downcast_ref::<StringViewArray>() {
+            str_view_arr.value(1).to_string()
+        } else {
+            panic!("Unexpected value column type");
+        };
+
+        let value_2 = if let Some(str_arr) = value_col.as_any().downcast_ref::<StringArray>() {
+            str_arr.value(2).to_string()
+        } else if let Some(str_view_arr) = value_col.as_any().downcast_ref::<StringViewArray>() {
+            str_view_arr.value(2).to_string()
+        } else {
+            panic!("Unexpected value column type");
+        };
+
+        assert_eq!(value_0, "A");
+        assert_eq!(value_1, "b");
+        assert_eq!(value_2, "c");
+
+        // Check insert hwm
+        let insert_hwm = writer.read_insert_hwm("t").await.unwrap();
+        assert_eq!(insert_hwm, Some(3));
+    }
+
+    #[tokio::test]
+    async fn merge_batch_bounded_pool_preserves_correctness() {
+        use deltalake::arrow::array::StringViewArray;
+        let temp = tempfile::tempdir().unwrap();
+        let spill = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap())
+            .with_merge_limits(32, Some(spill.path().to_path_buf()));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+
+        writer
+            .ensure_table("t", schema.clone())
+            .await
+            .unwrap();
+
+        // First merge: insert (1,"a") and (2,"b")
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2i64])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+
+        writer
+            .merge_batch("t", vec![batch1], "id", Some(2), None)
+            .await
+            .unwrap();
+
+        // Second merge: update (1,"A") and insert (3,"c")
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 3i64])),
+                Arc::new(StringArray::from(vec!["A", "c"])),
+            ],
+        )
+        .unwrap();
+
+        writer
+            .merge_batch("t", vec![batch2], "id", Some(3), None)
+            .await
+            .unwrap();
+
+        // Read back and verify final state
+        let t = writer.open_table("t").await.unwrap();
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        let provider = t.table_provider().await.unwrap();
+        ctx.register_table("t", provider).unwrap();
+        let batches = ctx
+            .sql("SELECT id, value FROM t ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 3);
+
+        let id_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let value_col = batch.column(1);
+
+        // Check id values
+        assert_eq!(id_col.value(0), 1i64);
+        assert_eq!(id_col.value(1), 2i64);
+        assert_eq!(id_col.value(2), 3i64);
+
+        // Check string values (may be StringArray or StringViewArray)
+        let value_0 = if let Some(str_arr) = value_col.as_any().downcast_ref::<StringArray>() {
+            str_arr.value(0).to_string()
+        } else if let Some(str_view_arr) = value_col.as_any().downcast_ref::<StringViewArray>() {
+            str_view_arr.value(0).to_string()
+        } else {
+            panic!("Unexpected value column type");
+        };
+
+        let value_1 = if let Some(str_arr) = value_col.as_any().downcast_ref::<StringArray>() {
+            str_arr.value(1).to_string()
+        } else if let Some(str_view_arr) = value_col.as_any().downcast_ref::<StringViewArray>() {
+            str_view_arr.value(1).to_string()
+        } else {
+            panic!("Unexpected value column type");
+        };
+
+        let value_2 = if let Some(str_arr) = value_col.as_any().downcast_ref::<StringArray>() {
+            str_arr.value(2).to_string()
+        } else if let Some(str_view_arr) = value_col.as_any().downcast_ref::<StringViewArray>() {
+            str_view_arr.value(2).to_string()
+        } else {
+            panic!("Unexpected value column type");
+        };
+
+        assert_eq!(value_0, "A");
+        assert_eq!(value_1, "b");
+        assert_eq!(value_2, "c");
+
+        // Check insert hwm
+        let insert_hwm = writer.read_insert_hwm("t").await.unwrap();
+        assert_eq!(insert_hwm, Some(3));
+    }
+
+    #[tokio::test]
+    async fn merge_batch_empty_batches_noop() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+
+        writer
+            .ensure_table("t", schema.clone())
+            .await
+            .unwrap();
+
+        // Merge with empty batch vector — should be no-op
+        writer
+            .merge_batch("t", vec![], "id", Some(1), None)
+            .await
+            .unwrap();
+
+        let t = writer.open_table("t").await.unwrap();
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        let provider = t.table_provider().await.unwrap();
+        ctx.register_table("t", provider).unwrap();
+        let batches = ctx
+            .sql("SELECT COUNT(*) as cnt FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let cnt_col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<deltalake::arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(cnt_col.value(0), 0i64);
+    }
+
+    #[tokio::test]
+    async fn merge_batch_dedup_duplicate_keys() {
+        // Test that merge_batch deduplicates source keys, fixing cardinality violations.
+        // Step F10.3a: Ensure MERGE never hits "matched a target row with multiple source rows".
+        use deltalake::arrow::array::StringViewArray;
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+
+        writer
+            .ensure_table("t", schema.clone())
+            .await
+            .unwrap();
+
+        // First merge: insert id=1 with value="a"
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64])),
+                Arc::new(StringArray::from(vec!["a"])),
+            ],
+        )
+        .unwrap();
+
+        writer
+            .merge_batch("t", vec![batch1], "id", Some(1), None)
+            .await
+            .unwrap();
+
+        // Second merge: source contains DUPLICATE keys: id=1 twice (values "X" and "Y") and id=2 once (value "b")
+        // Before fix: MERGE would fail with "matched a target row with multiple source rows"
+        // After fix (dedup): MERGE succeeds, keeping one row per key
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 1i64, 2i64])),
+                Arc::new(StringArray::from(vec!["X", "Y", "b"])),
+            ],
+        )
+        .unwrap();
+
+        writer
+            .merge_batch("t", vec![batch2], "id", Some(2), None)
+            .await
+            .unwrap();
+
+        // Read back and verify
+        let t = writer.open_table("t").await.unwrap();
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        let provider = t.table_provider().await.unwrap();
+        ctx.register_table("t", provider).unwrap();
+        let batches = ctx
+            .sql("SELECT id, value FROM t ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2, "Should have 2 rows: id=1 and id=2");
+
+        let id_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let value_col = batch.column(1);
+
+        // Verify ids
+        assert_eq!(id_col.value(0), 1i64);
+        assert_eq!(id_col.value(1), 2i64);
+
+        // Verify id=1 has been updated (dedup keeps one row deterministically)
+        // and id=2 has been inserted
+        let value_0 = if let Some(str_arr) = value_col.as_any().downcast_ref::<StringArray>() {
+            str_arr.value(0).to_string()
+        } else if let Some(str_view_arr) = value_col.as_any().downcast_ref::<StringViewArray>() {
+            str_view_arr.value(0).to_string()
+        } else {
+            panic!("Unexpected value column type");
+        };
+
+        let value_1 = if let Some(str_arr) = value_col.as_any().downcast_ref::<StringArray>() {
+            str_arr.value(1).to_string()
+        } else if let Some(str_view_arr) = value_col.as_any().downcast_ref::<StringViewArray>() {
+            str_view_arr.value(1).to_string()
+        } else {
+            panic!("Unexpected value column type");
+        };
+
+        // id=1 should have one of the deduped values (dedup keeps first by row order)
+        assert!(value_0 == "X" || value_0 == "Y", "id=1 value should be X or Y, got {}", value_0);
+        assert_eq!(value_1, "b", "id=2 should have value 'b'");
+    }
+
+    #[tokio::test]
+    async fn append_two_stream_inserts_rows_with_both_watermarks() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+
+        writer
+            .ensure_table("t", schema.clone())
+            .await
+            .unwrap();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2i64])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+
+        writer
+            .append_two_stream("t", vec![batch], Some(2), None)
+            .await
+            .unwrap();
+
+        // Verify insert_id is recorded
+        let insert_hwm = writer.read_insert_hwm("t").await.unwrap();
+        assert_eq!(insert_hwm, Some(2));
+
+        // Verify rows are in the table
+        let t = writer.open_table("t").await.unwrap();
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        let provider = t.table_provider().await.unwrap();
+        ctx.register_table("t", provider).unwrap();
+        let batches = ctx
+            .sql("SELECT id FROM t ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2);
+
+        let id_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(id_col.value(0), 1i64);
+        assert_eq!(id_col.value(1), 2i64);
+    }
+
+    #[tokio::test]
+    async fn append_two_stream_empty_batches_noop() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+
+        writer
+            .ensure_table("t", schema.clone())
+            .await
+            .unwrap();
+
+        // Append with empty batch vector — should be no-op
+        writer
+            .append_two_stream("t", vec![], Some(1), None)
+            .await
+            .unwrap();
+
+        let t = writer.open_table("t").await.unwrap();
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        let provider = t.table_provider().await.unwrap();
+        ctx.register_table("t", provider).unwrap();
+        let batches = ctx
+            .sql("SELECT COUNT(*) as cnt FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let cnt_col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<deltalake::arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(cnt_col.value(0), 0i64);
     }
 }

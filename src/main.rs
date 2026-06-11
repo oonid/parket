@@ -26,6 +26,40 @@ fn init_tracing() {
         .init();
 }
 
+/// Raise the soft NOFILE (open file descriptor) limit to the hard limit.
+///
+/// The two-stream MERGE bounds memory by spilling its external sort to disk, which opens
+/// many spill files at once. The default soft limit (often 1024, e.g. under a systemd
+/// scope) is too low and the merge fails with "Too many open files". Best-effort: logs and
+/// continues if it cannot raise (e.g. insufficient privilege).
+#[cfg(unix)]
+fn raise_nofile_limit() {
+    // SAFETY: get/setrlimit with a valid resource id and a properly-initialized rlimit.
+    unsafe {
+        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            tracing::warn!("could not read NOFILE limit; leaving as-is");
+            return;
+        }
+        if lim.rlim_cur < lim.rlim_max {
+            let old = lim.rlim_cur;
+            lim.rlim_cur = lim.rlim_max;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) == 0 {
+                tracing::info!(from = old, to = lim.rlim_cur, "raised NOFILE soft limit");
+            } else {
+                tracing::warn!(
+                    soft = old,
+                    hard = lim.rlim_max,
+                    "failed to raise NOFILE soft limit; MERGE spill may hit 'too many open files'"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_nofile_limit() {}
+
 fn extract_database_name(url: &str) -> String {
     url::Url::parse(url)
         .ok()
@@ -63,6 +97,10 @@ async fn main() {
     let cli = Cli::parse();
 
     init_tracing();
+
+    // Lift the soft FD limit to the hard limit so the two-stream MERGE's disk-spill
+    // (many open files) doesn't fail under a low default (e.g. systemd's 1024).
+    raise_nofile_limit();
 
     // Handle --inspect early (before full config load)
     if let Some(ref table) = cli.inspect {
@@ -171,7 +209,7 @@ async fn main() {
     let state_path = PathBuf::from("state.json");
 
     if let Some(ref dir) = local_dir {
-        let writer = LocalDeltaWriterAdapter::new(dir);
+        let writer = LocalDeltaWriterAdapter::new(dir, &config);
         let mut orchestrator = Orchestrator::new(
             config,
             schema_inspect,
@@ -360,6 +398,8 @@ mod tests {
             s3_secret_access_key: "secret".to_string(),
             tables: vec!["orders".to_string(), "products".to_string()],
             target_memory_mb: 512,
+            merge_memory_mb: 512,
+            merge_spill_dir: None,
             s3_endpoint: None,
             s3_region: "us-east-1".to_string(),
             s3_prefix: "parket".to_string(),
@@ -368,6 +408,8 @@ mod tests {
             table_modes: std::collections::HashMap::new(),
             table_initial_hwm: std::collections::HashMap::new(),
             table_timestamp_col: std::collections::HashMap::new(),
+            table_insert_cursor: std::collections::HashMap::new(),
+            table_update_cursor: std::collections::HashMap::new(),
         };
 
         log_startup_banner(&config, None);
@@ -388,6 +430,8 @@ mod tests {
             s3_secret_access_key: String::new(),
             tables: vec!["orders".to_string()],
             target_memory_mb: 256,
+            merge_memory_mb: 256,
+            merge_spill_dir: None,
             s3_endpoint: None,
             s3_region: "us-east-1".to_string(),
             s3_prefix: "parket".to_string(),
@@ -396,9 +440,27 @@ mod tests {
             table_modes: std::collections::HashMap::new(),
             table_initial_hwm: std::collections::HashMap::new(),
             table_timestamp_col: std::collections::HashMap::new(),
+            table_insert_cursor: std::collections::HashMap::new(),
+            table_update_cursor: std::collections::HashMap::new(),
         };
 
         log_startup_banner(&config, Some(std::path::Path::new("/tmp/delta")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raise_nofile_limit_does_not_lower_soft_limit() {
+        // SAFETY: getrlimit with a valid resource and rlimit pointer.
+        unsafe {
+            let mut before = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut before), 0);
+            raise_nofile_limit();
+            let mut after = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut after), 0);
+            // Best-effort: it must never decrease the soft limit, and should reach the hard cap.
+            assert!(after.rlim_cur >= before.rlim_cur, "soft NOFILE must not decrease");
+            assert_eq!(after.rlim_cur, after.rlim_max, "soft should be raised to hard");
+        }
     }
 
     #[test]
