@@ -49,16 +49,18 @@ Validates without extracting any data:
 - prints a per-table mode-detection summary with current High Watermark:
 
 ```
-TABLE                          MODE            COLUMNS    AVG_ROW_LEN      KEY              HWM
-orders                         incremental     5          128              id, updated_at   2026-01-01T00:00:00.000000 / 1000
-events                         full_refresh    3          N/A              no updated_at    —
-customers                      incremental     4          256              override         2026-01-15T12:30:45.500000 / 5000
+TABLE                          MODE            COLUMNS    AVG_ROW_LEN      KEY                        HWM
+orders                         incremental     5          128              id, updated_at             2026-01-01T00:00:00.000000 / 1000
+events                         two_stream      6          256              two-stream: id + completed_at
+customers                      incremental     4          256              override                   2026-01-15T12:30:45.500000 / 5000
+attempts                       full_refresh    3          N/A              no updated_at              —
 pre-flight check passed
 ```
 
 The `KEY` column shows which columns drive the extraction mode:
 - `override` if a mode override is set in config,
 - `id, updated_at` if incremental (both required),
+- `two-stream: <insert> + <update>` if two-stream mode is enabled (e.g., `two-stream: id + completed_at`),
 - reason if full-refresh: `no id`, `no updated_at`, or `no id/updated_at`.
 
 The `HWM` column shows the current stored High Watermark as `updated_at / last_id`,
