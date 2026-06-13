@@ -618,9 +618,10 @@ async fn crash_recovery_hwm_advances_and_only_new_rows_appended() {
 /// - bootstrap seeds the update watermark so run 1 merges nothing redundant;
 /// - run 2 captures: a mutated existing row, a NULL->set transition, new inserts, and
 ///   crucially does NOT duplicate a row caught by BOTH streams.
-#[tokio::test]
-#[serial_test::serial]
-async fn two_stream_inserts_and_merges_mutations_across_runs() {
+async fn run_two_stream_upsert_scenario(update_strategy: Option<&str>) {
+    if let Some(s) = update_strategy {
+        unsafe { std::env::set_var("UPDATE_STRATEGY", s); }
+    }
     let _guard = tracing_subscriber::fmt()
         .with_env_filter("parket=debug")
         .with_test_writer()
@@ -738,6 +739,24 @@ async fn two_stream_inserts_and_merges_mutations_across_runs() {
         Some(5),
         "run 2: insert HWM should advance to 5"
     );
+
+    if update_strategy.is_some() {
+        unsafe { std::env::remove_var("UPDATE_STRATEGY"); }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn two_stream_inserts_and_delete_append_updates_across_runs() {
+    // default strategy = delete_then_append
+    run_two_stream_upsert_scenario(None).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn two_stream_inserts_and_merges_mutations_across_runs() {
+    // opt-out: the legacy MERGE path
+    run_two_stream_upsert_scenario(Some("merge")).await;
 }
 
 #[tokio::test]

@@ -419,6 +419,109 @@ impl DeltaWriter {
             _ => Ok(None),
         }
     }
+
+    /// Upsert via DELETE-by-key + APPEND (bounded-memory alternative to `merge_batch`).
+    /// Deletes every target row whose `key_col` is in the incoming batch, then appends the
+    /// batch (the new versions). The DELETE is a streaming scan+filter+rewrite (no join/sort),
+    /// so memory stays bounded regardless of target size. The APPEND carries the commit
+    /// properties (watermarks), so the HWM advances only after the append commits.
+    ///
+    /// Deduplicates the source by `key_col` before deleting/appending to prevent issues
+    /// when the source contains duplicate keys (keeps one row per key).
+    pub async fn delete_then_append(
+        &self,
+        table_name: &str,
+        batches: Vec<RecordBatch>,
+        key_col: &str,
+        insert_id: Option<i64>,
+        update_hwm: Option<&Hwm>,
+    ) -> Result<()> {
+        use std::collections::HashSet;
+        use deltalake::datafusion::prelude::{cast, col, lit};
+
+        if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
+            return Ok(());
+        }
+        let url = self.table_url(table_name)?;
+        let mut table = deltalake::DeltaTableBuilder::from_url(url)?
+            .with_storage_options(self.storage_options.clone())
+            .build()?;
+        table.load().await?;
+
+        // Dedup the incoming batches by key_col (same pattern as merge_batch).
+        let schema = batches[0].schema();
+        let merged = deltalake::arrow::compute::concat_batches(&schema, &batches)?;
+        let ctx = SessionContext::new();
+        ctx.register_batch("delete_source_raw", merged)?;
+
+        let col_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+        let col_list = col_names.join(", ");
+        let dedup_sql = format!(
+            "SELECT {col_list} FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY {key_col} ORDER BY {key_col}) AS __rn FROM delete_source_raw) WHERE __rn = 1"
+        );
+        let deduped_source = ctx.sql(&dedup_sql).await?;
+        let deduped_batches = deduped_source.collect().await?;
+
+        // Collect the distinct i64 keys present in the deduplicated batches.
+        // Handle Int64Array, Int32Array, UInt64Array, UInt32Array.
+        let mut ids: HashSet<i64> = HashSet::new();
+        for b in &deduped_batches {
+            let idx = b.schema().index_of(key_col)?;
+            let c = b.column(idx);
+            if let Some(a) = c.as_any().downcast_ref::<Int64Array>() {
+                for i in 0..a.len() {
+                    if !a.is_null(i) {
+                        ids.insert(a.value(i));
+                    }
+                }
+            } else if let Some(a) = c.as_any().downcast_ref::<Int32Array>() {
+                for i in 0..a.len() {
+                    if !a.is_null(i) {
+                        ids.insert(a.value(i) as i64);
+                    }
+                }
+            } else if let Some(a) = c.as_any().downcast_ref::<UInt64Array>() {
+                for i in 0..a.len() {
+                    if !a.is_null(i) {
+                        ids.insert(a.value(i) as i64);
+                    }
+                }
+            } else if let Some(a) = c.as_any().downcast_ref::<UInt32Array>() {
+                for i in 0..a.len() {
+                    if !a.is_null(i) {
+                        ids.insert(a.value(i) as i64);
+                    }
+                }
+            } else {
+                return Err(anyhow::anyhow!(
+                    "delete_then_append: key column `{key_col}` has unsupported type {:?} (expected an integer)",
+                    c.data_type()
+                ));
+            }
+        }
+
+        // 1) DELETE the existing rows for those keys (streaming scan+filter+rewrite).
+        let table = if ids.is_empty() {
+            table
+        } else {
+            let list: Vec<_> = ids.iter().map(|id| lit(*id)).collect();
+            let predicate = cast(col(key_col), DataType::Int64).in_list(list, false);
+            let (t, _metrics) = table.delete().with_predicate(predicate).await?;
+            info!(table = table_name, keys = ids.len(), "delete_then_append: deleted existing rows for incoming keys");
+            t
+        };
+
+        // 2) APPEND the deduplicated versions; the watermarks ride on this commit.
+        let total_rows: usize = deduped_batches.iter().map(|b| b.num_rows()).sum();
+        let commit_properties = build_two_stream_commit_properties(insert_id, update_hwm);
+        table
+            .write(deduped_batches)
+            .with_save_mode(SaveMode::Append)
+            .with_commit_properties(commit_properties)
+            .await?;
+        info!(table = table_name, rows = total_rows, "delete_then_append: appended new versions");
+        Ok(())
+    }
 }
 
 fn build_commit_properties(hwm: Option<&Hwm>) -> deltalake::kernel::transaction::CommitProperties {
@@ -2423,6 +2526,581 @@ mod tests {
             .append_two_stream("t", vec![], Some(1), None)
             .await
             .unwrap();
+
+        let t = writer.open_table("t").await.unwrap();
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        let provider = t.table_provider().await.unwrap();
+        ctx.register_table("t", provider).unwrap();
+        let batches = ctx
+            .sql("SELECT COUNT(*) as cnt FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let cnt_col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<deltalake::arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(cnt_col.value(0), 0i64);
+    }
+
+    #[tokio::test]
+    async fn delete_then_append_upsert_workflow() {
+        use deltalake::arrow::array::StringViewArray;
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+
+        writer
+            .ensure_table("t", schema.clone())
+            .await
+            .unwrap();
+
+        // First append: insert (1,"a") and (2,"b")
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2i64])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+
+        writer
+            .append_two_stream("t", vec![batch1], Some(2), None)
+            .await
+            .unwrap();
+
+        // Second operation: delete-then-append with (1,"A") and (3,"c")
+        // This deletes id=1 and appends id=1 with new value and id=3 as new row
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 3i64])),
+                Arc::new(StringArray::from(vec!["A", "c"])),
+            ],
+        )
+        .unwrap();
+
+        writer
+            .delete_then_append("t", vec![batch2], "id", Some(3), None)
+            .await
+            .unwrap();
+
+        // Read back and verify final state
+        let t = writer.open_table("t").await.unwrap();
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        let provider = t.table_provider().await.unwrap();
+        ctx.register_table("t", provider).unwrap();
+        let batches = ctx
+            .sql("SELECT id, value FROM t ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 3);
+
+        let id_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let value_col = batch.column(1);
+
+        // Check id values
+        assert_eq!(id_col.value(0), 1i64);
+        assert_eq!(id_col.value(1), 2i64);
+        assert_eq!(id_col.value(2), 3i64);
+
+        // Check string values (may be StringArray or StringViewArray)
+        let value_0 = if let Some(str_arr) = value_col.as_any().downcast_ref::<StringArray>() {
+            str_arr.value(0).to_string()
+        } else if let Some(str_view_arr) = value_col.as_any().downcast_ref::<StringViewArray>() {
+            str_view_arr.value(0).to_string()
+        } else {
+            panic!("Unexpected value column type");
+        };
+
+        let value_1 = if let Some(str_arr) = value_col.as_any().downcast_ref::<StringArray>() {
+            str_arr.value(1).to_string()
+        } else if let Some(str_view_arr) = value_col.as_any().downcast_ref::<StringViewArray>() {
+            str_view_arr.value(1).to_string()
+        } else {
+            panic!("Unexpected value column type");
+        };
+
+        let value_2 = if let Some(str_arr) = value_col.as_any().downcast_ref::<StringArray>() {
+            str_arr.value(2).to_string()
+        } else if let Some(str_view_arr) = value_col.as_any().downcast_ref::<StringViewArray>() {
+            str_view_arr.value(2).to_string()
+        } else {
+            panic!("Unexpected value column type");
+        };
+
+        assert_eq!(value_0, "A");
+        assert_eq!(value_1, "b");
+        assert_eq!(value_2, "c");
+
+        // Check insert hwm
+        let insert_hwm = writer.read_insert_hwm("t").await.unwrap();
+        assert_eq!(insert_hwm, Some(3));
+    }
+
+    #[tokio::test]
+    async fn delete_then_append_upsert_uint64_key() {
+        use deltalake::arrow::array::StringViewArray;
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+
+        writer
+            .ensure_table("t", schema.clone())
+            .await
+            .unwrap();
+
+        // First append: insert (1,"a") and (2,"b")
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![1u64, 2u64])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+
+        writer
+            .append_two_stream("t", vec![batch1], Some(2), None)
+            .await
+            .unwrap();
+
+        // Second operation: delete-then-append with (1,"A") and (3,"c")
+        // This deletes id=1 and appends id=1 with new value and id=3 as new row
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![1u64, 3u64])),
+                Arc::new(StringArray::from(vec!["A", "c"])),
+            ],
+        )
+        .unwrap();
+
+        writer
+            .delete_then_append("t", vec![batch2], "id", Some(3), None)
+            .await
+            .unwrap();
+
+        // Read back and verify final state
+        let t = writer.open_table("t").await.unwrap();
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        let provider = t.table_provider().await.unwrap();
+        ctx.register_table("t", provider).unwrap();
+        let batches = ctx
+            .sql("SELECT id, value FROM t ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 3);
+
+        let id_col_raw = batch.column(0);
+        let value_col = batch.column(1);
+
+        // Check id values - handle both UInt64Array and Int64Array conversions
+        let (id_0, id_1, id_2) = if let Some(arr) = id_col_raw.as_any().downcast_ref::<UInt64Array>() {
+            (arr.value(0), arr.value(1), arr.value(2))
+        } else if let Some(arr) = id_col_raw.as_any().downcast_ref::<Int64Array>() {
+            (arr.value(0) as u64, arr.value(1) as u64, arr.value(2) as u64)
+        } else {
+            panic!("Unexpected id column type");
+        };
+        assert_eq!(id_0, 1u64);
+        assert_eq!(id_1, 2u64);
+        assert_eq!(id_2, 3u64);
+
+        // Check string values (may be StringArray or StringViewArray)
+        let value_0 = if let Some(str_arr) = value_col.as_any().downcast_ref::<StringArray>() {
+            str_arr.value(0).to_string()
+        } else if let Some(str_view_arr) = value_col.as_any().downcast_ref::<StringViewArray>() {
+            str_view_arr.value(0).to_string()
+        } else {
+            panic!("Unexpected value column type");
+        };
+
+        let value_1 = if let Some(str_arr) = value_col.as_any().downcast_ref::<StringArray>() {
+            str_arr.value(1).to_string()
+        } else if let Some(str_view_arr) = value_col.as_any().downcast_ref::<StringViewArray>() {
+            str_view_arr.value(1).to_string()
+        } else {
+            panic!("Unexpected value column type");
+        };
+
+        let value_2 = if let Some(str_arr) = value_col.as_any().downcast_ref::<StringArray>() {
+            str_arr.value(2).to_string()
+        } else if let Some(str_view_arr) = value_col.as_any().downcast_ref::<StringViewArray>() {
+            str_view_arr.value(2).to_string()
+        } else {
+            panic!("Unexpected value column type");
+        };
+
+        assert_eq!(value_0, "A");
+        assert_eq!(value_1, "b");
+        assert_eq!(value_2, "c");
+
+        // Check insert hwm
+        let insert_hwm = writer.read_insert_hwm("t").await.unwrap();
+        assert_eq!(insert_hwm, Some(3));
+    }
+
+    #[tokio::test]
+    async fn delete_then_append_dedups_duplicate_keys() {
+        use deltalake::arrow::array::StringViewArray;
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+
+        writer
+            .ensure_table("t", schema.clone())
+            .await
+            .unwrap();
+
+        // Batch with DUPLICATE keys: id=1 appears twice (values "x" and "y"), id=2 once (value "b")
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 1i64, 2i64])),
+                Arc::new(StringArray::from(vec!["x", "y", "b"])),
+            ],
+        )
+        .unwrap();
+
+        // delete_then_append should dedup and keep only one row per key
+        writer
+            .delete_then_append("t", vec![batch], "id", Some(2), None)
+            .await
+            .unwrap();
+
+        // Read back and verify
+        let t = writer.open_table("t").await.unwrap();
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        let provider = t.table_provider().await.unwrap();
+        ctx.register_table("t", provider).unwrap();
+        let batches = ctx
+            .sql("SELECT id, value FROM t ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        // After dedup: exactly 2 rows (id=1 once, id=2 once)
+        assert_eq!(batch.num_rows(), 2, "Should have exactly 2 rows after dedup");
+
+        let id_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let value_col = batch.column(1);
+
+        // Check ids
+        assert_eq!(id_col.value(0), 1i64);
+        assert_eq!(id_col.value(1), 2i64);
+
+        // Check that id=1 has one of the deduped values (either "x" or "y")
+        let value_0 = if let Some(str_arr) = value_col.as_any().downcast_ref::<StringArray>() {
+            str_arr.value(0).to_string()
+        } else if let Some(str_view_arr) = value_col.as_any().downcast_ref::<StringViewArray>() {
+            str_view_arr.value(0).to_string()
+        } else {
+            panic!("Unexpected value column type");
+        };
+
+        let value_1 = if let Some(str_arr) = value_col.as_any().downcast_ref::<StringArray>() {
+            str_arr.value(1).to_string()
+        } else if let Some(str_view_arr) = value_col.as_any().downcast_ref::<StringViewArray>() {
+            str_view_arr.value(1).to_string()
+        } else {
+            panic!("Unexpected value column type");
+        };
+
+        // id=1 should have one of the deduplicated values
+        assert!(
+            value_0 == "x" || value_0 == "y",
+            "id=1 value should be 'x' or 'y', got '{}'",
+            value_0
+        );
+        // id=2 should have value "b"
+        assert_eq!(value_1, "b", "id=2 should have value 'b'");
+    }
+
+    #[tokio::test]
+    async fn delete_then_append_upsert_int32_key() {
+        use deltalake::arrow::array::StringViewArray;
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+
+        writer
+            .ensure_table("t", schema.clone())
+            .await
+            .unwrap();
+
+        // First append: insert (1,"a") and (2,"b")
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1i32, 2i32])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+
+        writer
+            .append_two_stream("t", vec![batch1], Some(2), None)
+            .await
+            .unwrap();
+
+        // Second operation: delete-then-append with (1,"A") and (3,"c")
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1i32, 3i32])),
+                Arc::new(StringArray::from(vec!["A", "c"])),
+            ],
+        )
+        .unwrap();
+
+        writer
+            .delete_then_append("t", vec![batch2], "id", Some(3), None)
+            .await
+            .unwrap();
+
+        // Read back and verify final state
+        let t = writer.open_table("t").await.unwrap();
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        let provider = t.table_provider().await.unwrap();
+        ctx.register_table("t", provider).unwrap();
+        let batches = ctx
+            .sql("SELECT id, value FROM t ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 3);
+
+        let id_col_raw = batch.column(0);
+        let value_col = batch.column(1);
+
+        // Check id values - handle both Int32Array and Int64Array conversions
+        let (id_0, id_1, id_2) = if let Some(arr) = id_col_raw.as_any().downcast_ref::<Int32Array>() {
+            (arr.value(0) as i64, arr.value(1) as i64, arr.value(2) as i64)
+        } else if let Some(arr) = id_col_raw.as_any().downcast_ref::<Int64Array>() {
+            (arr.value(0), arr.value(1), arr.value(2))
+        } else {
+            panic!("Unexpected id column type");
+        };
+        assert_eq!(id_0, 1i64);
+        assert_eq!(id_1, 2i64);
+        assert_eq!(id_2, 3i64);
+
+        // Check string values (may be StringArray or StringViewArray)
+        let value_0 = if let Some(str_arr) = value_col.as_any().downcast_ref::<StringArray>() {
+            str_arr.value(0).to_string()
+        } else if let Some(str_view_arr) = value_col.as_any().downcast_ref::<StringViewArray>() {
+            str_view_arr.value(0).to_string()
+        } else {
+            panic!("Unexpected value column type");
+        };
+
+        let value_1 = if let Some(str_arr) = value_col.as_any().downcast_ref::<StringArray>() {
+            str_arr.value(1).to_string()
+        } else if let Some(str_view_arr) = value_col.as_any().downcast_ref::<StringViewArray>() {
+            str_view_arr.value(1).to_string()
+        } else {
+            panic!("Unexpected value column type");
+        };
+
+        let value_2 = if let Some(str_arr) = value_col.as_any().downcast_ref::<StringArray>() {
+            str_arr.value(2).to_string()
+        } else if let Some(str_view_arr) = value_col.as_any().downcast_ref::<StringViewArray>() {
+            str_view_arr.value(2).to_string()
+        } else {
+            panic!("Unexpected value column type");
+        };
+
+        assert_eq!(value_0, "A");
+        assert_eq!(value_1, "b");
+        assert_eq!(value_2, "c");
+
+        // Check insert hwm
+        let insert_hwm = writer.read_insert_hwm("t").await.unwrap();
+        assert_eq!(insert_hwm, Some(3));
+    }
+
+    #[tokio::test]
+    async fn delete_then_append_upsert_uint32_key() {
+        use deltalake::arrow::array::StringViewArray;
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+
+        writer
+            .ensure_table("t", schema.clone())
+            .await
+            .unwrap();
+
+        // First append: insert (1,"a") and (2,"b")
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![1u32, 2u32])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+
+        writer
+            .append_two_stream("t", vec![batch1], Some(2), None)
+            .await
+            .unwrap();
+
+        // Second operation: delete-then-append with (1,"A") and (3,"c")
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![1u32, 3u32])),
+                Arc::new(StringArray::from(vec!["A", "c"])),
+            ],
+        )
+        .unwrap();
+
+        writer
+            .delete_then_append("t", vec![batch2], "id", Some(3), None)
+            .await
+            .unwrap();
+
+        // Read back and verify final state
+        let t = writer.open_table("t").await.unwrap();
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        let provider = t.table_provider().await.unwrap();
+        ctx.register_table("t", provider).unwrap();
+        let batches = ctx
+            .sql("SELECT id, value FROM t ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 3);
+
+        let id_col_raw = batch.column(0);
+        let value_col = batch.column(1);
+
+        // Check id values - handle UInt32/UInt64/Int32/Int64 array conversions
+        let (id_0, id_1, id_2) = if let Some(arr) = id_col_raw.as_any().downcast_ref::<UInt32Array>() {
+            (arr.value(0) as u64, arr.value(1) as u64, arr.value(2) as u64)
+        } else if let Some(arr) = id_col_raw.as_any().downcast_ref::<UInt64Array>() {
+            (arr.value(0), arr.value(1), arr.value(2))
+        } else if let Some(arr) = id_col_raw.as_any().downcast_ref::<Int32Array>() {
+            (arr.value(0) as u64, arr.value(1) as u64, arr.value(2) as u64)
+        } else if let Some(arr) = id_col_raw.as_any().downcast_ref::<Int64Array>() {
+            (arr.value(0) as u64, arr.value(1) as u64, arr.value(2) as u64)
+        } else {
+            panic!("Unexpected id column type");
+        };
+        assert_eq!(id_0, 1u64);
+        assert_eq!(id_1, 2u64);
+        assert_eq!(id_2, 3u64);
+
+        // Check string values (may be StringArray or StringViewArray)
+        let value_0 = if let Some(str_arr) = value_col.as_any().downcast_ref::<StringArray>() {
+            str_arr.value(0).to_string()
+        } else if let Some(str_view_arr) = value_col.as_any().downcast_ref::<StringViewArray>() {
+            str_view_arr.value(0).to_string()
+        } else {
+            panic!("Unexpected value column type");
+        };
+
+        let value_1 = if let Some(str_arr) = value_col.as_any().downcast_ref::<StringArray>() {
+            str_arr.value(1).to_string()
+        } else if let Some(str_view_arr) = value_col.as_any().downcast_ref::<StringViewArray>() {
+            str_view_arr.value(1).to_string()
+        } else {
+            panic!("Unexpected value column type");
+        };
+
+        let value_2 = if let Some(str_arr) = value_col.as_any().downcast_ref::<StringArray>() {
+            str_arr.value(2).to_string()
+        } else if let Some(str_view_arr) = value_col.as_any().downcast_ref::<StringViewArray>() {
+            str_view_arr.value(2).to_string()
+        } else {
+            panic!("Unexpected value column type");
+        };
+
+        assert_eq!(value_0, "A");
+        assert_eq!(value_1, "b");
+        assert_eq!(value_2, "c");
+
+        // Check insert hwm
+        let insert_hwm = writer.read_insert_hwm("t").await.unwrap();
+        assert_eq!(insert_hwm, Some(3));
+    }
+
+    #[tokio::test]
+    async fn delete_then_append_empty_batch_noop() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+
+        writer
+            .ensure_table("t", schema.clone())
+            .await
+            .unwrap();
+
+        // delete_then_append with an empty batch vector — should be a no-op
+        let result = writer
+            .delete_then_append("t", vec![], "id", None, None)
+            .await;
+        assert!(result.is_ok());
 
         let t = writer.open_table("t").await.unwrap();
         let ctx = deltalake::datafusion::prelude::SessionContext::new();

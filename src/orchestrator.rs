@@ -57,6 +57,14 @@ pub trait DeltaWrite: Send + Sync {
         insert_id: Option<i64>,
         update_hwm: Option<Hwm>,
     ) -> Result<()>;
+    async fn delete_then_append(
+        &self,
+        table_name: &str,
+        batches: Vec<deltalake::arrow::record_batch::RecordBatch>,
+        key_col: String,
+        insert_id: Option<i64>,
+        update_hwm: Option<Hwm>,
+    ) -> Result<()>;
     async fn read_insert_hwm(&self, table_name: &str) -> Result<Option<i64>>;
     async fn append_two_stream(
         &self,
@@ -235,6 +243,19 @@ impl DeltaWrite for DeltaWriterAdapter {
             .await
     }
 
+    async fn delete_then_append(
+        &self,
+        table_name: &str,
+        batches: Vec<deltalake::arrow::record_batch::RecordBatch>,
+        key_col: String,
+        insert_id: Option<i64>,
+        update_hwm: Option<Hwm>,
+    ) -> Result<()> {
+        self.inner
+            .delete_then_append(table_name, batches, &key_col, insert_id, update_hwm.as_ref())
+            .await
+    }
+
     async fn read_insert_hwm(&self, table_name: &str) -> Result<Option<i64>> {
         self.inner.read_insert_hwm(table_name).await
     }
@@ -322,6 +343,19 @@ impl DeltaWrite for LocalDeltaWriterAdapter {
     ) -> Result<()> {
         self.inner
             .merge_batch(table_name, batches, &key_col, insert_id, update_hwm.as_ref())
+            .await
+    }
+
+    async fn delete_then_append(
+        &self,
+        table_name: &str,
+        batches: Vec<deltalake::arrow::record_batch::RecordBatch>,
+        key_col: String,
+        insert_id: Option<i64>,
+        update_hwm: Option<Hwm>,
+    ) -> Result<()> {
+        self.inner
+            .delete_then_append(table_name, batches, &key_col, insert_id, update_hwm.as_ref())
             .await
     }
 
@@ -921,7 +955,21 @@ where
             let new_hwm = batches.last().and_then(|b| extract_hwm_from_batch(b, update_col));
             if self.progress { info!(table = table_name, rows = chunk_rows, extract_ms, "two-stream update: extracted, merging"); }
             let t_write = Instant::now();
-            self.writer.merge_batch(table_name, batches, insert_col.to_string(), hwm_id, new_hwm.clone()).await?;
+            if std::env::var("UPDATE_STRATEGY").as_deref() == Ok("merge") {
+                if self.progress {
+                    info!(table = table_name, "two-stream update: strategy=merge (MERGE upsert, opt-out)");
+                }
+                self.writer
+                    .merge_batch(table_name, batches, insert_col.to_string(), hwm_id, new_hwm.clone())
+                    .await?;
+            } else {
+                if self.progress {
+                    info!(table = table_name, "two-stream update: strategy=delete_append (default, DELETE+APPEND)");
+                }
+                self.writer
+                    .delete_then_append(table_name, batches, insert_col.to_string(), hwm_id, new_hwm.clone())
+                    .await?;
+            }
             let write_ms = t_write.elapsed().as_millis();
             if let Some(h) = new_hwm { update_hwm = Some(h); }
             total_rows += chunk_rows;
@@ -1042,6 +1090,7 @@ impl SignalHandler {
 mod tests {
     use super::*;
     use deltalake::arrow::record_batch::RecordBatch;
+    use serial_test::serial;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
@@ -2851,6 +2900,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn two_stream_insert_stream_merges_new_rows_then_stops() {
         let dir = TempDir::new().unwrap();
         let mut config = make_config(vec!["orders".to_string()]);
@@ -2991,7 +3041,188 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_stream_update_stream_merges_completions() {
+    #[serial]
+    async fn two_stream_update_default_delete_append() {
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_insert_cursor.insert("orders".to_string(), "id".to_string());
+        config.table_update_cursor.insert("orders".to_string(), "updated_at".to_string());
+
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        schema_mock
+            .expect_max_timestamp()
+            .returning(|_, _| Ok(None));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        extract_mock
+            .expect_batch_size()
+            .returning(|| 10000);
+        writer_mock
+            .expect_ensure_table()
+            .returning(|_, _| Ok(()));
+        writer_mock
+            .expect_get_schema()
+            .returning(|_| Ok(None));
+        writer_mock
+            .expect_read_insert_hwm()
+            .returning(|_| Ok(Some(100)));
+        writer_mock
+            .expect_read_hwm()
+            .returning(|_| Ok(Some(Hwm {
+                updated_at: "2026-06-01T00:00:00.000000".to_string(),
+                last_id: 50,
+            })));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        extract_mock
+            .expect_extract()
+            .returning(move |_| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    // Insert stream returns empty immediately
+                    Ok(vec![])
+                } else if count == 1 {
+                    // Update stream returns a batch
+                    let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                        deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+                        deltalake::arrow::datatypes::Field::new("name", deltalake::arrow::datatypes::DataType::Utf8, false),
+                        deltalake::arrow::datatypes::Field::new(
+                            "updated_at",
+                            deltalake::arrow::datatypes::DataType::Timestamp(deltalake::arrow::datatypes::TimeUnit::Microsecond, None),
+                            false,
+                        ),
+                    ]));
+                    let batch = RecordBatch::try_new(
+                        schema,
+                        vec![
+                            Arc::new(deltalake::arrow::array::Int64Array::from(vec![50i64, 51i64])),
+                            Arc::new(deltalake::arrow::array::StringArray::from(vec!["x", "y"])),
+                            Arc::new(deltalake::arrow::array::TimestampMicrosecondArray::from(vec![1743158400000000i64, 1743158401000000i64])),
+                        ],
+                    )
+                    .unwrap();
+                    Ok(vec![batch])
+                } else {
+                    Ok(vec![])
+                }
+            });
+
+        writer_mock
+            .expect_append_two_stream()
+            .times(0)
+            .returning(|_, _, _, _| Ok(()));
+        writer_mock
+            .expect_delete_then_append()
+            .returning(|_, _, _, _, _| Ok(()));
+        state_mock
+            .expect_update_table()
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn two_stream_seeds_update_hwm_when_none_stored() {
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_insert_cursor.insert("orders".to_string(), "id".to_string());
+        config.table_update_cursor.insert("orders".to_string(), "updated_at".to_string());
+
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        schema_mock
+            .expect_max_timestamp()
+            .returning(|_, _| Ok(Some("2026-06-01T00:00:00.000000".to_string())));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        extract_mock
+            .expect_batch_size()
+            .returning(|| 10000);
+        writer_mock
+            .expect_ensure_table()
+            .returning(|_, _| Ok(()));
+        writer_mock
+            .expect_get_schema()
+            .returning(|_| Ok(None));
+        writer_mock
+            .expect_read_insert_hwm()
+            .returning(|_| Ok(None));
+        writer_mock
+            .expect_read_hwm()
+            .returning(|_| Ok(None));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        extract_mock
+            .expect_extract()
+            .returning(move |sql| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                // Verify seed reached the update stream query
+                if count == 0 {
+                    // Insert stream returns empty (insert loop ends immediately)
+                    Ok(vec![])
+                } else if count == 1 {
+                    // Update stream: verify seed is in the SQL query
+                    assert!(sql.contains("2026-06-01T00:00:00.000000"), "seed should be in update stream SQL");
+                    Ok(vec![])
+                } else {
+                    Ok(vec![])
+                }
+            });
+
+        writer_mock
+            .expect_append_two_stream()
+            .times(0)
+            .returning(|_, _, _, _| Ok(()));
+        writer_mock
+            .expect_merge_batch()
+            .times(0)
+            .returning(|_, _, _, _, _| Ok(()));
+        state_mock
+            .expect_update_table()
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn two_stream_update_merge_optout() {
+        unsafe { std::env::set_var("UPDATE_STRATEGY", "merge"); }
+
         let dir = TempDir::new().unwrap();
         let mut config = make_config(vec!["orders".to_string()]);
         config.table_insert_cursor.insert("orders".to_string(), "id".to_string());
@@ -3084,85 +3315,9 @@ mod tests {
 
         let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
         let result = orch.run().await;
-        assert!(matches!(result, ExitCode::Success));
-    }
 
-    #[tokio::test]
-    async fn two_stream_seeds_update_hwm_when_none_stored() {
-        let dir = TempDir::new().unwrap();
-        let mut config = make_config(vec!["orders".to_string()]);
-        config.table_insert_cursor.insert("orders".to_string(), "id".to_string());
-        config.table_update_cursor.insert("orders".to_string(), "updated_at".to_string());
+        unsafe { std::env::remove_var("UPDATE_STRATEGY"); }
 
-        let mut schema_mock = MockSchemaInspect::new();
-        let mut extract_mock = MockExtract::new();
-        let mut writer_mock = MockDeltaWrite::new();
-        let mut state_mock = MockStateManage::new();
-
-        state_mock
-            .expect_load_or_default()
-            .returning(|_| AppState::default());
-        schema_mock
-            .expect_discover_columns()
-            .returning(move |_| Ok(make_columns()));
-        schema_mock
-            .expect_get_avg_row_length()
-            .returning(|_| Ok(Some(100)));
-        schema_mock
-            .expect_max_timestamp()
-            .returning(|_, _| Ok(Some("2026-06-01T00:00:00.000000".to_string())));
-        extract_mock
-            .expect_calculate_batch_size()
-            .returning(|_| 10000);
-        extract_mock
-            .expect_batch_size()
-            .returning(|| 10000);
-        writer_mock
-            .expect_ensure_table()
-            .returning(|_, _| Ok(()));
-        writer_mock
-            .expect_get_schema()
-            .returning(|_| Ok(None));
-        writer_mock
-            .expect_read_insert_hwm()
-            .returning(|_| Ok(None));
-        writer_mock
-            .expect_read_hwm()
-            .returning(|_| Ok(None));
-
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let call_count_clone = call_count.clone();
-        extract_mock
-            .expect_extract()
-            .returning(move |sql| {
-                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
-                // Verify seed reached the update stream query
-                if count == 0 {
-                    // Insert stream returns empty (insert loop ends immediately)
-                    Ok(vec![])
-                } else if count == 1 {
-                    // Update stream: verify seed is in the SQL query
-                    assert!(sql.contains("2026-06-01T00:00:00.000000"), "seed should be in update stream SQL");
-                    Ok(vec![])
-                } else {
-                    Ok(vec![])
-                }
-            });
-
-        writer_mock
-            .expect_append_two_stream()
-            .times(0)
-            .returning(|_, _, _, _| Ok(()));
-        writer_mock
-            .expect_merge_batch()
-            .times(0)
-            .returning(|_, _, _, _, _| Ok(()));
-        state_mock
-            .expect_update_table()
-            .returning(|_, _, _| Ok(()));
-
-        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
-        let result = orch.run().await;
         assert!(matches!(result, ExitCode::Success));
     }
 }
