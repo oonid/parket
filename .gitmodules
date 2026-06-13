@@ -7,3 +7,6 @@
 [submodule "reference/connector-x"]
 	path = reference/connector-x
 	url = git@github.com:sfu-db/connector-x.git
+[submodule "reference/datafusion"]
+	path = reference/datafusion
+	url = git@github.com:apache/datafusion.git
