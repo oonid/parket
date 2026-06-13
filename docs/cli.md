@@ -229,4 +229,5 @@ signal forces immediate exit (`130`). See [signal-handling.md](signal-handling.m
 - [config.md](config.md) — environment variables, validation, VM sizing, memory-fit testing
 - [logging.md](logging.md) — log format and `RUST_LOG` levels
 - [orchestrator.md](orchestrator.md) — what happens per table during a run
-- [incremental-extraction-design.md](incremental-extraction-design.md) — HWM, cursor config, two-stream + MERGE-memory design
+- [two-stream-full-sync.md](two-stream-full-sync.md) — HWM, cursor config, `--inspect`, two-stream full-sync (insert-append)
+- [two-stream-continue-update.md](two-stream-continue-update.md) — continue-update write strategy (DELETE+APPEND default, MERGE opt-out + memory)

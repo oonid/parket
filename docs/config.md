@@ -22,10 +22,11 @@ All configuration is provided through environment variables. Parket uses `dotenv
 | `S3_PREFIX` | `parket` | Path prefix within the bucket. Each table lands at `s3://{S3_BUCKET}/{S3_PREFIX}/{table}/`. |
 | `DEFAULT_BATCH_SIZE` | `10000` | Fallback batch row count when `AVG_ROW_LENGTH` is unavailable. |
 | `RUST_LOG` | `info` | Log level filter (see [Logging](logging.md)). |
-| `MERGE_MEMORY_MB` | _(= `TARGET_MEMORY_MB`)_ | Memory budget (MB) for the two-stream MERGE's datafusion session. See [Bounding the two-stream MERGE memory](#bounding-the-two-stream-merge-memory). |
-| `MERGE_SPILL_DIR` | _(system temp)_ | Directory for the MERGE external-sort disk spill. Must be real disk, not tmpfs. |
-| `MERGE_SORT_RESERVATION_MB` | _(datafusion default: 10)_ | Advanced. Overrides the external sort's merge-phase memory reservation. **Lower** it (e.g. `1`–`2`) if a bounded merge fails with *"Not enough memory to continue external sort"*. |
-| `MERGE_TARGET_PARTITIONS` | `1` | Parallelism of the MERGE's external sort. Defaults to **1** so a single sorter owns the whole pool — parallel sorters share the one pool and fragment it, starving the merge even with a large pool. Raise only on machines with ample RAM headroom. |
+| `UPDATE_STRATEGY` | `delete_append` | Two-stream **continue-update** write op. Default = bounded **DELETE+APPEND** (fits a 4 GB VM); `=merge` selects the legacy **MERGE** (opt-out). See [two-stream-continue-update.md](two-stream-continue-update.md). |
+| `MERGE_MEMORY_MB` | _(= `TARGET_MEMORY_MB`)_ | **MERGE opt-out only** (`UPDATE_STRATEGY=merge`). Memory budget (MB) for the MERGE's datafusion session. See [Bounding the two-stream MERGE memory](#bounding-the-two-stream-merge-memory). |
+| `MERGE_SPILL_DIR` | _(system temp)_ | **MERGE opt-out only.** External-sort disk spill dir. Must be real disk, not tmpfs. |
+| `MERGE_SORT_RESERVATION_MB` | _(datafusion default: 10)_ | **MERGE opt-out only.** Advanced; overrides the external sort's merge-phase reservation. **Lower** it (e.g. `1`–`2`) on *"Not enough memory to continue external sort"*. |
+| `MERGE_TARGET_PARTITIONS` | `1` | **MERGE opt-out only.** Parallelism of the MERGE's external sort. Keep at **1** — parallel sorters share the one pool and starve the merge. |
 
 ## Per-Table Extraction Mode Overrides
 
@@ -181,6 +182,10 @@ watch -n2 'grep VmHWM /proc/$(pgrep -f target/release/parket)/status'
 `VmHWM` is the peak resident set size reached so far. Peak RSS ≈ one Arrow batch (bounded by `TARGET_MEMORY_MB`, up to the 2× hard ceiling) + delta-rs Parquet encode buffers + MySQL result buffering + allocator slack.
 
 ## Bounding the two-stream MERGE memory
+
+> **Applies only to the MERGE opt-out** (`UPDATE_STRATEGY=merge`). The **default** continue-update
+> write is **DELETE+APPEND**, bounded by construction (~2 GB, fits a 4 GB VM) and needing none of
+> the tuning below. Full rationale: [two-stream-continue-update.md](two-stream-continue-update.md).
 
 The two-stream **update** stream upserts via a Delta `MERGE`, which joins the (small) batch of
 changed rows against the **entire target table**. On a large target this dominates parket's
