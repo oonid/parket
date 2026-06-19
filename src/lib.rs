@@ -12,6 +12,7 @@
 //!
 //! No public API stability is implied — this is purely an internal structuring choice.
 
+pub mod calendar;
 pub mod cli;
 pub mod config;
 pub mod discovery;
