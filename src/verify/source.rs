@@ -1,0 +1,137 @@
+use anyhow::{Context, Result};
+use sqlx::Row;
+use std::collections::HashMap;
+
+use super::{ColumnMeta, KeyStats, SourceProbe};
+
+pub struct SourceProbeAdapter {
+    pool: sqlx::MySqlPool,
+}
+impl SourceProbeAdapter {
+    pub fn new(pool: sqlx::MySqlPool) -> Self {
+        Self { pool }
+    }
+}
+impl SourceProbe for SourceProbeAdapter {
+    async fn row_count(&self, table: &str) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM `{table}`"))
+            .fetch_one(&self.pool)
+            .await
+            .with_context(|| format!("source COUNT(*) for `{table}`"))?;
+        Ok(row.0)
+    }
+
+    async fn columns(&self, table: &str) -> Result<Vec<ColumnMeta>> {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM information_schema.columns \
+             WHERE table_schema = DATABASE() AND table_name = ? ORDER BY ORDINAL_POSITION",
+        )
+        .bind(table)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("source schema for `{table}`"))?;
+        Ok(rows
+            .into_iter()
+            .map(|(name, type_str, nullable)| ColumnMeta {
+                name,
+                type_str,
+                nullable: nullable == "YES",
+            })
+            .collect())
+    }
+
+    async fn key_stats(&self, table: &str, key_col: &str) -> Result<KeyStats> {
+        // MariaDB's BIT_XOR does not accept DISTINCT (syntax error). The source key
+        // column is the primary key (unique), so BIT_XOR over all rows already equals
+        // the fingerprint over distinct values — we reuse it for `distinct_xor`. The
+        // Delta side, which may carry append-log duplicates, computes a true
+        // bit_xor(distinct ...).
+        let row: (i64, i64, Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(&format!(
+            "SELECT COUNT(*), COUNT(DISTINCT `{key_col}`), \
+             CAST(MIN(`{key_col}`) AS SIGNED), CAST(MAX(`{key_col}`) AS SIGNED), \
+             CAST(BIT_XOR(`{key_col}`) AS SIGNED) FROM `{table}`"
+        ))
+        .fetch_one(&self.pool)
+        .await
+        .with_context(|| format!("source key_stats for `{table}`.`{key_col}`"))?;
+        let xor = row.4.unwrap_or(0);
+        Ok(KeyStats {
+            count: row.0,
+            distinct: row.1,
+            min: row.2,
+            max: row.3,
+            xor,
+            distinct_xor: xor,
+        })
+    }
+
+    async fn non_null_counts(&self, table: &str, columns: &[String]) -> Result<Vec<i64>> {
+        if columns.is_empty() {
+            return Ok(vec![]);
+        }
+        let select_list = columns
+            .iter()
+            .map(|c| format!("COUNT(`{c}`)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT {select_list} FROM `{table}`");
+        let row = sqlx::query(&sql)
+            .fetch_one(&self.pool)
+            .await
+            .with_context(|| format!("source non_null_counts for `{table}`"))?;
+        let mut out = Vec::with_capacity(columns.len());
+        for i in 0..columns.len() {
+            out.push(row.try_get::<i64, _>(i)?);
+        }
+        Ok(out)
+    }
+
+    async fn sample_ids(&self, table: &str, id_col: &str, limit: i64) -> Result<Vec<i64>> {
+        if limit <= 0 {
+            return Ok(vec![]);
+        }
+        let sql = format!(
+            "SELECT CAST(`{id_col}` AS SIGNED) FROM `{table}` ORDER BY `{id_col}` LIMIT {limit}"
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .with_context(|| format!("source sample_ids for `{table}`.`{id_col}`"))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(row.try_get::<i64, _>(0)?);
+        }
+        Ok(out)
+    }
+
+    async fn sample_rows(&self, table: &str, id_col: &str, columns: &[String], ids: &[i64]) -> Result<HashMap<i64, Vec<Option<String>>>> {
+        if columns.is_empty() || ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut select_parts = vec![format!("CAST(`{id_col}` AS SIGNED)")];
+        for c in columns {
+            select_parts.push(format!("CAST(`{c}` AS CHAR)"));
+        }
+        let select_list = select_parts.join(", ");
+        let ids_list = ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT {select_list} FROM `{table}` WHERE `{id_col}` IN ({ids_list})");
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .with_context(|| format!("source sample_rows for `{table}`.`{id_col}`"))?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let id = row.try_get::<i64, _>(0)?;
+            let mut vals = Vec::with_capacity(columns.len());
+            for i in 0..columns.len() {
+                vals.push(row.try_get::<Option<String>, _>(i + 1)?);
+            }
+            map.insert(id, vals);
+        }
+        Ok(map)
+    }
+}
