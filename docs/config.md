@@ -293,9 +293,14 @@ Error messages identify the specific missing or invalid variable.
 
 ## CLI Usage
 
-Command-line flags (`--check`, `--progress`, `--local`, `--version`, `--help`),
-the startup banner, and exit codes are documented in the dedicated
-[CLI Reference](cli.md).
+Command-line flags (`--check`, `--inspect`, `--verify`, `--progress`, `--local`,
+`--version`, `--help`), the startup banner, and exit codes are documented in the
+dedicated [CLI Reference](cli.md).
+
+Reconciliation (`--verify` / `--verify-after`) adds no environment variables: it
+reuses `DATABASE_URL`, `TABLES`, and the same S3 (or `--local`) target as a normal
+run. The 1,000,000-row strict-check cap is a built-in constant, overridden per-run
+with `--verify-deep` rather than via config.
 
 ## Example `.env`
 

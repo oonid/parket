@@ -12,6 +12,7 @@ use parket::preflight::{
     NoopPreflightStorage, PreflightCheck, PreflightHwmAdapter, PreflightInspectAdapter,
     PreflightStorageAdapter,
 };
+use parket::writer::DeltaWriter;
 
 fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -92,8 +93,75 @@ fn log_startup_banner(config: &config::Config, local_dir: Option<&std::path::Pat
     }
 }
 
-#[tokio::main]
-async fn main() {
+/// Run `--verify` reconciliation against the synced Delta tables.
+/// Returns a process exit code: 0 = clean, 1 = discrepancy, 2 = could not run.
+async fn run_verify(
+    config: &config::Config,
+    local_dir: Option<&std::path::Path>,
+    deep: bool,
+) -> i32 {
+    let pool = match sqlx::MySqlPool::connect(&config.database_url).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("database connection error: {e}");
+            return 2;
+        }
+    };
+    let source = parket::verify::SourceProbeAdapter::new(pool);
+    let writer = if let Some(dir) = local_dir {
+        DeltaWriter::new_local(&dir.to_string_lossy())
+    } else {
+        DeltaWriter::new(
+            &config.s3_bucket,
+            &config.s3_prefix,
+            config.s3_endpoint.as_deref(),
+            &config.s3_region,
+            &config.s3_access_key_id,
+            &config.s3_secret_access_key,
+        )
+    };
+    let delta = parket::verify::DeltaProbeAdapter::new(writer);
+    let cmd =
+        parket::verify::VerifyCommand::new(source, delta, config.tables.clone()).with_deep(deep);
+    match cmd.run().await {
+        Ok(parket::verify::VerifyVerdict::Clean) => 0,
+        Ok(parket::verify::VerifyVerdict::Discrepancy) => 1,
+        Err(e) => {
+            eprintln!("verify failed: {e:#}");
+            2
+        }
+    }
+}
+
+fn main() {
+    // DataFusion's logical/physical plan and expression traversal recurses deeply on
+    // large inputs (e.g. the two-stream DELETE predicate's big id `in_list`, or a
+    // full-table scan over a Delta table with many files during `--verify-deep`).
+    // The default 8 MiB main-thread / 2 MiB tokio-worker stacks can overflow, so run
+    // the whole program on threads with a generous stack.
+    // Stacks are virtual reservations, committed lazily as touched, so they do not
+    // count against a cgroup RSS cap until used. Be generous: the DELETE predicate's
+    // `OR`-normalized id list can drive plan-traversal depth into the hundreds of
+    // thousands on a large re-sync.
+    const DRIVER_STACK: usize = 512 * 1024 * 1024; // block_on driver thread (plan setup)
+    const WORKER_STACK: usize = 128 * 1024 * 1024; // tokio worker threads (execution)
+
+    let child = std::thread::Builder::new()
+        .name("parket-main".to_string())
+        .stack_size(DRIVER_STACK)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(WORKER_STACK)
+                .build()
+                .expect("build tokio runtime");
+            runtime.block_on(async_main());
+        })
+        .expect("spawn parket-main thread");
+    child.join().expect("join parket-main thread");
+}
+
+async fn async_main() {
     let cli = Cli::parse();
 
     init_tracing();
@@ -187,6 +255,11 @@ async fn main() {
         }
     }
 
+    if cli.verify {
+        let code = run_verify(&config, local_dir.as_deref(), cli.verify_deep).await;
+        std::process::exit(code);
+    }
+
     log_startup_banner(&config, local_dir.as_deref());
 
     let pool = match sqlx::MySqlPool::connect(&config.database_url).await {
@@ -208,7 +281,16 @@ async fn main() {
 
     let state_path = PathBuf::from("state.json");
 
-    if let Some(ref dir) = local_dir {
+    // Capture what --verify-after needs before `config` is moved into the orchestrator.
+    let verify_after_cfg = if cli.verify_after {
+        Some(config.clone())
+    } else {
+        None
+    };
+    let verify_after_dir = local_dir.clone();
+    let verify_deep = cli.verify_deep;
+
+    let sync_exit = if let Some(ref dir) = local_dir {
         let writer = LocalDeltaWriterAdapter::new(dir, &config);
         let mut orchestrator = Orchestrator::new(
             config,
@@ -220,8 +302,7 @@ async fn main() {
             state_path,
             cli.progress,
         );
-        let exit_code = orchestrator.run().await;
-        std::process::exit(exit_code as i32);
+        orchestrator.run().await as i32
     } else {
         let writer = DeltaWriterAdapter::new(&config);
         let mut orchestrator = Orchestrator::new(
@@ -234,9 +315,19 @@ async fn main() {
             state_path,
             cli.progress,
         );
-        let exit_code = orchestrator.run().await;
-        std::process::exit(exit_code as i32);
+        orchestrator.run().await as i32
+    };
+
+    // --verify-after: reconcile only when the sync itself succeeded.
+    if let Some(vcfg) = verify_after_cfg {
+        if sync_exit == 0 {
+            let code = run_verify(&vcfg, verify_after_dir.as_deref(), verify_deep).await;
+            std::process::exit(code);
+        }
+        eprintln!("verify-after skipped: sync exited with code {sync_exit}");
     }
+
+    std::process::exit(sync_exit);
 }
 
 #[cfg(test)]

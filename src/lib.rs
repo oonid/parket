@@ -21,4 +21,5 @@ pub mod orchestrator;
 pub mod preflight;
 pub mod query;
 pub mod state;
+pub mod verify;
 pub mod writer;

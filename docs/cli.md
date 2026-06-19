@@ -5,7 +5,7 @@ controlled by a small set of flags plus environment variables (see
 [config.md](config.md) for the env reference).
 
 ```
-parket [--check] [--inspect <TABLE>] [--progress] [--local <dir>] [--version] [--help]
+parket [--check] [--inspect <TABLE>] [--verify] [--verify-deep] [--verify-after] [--progress] [--local <dir>] [--version] [--help]
 ```
 
 All flags are defined in `src/cli.rs`.
@@ -17,6 +17,9 @@ All flags are defined in `src/cli.rs`.
 | _(none)_ | — | — | Run the extract-and-load pipeline |
 | `--check` | — | off | Validate config + connectivity and print a per-table summary; extract nothing |
 | `--inspect <TABLE>` | table name (required) | unset | Evaluate a single table's columns, indexes, and cursor suitability, then exit |
+| `--verify` | — | off | Reconcile each synced Delta table against the source DB (schema, counts, key-set, null census, sampled values), then exit |
+| `--verify-deep` | — | off | With `--verify`/`--verify-after`, run strict checks even on tables above the 1M-row cap |
+| `--verify-after` | — | off | After a successful sync, run the same reconciliation; a discrepancy makes the process exit non-zero |
 | `--progress` | — | off | Emit detailed per-batch / per-chunk progress logs |
 | `--local <dir>` | path (required) | unset | Write Delta tables to a local directory instead of S3 |
 | `--version` | — | — | Print the version from `Cargo.toml` and exit |
@@ -147,6 +150,65 @@ The recommendation suggests the best candidate and warns if a configured cursor
 Exits `0` on success (even if no safe cursor is found — that is information, not
 an error). Exits `2` on database connection failure or table-not-found.
 
+## `--verify` (reconciliation)
+
+```bash
+parket --verify                 # reconcile S3 tables against the source, then exit
+parket --local ./out --verify   # reconcile local tables
+parket --verify --verify-deep   # also reconcile tables larger than the 1M-row cap
+```
+
+Re-reads each table in `TABLES` from both the source DB and the synced Delta
+output and reports whether they agree. It writes nothing — it is a read-only
+audit you can run after a sync. The check runs in layers, cheapest first:
+
+| Layer | What it compares | Verdict effect |
+|-------|------------------|----------------|
+| Schema | Column names present on both sides | A column missing from Delta → **discrepancy** |
+| Count + key-set | Row count and an `id` fingerprint (count, distinct, min, max, XOR over the PK) | See drift handling below |
+| Null census | `COUNT(non-null)` per common column | Report-only |
+| Sampled values | Up to 100 rows compared cell-by-cell, in-process | Report-only |
+
+**Drift handling.** The source is live and keeps changing after a sync, so a raw
+count/key-set difference does not necessarily mean the sync is wrong. parket
+classifies the key-set comparison:
+
+- **Exact match** (or match after de-duplicating Delta's append-log by distinct
+  `id`) → **pass**.
+- Delta's `id` range sits *inside* the source's and Delta is no larger → **drift**
+  (the source advanced with new rows since the sync) → reported, **not** a failure.
+- Delta has `id`s or rows the source does not → **discrepancy** → failure.
+
+The null-census and sampled-value layers run only on tables that passed the
+key-set check (identical `id` set, so differences are not just new rows). They
+are **report-only**: a difference is printed for a human to judge but does not by
+itself fail the run, because on a live table it can be a legitimate post-sync
+update.
+
+**Size guard.** Tables above 1,000,000 rows are skipped (reported as `SKIPPED`)
+unless `--verify-deep` is passed, so a routine verify stays fast.
+
+**PII safety.** The sampled-value layer fetches cell values only to compare them
+in memory; output is limited to row `id`s and differing **column names** — never
+the values themselves.
+
+Per-table verdicts and a final summary (`pass`/`drift`/`discrepancy`/`skipped`
+counts) are printed. Exit codes: `0` clean (all pass/drift/skipped), `1` at least
+one discrepancy, `2` could not run (DB/Delta error).
+
+### `--verify-after`
+
+```bash
+parket --verify-after                 # sync, then reconcile
+parket --verify-after --verify-deep   # sync, then reconcile without the size cap
+```
+
+Runs a normal sync and, **only if the sync itself succeeded** (exit `0`), runs the
+reconciliation above against the just-synced tables. Because the drift window is
+near-zero immediately after a sync, a reported discrepancy is more meaningful. The
+final exit code becomes the verify exit code (`0`/`1`/`2`); if the sync failed
+(`1`/`2`), verify is skipped and the sync's exit code stands.
+
 ## `--progress` (detailed progress logging)
 
 ```bash
@@ -217,6 +279,10 @@ Sensitive values (database password, S3 secret key) are masked via
 The code is decided after all tables are attempted: `failed == 0` → 0;
 `succeeded > 0 && failed > 0` → 1; `succeeded == 0 && failed > 0` → 2. A single
 failing table is logged and skipped; the run continues to the next table.
+
+For `--verify` (and `--verify-after`) the same codes carry a reconciliation
+meaning: `0` clean, `1` a discrepancy was found, `2` the check could not run. With
+`--verify-after`, a failed sync (`1`/`2`) skips verify and keeps the sync's code.
 
 ## Signals
 

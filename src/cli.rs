@@ -33,6 +33,24 @@ pub struct Cli {
         help = "Evaluate a single table's columns, indexes, and cursor suitability, then exit (needs only DATABASE_URL)"
     )]
     pub inspect: Option<String>,
+
+    #[arg(
+        long,
+        help = "Reconcile each synced Delta table against the source DB (row counts), then exit"
+    )]
+    pub verify: bool,
+
+    #[arg(
+        long,
+        help = "With --verify, run strict checks even on tables larger than the row cap"
+    )]
+    pub verify_deep: bool,
+
+    #[arg(
+        long,
+        help = "After a successful sync, reconcile the synced tables against the source DB; a discrepancy makes the process exit non-zero"
+    )]
+    pub verify_after: bool,
 }
 
 #[cfg(test)]
