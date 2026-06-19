@@ -460,7 +460,7 @@ mod tests {
     #[test]
     fn env_filter_parses_rust_log_env() {
         use tracing_subscriber::EnvFilter;
-        let filter = EnvFilter::try_from("parket=debug").unwrap();
+        let filter = EnvFilter::from("parket=debug");
         assert!(filter.max_level_hint().is_some());
     }
 

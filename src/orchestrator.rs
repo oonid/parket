@@ -338,8 +338,8 @@ mod tests {
     use super::*;
     use super::test_support::*;
     use deltalake::arrow::record_batch::RecordBatch;
-    use serial_test::serial;
-    use std::collections::HashMap;
+    
+    
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 

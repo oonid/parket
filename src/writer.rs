@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use deltalake::arrow::datatypes::SchemaRef;
 #[cfg(test)]
-use deltalake::arrow::array::{Int32Array, Int64Array, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampSecondArray, UInt32Array, UInt64Array};
+use deltalake::arrow::array::{Int64Array, StringArray};
 #[cfg(test)]
-use deltalake::arrow::datatypes::{DataType, Schema as ArrowSchema, TimeUnit};
+use deltalake::arrow::datatypes::{DataType, Schema as ArrowSchema};
 use deltalake::arrow::record_batch::RecordBatch;
 use deltalake::DeltaTable;
 use deltalake::protocol::SaveMode;
@@ -271,8 +271,8 @@ impl DeltaWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::datetime::*;
-    use super::hwm::build_two_stream_commit_properties;
+    
+    
     use deltalake::arrow::datatypes::Field;
     use std::sync::Arc;
 
@@ -323,7 +323,7 @@ mod tests {
             "secret",
         );
 
-        assert!(writer.storage_options.get("AWS_ENDPOINT_URL").is_none());
+        assert!(!writer.storage_options.contains_key("AWS_ENDPOINT_URL"));
     }
 
     #[test]

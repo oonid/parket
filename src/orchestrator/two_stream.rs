@@ -150,7 +150,7 @@ where
 mod tests {
     use crate::orchestrator::*;
     use crate::orchestrator::test_support::*;
-    use crate::discovery::ColumnInfo;
+    
     use deltalake::arrow::record_batch::RecordBatch;
     use serial_test::serial;
     use std::sync::Arc;
