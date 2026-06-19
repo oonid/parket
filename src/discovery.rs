@@ -6,6 +6,17 @@ use sqlx::MySqlPool;
 
 use crate::config::ExtractionMode;
 
+/// Common timestamp cursor column names, in priority order. Used to auto-detect an
+/// incremental HWM cursor when no `TABLE_TIMESTAMP_<table>` override is configured.
+const TIMESTAMP_CANDIDATES: &[&str] = &[
+    "updated_at",
+    "modified_at",
+    "changed_at",
+    "created_at",
+    "created_date",
+    "modified_date",
+];
+
 const UNSUPPORTED_DATA_TYPES: &[&str] = &[
     "geometry",
     "point",
@@ -204,6 +215,20 @@ pub fn filter_unsupported_columns(columns: &[ColumnInfo]) -> Vec<ColumnInfo> {
         })
         .cloned()
         .collect()
+}
+
+/// Auto-detect a timestamp cursor column: returns the first `TIMESTAMP_CANDIDATES`
+/// entry present as a `timestamp`/`datetime` column, or `None` if none match.
+/// (Used only when there is no explicit `TABLE_TIMESTAMP_<table>` override.)
+pub fn detect_timestamp_col(columns: &[ColumnInfo]) -> Option<String> {
+    for candidate in TIMESTAMP_CANDIDATES {
+        if columns.iter().any(|c| {
+            c.name == *candidate && (c.data_type == "timestamp" || c.data_type == "datetime")
+        }) {
+            return Some((*candidate).to_string());
+        }
+    }
+    None
 }
 
 pub fn detect_mode(
@@ -681,5 +706,73 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("completed_at"));
+    }
+
+    #[test]
+    fn detect_timestamp_col_finds_updated_at() {
+        let columns = vec![
+            col("updated_at", "timestamp", "timestamp"),
+            col("id", "int", "int(11)"),
+        ];
+        assert_eq!(detect_timestamp_col(&columns), Some("updated_at".to_string()));
+    }
+
+    #[test]
+    fn detect_timestamp_col_finds_modified_at() {
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("modified_at", "datetime", "datetime"),
+        ];
+        assert_eq!(detect_timestamp_col(&columns), Some("modified_at".to_string()));
+    }
+
+    #[test]
+    fn detect_timestamp_col_finds_changed_at() {
+        let columns = vec![col("changed_at", "timestamp", "timestamp")];
+        assert_eq!(detect_timestamp_col(&columns), Some("changed_at".to_string()));
+    }
+
+    #[test]
+    fn detect_timestamp_col_finds_created_at() {
+        let columns = vec![col("created_at", "datetime", "datetime")];
+        assert_eq!(detect_timestamp_col(&columns), Some("created_at".to_string()));
+    }
+
+    #[test]
+    fn detect_timestamp_col_finds_created_date() {
+        let columns = vec![col("created_date", "timestamp", "timestamp")];
+        assert_eq!(detect_timestamp_col(&columns), Some("created_date".to_string()));
+    }
+
+    #[test]
+    fn detect_timestamp_col_finds_modified_date() {
+        let columns = vec![col("modified_date", "datetime", "datetime")];
+        assert_eq!(detect_timestamp_col(&columns), Some("modified_date".to_string()));
+    }
+
+    #[test]
+    fn detect_timestamp_col_priority_updated_over_modified() {
+        let columns = vec![
+            col("updated_at", "timestamp", "timestamp"),
+            col("modified_at", "timestamp", "timestamp"),
+        ];
+        assert_eq!(detect_timestamp_col(&columns), Some("updated_at".to_string()));
+    }
+
+    #[test]
+    fn detect_timestamp_col_ignores_wrong_type() {
+        let columns = vec![
+            col("updated_at", "varchar", "varchar(20)"),
+        ];
+        assert_eq!(detect_timestamp_col(&columns), None);
+    }
+
+    #[test]
+    fn detect_timestamp_col_none_when_no_candidate() {
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("name", "varchar", "varchar(255)"),
+        ];
+        assert_eq!(detect_timestamp_col(&columns), None);
     }
 }

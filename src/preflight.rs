@@ -86,10 +86,14 @@ where
     async fn check_table(&self, table_name: &str) -> Result<()> {
         let columns = self.inspect.discover_columns(table_name).await?;
         let columns = filter_unsupported_columns(&columns);
-        let ts_col = self.config.timestamp_col(table_name).to_string();
-        if self.config.table_timestamp_col.contains_key(table_name) {
-            crate::discovery::validate_timestamp_col(&columns, &ts_col)?;
-        }
+        let ts_col = match self.config.table_timestamp_col.get(table_name) {
+            Some(ovr) => {
+                crate::discovery::validate_timestamp_col(&columns, ovr)?;
+                ovr.clone()
+            }
+            None => crate::discovery::detect_timestamp_col(&columns)
+                .unwrap_or_else(|| "updated_at".to_string()),
+        };
 
         // Resolve TwoStream mode from configuration
         let has_insert = self.config.table_insert_cursor.contains_key(table_name);
