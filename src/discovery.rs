@@ -775,4 +775,161 @@ mod tests {
         ];
         assert_eq!(detect_timestamp_col(&columns), None);
     }
+
+    #[test]
+    fn detect_timestamp_col_priority_updated_over_all() {
+        // updated_at should win even when all candidates are present.
+        let columns = vec![
+            col("modified_at", "timestamp", "timestamp"),
+            col("changed_at", "timestamp", "timestamp"),
+            col("updated_at", "timestamp", "timestamp"),
+            col("created_at", "datetime", "datetime"),
+            col("created_date", "timestamp", "timestamp"),
+            col("modified_date", "datetime", "datetime"),
+        ];
+        assert_eq!(detect_timestamp_col(&columns), Some("updated_at".to_string()));
+    }
+
+    #[test]
+    fn detect_timestamp_col_modified_when_no_updated() {
+        // modified_at is second priority.
+        let columns = vec![
+            col("changed_at", "timestamp", "timestamp"),
+            col("modified_at", "datetime", "datetime"),
+            col("created_at", "timestamp", "timestamp"),
+        ];
+        assert_eq!(detect_timestamp_col(&columns), Some("modified_at".to_string()));
+    }
+
+    #[test]
+    fn detect_timestamp_col_changed_when_no_updated_or_modified() {
+        let columns = vec![
+            col("changed_at", "timestamp", "timestamp"),
+            col("created_at", "datetime", "datetime"),
+            col("id", "int", "int(11)"),
+        ];
+        assert_eq!(detect_timestamp_col(&columns), Some("changed_at".to_string()));
+    }
+
+    #[test]
+    fn detect_timestamp_col_created_at_when_no_higher_priority() {
+        let columns = vec![
+            col("created_at", "timestamp", "timestamp"),
+            col("name", "varchar", "varchar(255)"),
+        ];
+        assert_eq!(detect_timestamp_col(&columns), Some("created_at".to_string()));
+    }
+
+    #[test]
+    fn detect_timestamp_col_created_date_when_no_created_at() {
+        let columns = vec![
+            col("created_date", "datetime", "datetime"),
+            col("id", "int", "int(11)"),
+        ];
+        assert_eq!(detect_timestamp_col(&columns), Some("created_date".to_string()));
+    }
+
+    #[test]
+    fn detect_timestamp_col_modified_date_fallback() {
+        let columns = vec![
+            col("modified_date", "timestamp", "timestamp"),
+            col("id", "int", "int(11)"),
+        ];
+        assert_eq!(detect_timestamp_col(&columns), Some("modified_date".to_string()));
+    }
+
+    #[test]
+    fn validate_two_stream_cursors_with_tinyint() {
+        // tinyint should be accepted as integer.
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("version", "tinyint", "tinyint(4)"),
+            col("updated_at", "timestamp", "timestamp"),
+        ];
+        let result = validate_two_stream_cursors(&columns, "version", "updated_at");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_two_stream_cursors_with_smallint() {
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("counter", "smallint", "smallint(6)"),
+            col("updated_at", "timestamp", "timestamp"),
+        ];
+        let result = validate_two_stream_cursors(&columns, "counter", "updated_at");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_two_stream_cursors_with_mediumint() {
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("seq", "mediumint", "mediumint(9)"),
+            col("updated_at", "timestamp", "timestamp"),
+        ];
+        let result = validate_two_stream_cursors(&columns, "seq", "updated_at");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_two_stream_cursors_with_datetime_update() {
+        // datetime should be accepted for update cursor (not just timestamp).
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("user_id", "bigint", "bigint(20)"),
+            col("modified_at", "datetime", "datetime"),
+        ];
+        let result = validate_two_stream_cursors(&columns, "user_id", "modified_at");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_timestamp_col_datetime_variant() {
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("event_time", "datetime", "datetime"),
+        ];
+        let result = validate_timestamp_col(&columns, "event_time");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_timestamp_col_timestamp_variant() {
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("event_time", "timestamp", "timestamp"),
+        ];
+        let result = validate_timestamp_col(&columns, "event_time");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn filter_mixed_supported_and_unsupported() {
+        // Mix of supported and unsupported types.
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("data", "json", "json"),
+            col("bounds", "geometry", "geometry"),
+            col("updated", "timestamp", "timestamp"),
+            col("path", "linestring", "linestring"),
+            col("text", "text", "text"),
+        ];
+        let filtered = filter_unsupported_columns(&columns);
+        assert_eq!(filtered.len(), 4);
+        assert!(filtered.iter().any(|c| c.name == "id"));
+        assert!(filtered.iter().any(|c| c.name == "data"));
+        assert!(filtered.iter().any(|c| c.name == "updated"));
+        assert!(filtered.iter().any(|c| c.name == "text"));
+        assert!(!filtered.iter().any(|c| c.name == "bounds"));
+        assert!(!filtered.iter().any(|c| c.name == "path"));
+    }
+
+    #[test]
+    fn compute_schema_hash_column_type_matters() {
+        // Different column_type (same name/data_type) should produce different hash.
+        let cols_a = vec![col("id", "int", "int(11)")];
+        let cols_b = vec![col("id", "int", "int(20)")];
+        assert_ne!(compute_schema_hash(&cols_a), compute_schema_hash(&cols_b));
+    }
 }

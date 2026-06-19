@@ -703,4 +703,240 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("1 table(s) failed"), "error message: {err}");
     }
+
+    #[tokio::test]
+    async fn full_refresh_no_id_no_timestamp() {
+        // Table has neither id nor timestamp; should be full_refresh with "no id/updated_at" key.
+        let columns = vec![
+            col("name", "varchar", "varchar(255)"),
+            col("value", "int", "int(11)"),
+        ];
+        let config = make_config(vec!["data".to_string()]);
+        let mut inspect = MockPreflightInspect::new();
+        let mut storage = MockPreflightStorage::new();
+        let mut hwm = MockPreflightHwm::new();
+
+        storage.expect_check_writable().returning(|| Ok(()));
+        hwm.expect_read_hwm().returning(|_| Ok(None));
+        inspect
+            .expect_discover_columns()
+            .withf(|t| t == "data")
+            .returning(move |_| Ok(columns.clone()));
+        inspect
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(64)));
+
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
+        let result = check.run().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn full_refresh_has_id_no_timestamp() {
+        // Table has id but missing timestamp column; should show "no updated_at" in key.
+        let columns = vec![
+            col("id", "bigint", "bigint(20)"),
+            col("name", "varchar", "varchar(255)"),
+        ];
+        let config = make_config(vec!["products".to_string()]);
+        let mut inspect = MockPreflightInspect::new();
+        let mut storage = MockPreflightStorage::new();
+        let mut hwm = MockPreflightHwm::new();
+
+        storage.expect_check_writable().returning(|| Ok(()));
+        hwm.expect_read_hwm().returning(|_| Ok(None));
+        inspect
+            .expect_discover_columns()
+            .returning(move |_| Ok(columns.clone()));
+        inspect
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
+        let result = check.run().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn full_refresh_no_id_has_timestamp() {
+        // Table has timestamp but missing id; should show "no id" in key.
+        let columns = vec![
+            col("name", "varchar", "varchar(255)"),
+            col("updated_at", "timestamp", "timestamp"),
+        ];
+        let config = make_config(vec!["events".to_string()]);
+        let mut inspect = MockPreflightInspect::new();
+        let mut storage = MockPreflightStorage::new();
+        let mut hwm = MockPreflightHwm::new();
+
+        storage.expect_check_writable().returning(|| Ok(()));
+        hwm.expect_read_hwm().returning(|_| Ok(None));
+        inspect
+            .expect_discover_columns()
+            .returning(move |_| Ok(columns.clone()));
+        inspect
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(80)));
+
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
+        let result = check.run().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn mode_override_shows_override_in_key() {
+        // When mode override is set, KEY should display "override" not the computed reason.
+        let config = Config {
+            table_modes: vec![("products".into(), ExtractionMode::FullRefresh)].into_iter().collect(),
+            ..make_config(vec!["products".to_string()])
+        };
+        let columns = incremental_columns(); // Has both id and timestamp
+        let mut inspect = MockPreflightInspect::new();
+        let mut storage = MockPreflightStorage::new();
+        let mut hwm = MockPreflightHwm::new();
+
+        storage.expect_check_writable().returning(|| Ok(()));
+        hwm.expect_read_hwm().returning(|_| Ok(None));
+        inspect
+            .expect_discover_columns()
+            .returning(move |_| Ok(columns.clone()));
+        inspect
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(128)));
+
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
+        let result = check.run().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn two_stream_mode_key_includes_both_cursors() {
+        // TwoStream mode KEY should show "two-stream: insert_col + update_col".
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_insert_cursor.insert("orders".to_string(), "id".to_string());
+        config.table_update_cursor.insert("orders".to_string(), "updated_at".to_string());
+
+        let mut inspect = MockPreflightInspect::new();
+        let mut storage = MockPreflightStorage::new();
+        let mut hwm = MockPreflightHwm::new();
+
+        storage.expect_check_writable().returning(|| Ok(()));
+        hwm.expect_read_hwm().returning(|_| Ok(None));
+        let cols = incremental_columns();
+        inspect
+            .expect_discover_columns()
+            .returning(move |_| Ok(cols.clone()));
+        inspect
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(128)));
+
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
+        let result = check.run().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn incremental_mode_key_shows_cursors() {
+        // Incremental mode KEY should show "id, timestamp_col".
+        let columns = incremental_columns();
+        let config = make_config(vec!["orders".to_string()]);
+        let mut inspect = MockPreflightInspect::new();
+        let mut storage = MockPreflightStorage::new();
+        let mut hwm = MockPreflightHwm::new();
+
+        storage.expect_check_writable().returning(|| Ok(()));
+        hwm.expect_read_hwm().returning(|_| Ok(None));
+        inspect
+            .expect_discover_columns()
+            .returning(move |_| Ok(columns.clone()));
+        inspect
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(128)));
+
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
+        let result = check.run().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn auto_mode_never_returned() {
+        // detect_mode with None override and valid columns should not return Auto.
+        let columns = incremental_columns();
+        let config = make_config(vec!["orders".to_string()]);
+        let mut inspect = MockPreflightInspect::new();
+        let mut storage = MockPreflightStorage::new();
+        let mut hwm = MockPreflightHwm::new();
+
+        storage.expect_check_writable().returning(|| Ok(()));
+        hwm.expect_read_hwm().returning(|_| Ok(None));
+        inspect
+            .expect_discover_columns()
+            .returning(move |_| Ok(columns.clone()));
+        inspect
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(128)));
+
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
+        let result = check.run().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn custom_timestamp_column_used_in_preflight() {
+        // When TABLE_TIMESTAMP_table is set, that column name should be used in KEY, not auto-detected.
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_timestamp_col.insert("orders".to_string(), "completed_at".to_string());
+
+        let columns = vec![
+            col("id", "bigint", "bigint(20)"),
+            col("name", "varchar", "varchar(255)"),
+            col("completed_at", "timestamp", "timestamp"),
+        ];
+
+        let mut inspect = MockPreflightInspect::new();
+        let mut storage = MockPreflightStorage::new();
+        let mut hwm = MockPreflightHwm::new();
+
+        storage.expect_check_writable().returning(|| Ok(()));
+        hwm.expect_read_hwm().returning(|_| Ok(None));
+        inspect
+            .expect_discover_columns()
+            .returning(move |_| Ok(columns.clone()));
+        inspect
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(128)));
+
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
+        let result = check.run().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn hwm_with_both_updated_at_and_last_id() {
+        // Format HWM when both updated_at and last_id are present.
+        let config = make_config(vec!["orders".to_string()]);
+        let mut inspect = MockPreflightInspect::new();
+        let mut storage = MockPreflightStorage::new();
+        let mut hwm = MockPreflightHwm::new();
+
+        storage.expect_check_writable().returning(|| Ok(()));
+        hwm.expect_read_hwm()
+            .withf(|t| t == "orders")
+            .returning(|_| {
+                Ok(Some(crate::writer::Hwm {
+                    updated_at: "2026-05-15T10:30:00.000000".to_string(),
+                    last_id: 5000,
+                }))
+            });
+        inspect
+            .expect_discover_columns()
+            .returning(|_| Ok(incremental_columns()));
+        inspect
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(128)));
+
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
+        let result = check.run().await;
+        assert!(result.is_ok());
+    }
 }

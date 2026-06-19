@@ -448,4 +448,131 @@ mod tests {
         let report = evaluate_cursor("orders", columns, indexes, None);
         assert_eq!(report.id_type.as_deref(), Some("bigint"));
     }
+
+    #[test]
+    fn configured_unsafe_with_safe_alternative() {
+        // Configured column is unsafe (nullable), but a safe alternative exists.
+        // Should show warning about unsafe config + suggest safe alternative.
+        let columns = &[
+            col("id", "bigint", "bigint(20)", false, "PRI"),
+            col("completed_at", "datetime", "datetime", true, ""),  // nullable = unsafe
+            col("created_at", "timestamp", "timestamp", false, "MUL"),  // safe, indexed
+        ];
+        let indexes = &[
+            idx("PRIMARY", true, &["id"]),
+            idx("idx_created_at", false, &["created_at"]),
+        ];
+        let report = evaluate_cursor("orders", columns, indexes, Some("completed_at"));
+        assert!(report.has_id);
+        assert_eq!(report.candidates.len(), 2);
+        let completed = report.candidates.iter().find(|c| c.column == "completed_at").unwrap();
+        assert_eq!(completed.verdict, Verdict::Unsafe);
+        // Recommendation should mention unsafe + suggest created_at
+        assert!(report.recommendation.contains("unsafe"), "rec: {}", report.recommendation);
+        assert!(report.recommendation.contains("created_at"), "rec: {}", report.recommendation);
+    }
+
+    #[test]
+    fn configured_non_unsafe_candidate_exists() {
+        // Configured column exists but is not in candidates; still has safe alternatives.
+        let columns = &[
+            col("id", "bigint", "bigint(20)", false, "PRI"),
+            col("created_at", "timestamp", "timestamp", false, "MUL"),
+        ];
+        let indexes = &[
+            idx("PRIMARY", true, &["id"]),
+            idx("idx_created_at", false, &["created_at"]),
+        ];
+        // Configure a different timestamp column that doesn't exist
+        let report = evaluate_cursor("orders", columns, indexes, Some("modified_at"));
+        assert!(report.has_id);
+        // Configured column is not in schema, so no warning is added
+        assert!(report.recommendation.contains("TABLE_TIMESTAMP"));
+        assert!(report.recommendation.contains("created_at"));
+    }
+
+    #[test]
+    fn ok_verdict_with_indexed_non_leading() {
+        // Indexed but not leading should get Ok verdict, with specific message.
+        let columns = &[
+            col("id", "bigint", "bigint(20)", false, "PRI"),
+            col("created_at", "timestamp", "timestamp", false, "MUL"),
+        ];
+        let indexes = &[
+            idx("PRIMARY", true, &["id"]),
+            idx("idx_status_created", false, &["status", "created_at"]),
+        ];
+        let report = evaluate_cursor("orders", columns, indexes, None);
+        let created = report.candidates.iter().find(|c| c.column == "created_at").unwrap();
+        assert_eq!(created.verdict, Verdict::Ok);
+        assert!(report.recommendation.contains("acceptable candidate"));
+        assert!(report.recommendation.contains("not leading index"));
+    }
+
+    #[test]
+    fn all_candidates_unsafe_no_safe_fallback() {
+        // Multiple candidates but all are nullable (unsafe).
+        let columns = &[
+            col("id", "bigint", "bigint(20)", false, "PRI"),
+            col("created_at", "timestamp", "timestamp", true, ""),
+            col("updated_at", "datetime", "datetime", true, ""),
+        ];
+        let indexes = &[idx("PRIMARY", true, &["id"])];
+        let report = evaluate_cursor("orders", columns, indexes, None);
+        assert!(report.has_id);
+        assert_eq!(report.candidates.len(), 2);
+        assert!(report.candidates.iter().all(|c| c.verdict == Verdict::Unsafe));
+        assert!(report.recommendation.contains("full_refresh"));
+    }
+
+    #[test]
+    fn multiple_index_columns_leading_detection() {
+        // Test that leading=true only when timestamp is FIRST in index.
+        let columns = &[
+            col("id", "bigint", "bigint(20)", false, "PRI"),
+            col("status", "varchar", "varchar(50)", false, ""),
+            col("created_at", "timestamp", "timestamp", false, ""),
+        ];
+        let indexes = &[
+            idx("PRIMARY", true, &["id"]),
+            idx("idx_status_created", false, &["status", "created_at"]),
+            idx("idx_created_status", false, &["created_at", "status"]),
+        ];
+        let report = evaluate_cursor("orders", columns, indexes, None);
+        let created = report.candidates.iter().find(|c| c.column == "created_at").unwrap();
+        assert!(created.indexed);
+        // created_at is in both indexes, but only leading in idx_created_status
+        assert!(created.leading, "should detect leading in at least one index");
+        assert_eq!(created.verdict, Verdict::Ideal);
+    }
+
+    #[test]
+    fn configured_non_existent_column_no_warning() {
+        // Configured column doesn't exist in column list = no warning.
+        let columns = &[
+            col("id", "bigint", "bigint(20)", false, "PRI"),
+            col("created_at", "timestamp", "timestamp", false, "MUL"),
+        ];
+        let indexes = &[
+            idx("PRIMARY", true, &["id"]),
+            idx("idx_created_at", false, &["created_at"]),
+        ];
+        let report = evaluate_cursor("orders", columns, indexes, Some("does_not_exist"));
+        assert!(report.has_id);
+        let rec = report.recommendation.clone();
+        // Should recommend created_at without mentioning the non-existent configured column
+        assert!(!rec.contains("does_not_exist"));
+        assert!(rec.contains("created_at"));
+    }
+
+    #[test]
+    fn id_column_type_int() {
+        let columns = &[
+            col("id", "int", "int(11)", false, "PRI"),
+            col("updated_at", "timestamp", "timestamp", false, ""),
+        ];
+        let indexes = &[idx("PRIMARY", true, &["id"])];
+        let report = evaluate_cursor("orders", columns, indexes, None);
+        assert_eq!(report.id_type.as_deref(), Some("int"));
+    }
 }
