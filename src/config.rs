@@ -3,6 +3,12 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 
+mod parse;
+mod mask;
+
+use parse::*;
+pub use mask::{mask_database_url, mask_secret};
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub database_url: String,
@@ -250,139 +256,6 @@ impl Config {
     }
 }
 
-fn env(key: &str) -> Result<String> {
-    let val = std::env::var(key).with_context(|| format!("{key} is required"))?;
-    if val.is_empty() {
-        bail!("{key} is required");
-    }
-    Ok(val)
-}
-
-fn validate_database_url(url: &str) -> Result<()> {
-    if url.starts_with("mysql://") {
-        Ok(())
-    } else {
-        bail!("DATABASE_URL must start with mysql:// — unsupported scheme")
-    }
-}
-
-fn parse_tables(raw: &str) -> Result<Vec<String>> {
-    let tables: Vec<String> = raw
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    Ok(tables)
-}
-
-fn parse_table_modes(tables: &[String]) -> HashMap<String, ExtractionMode> {
-    let mut modes = HashMap::new();
-    for table in tables {
-        let key = format!("TABLE_MODE_{table}");
-        if let Ok(val) = std::env::var(&key) {
-            let mode = match val.to_lowercase().as_str() {
-                "incremental" => ExtractionMode::Incremental,
-                "full_refresh" => ExtractionMode::FullRefresh,
-                _ => ExtractionMode::Auto,
-            };
-            modes.insert(table.clone(), mode);
-        }
-    }
-    modes
-}
-
-fn parse_table_initial_hwm(tables: &[String]) -> Result<HashMap<String, (String, i64)>> {
-    let mut map = HashMap::new();
-    for table in tables {
-        let key = format!("TABLE_HWM_{table}");
-        if let Ok(val) = std::env::var(&key) {
-            let val = val.trim();
-            if val.is_empty() {
-                continue;
-            }
-            let (ua, id_str) = val.split_once(',')
-                .ok_or_else(|| anyhow::anyhow!("{key} must be '<updated_at>,<last_id>', got '{val}'"))?;
-            let ua = ua.trim();
-            let id_str = id_str.trim();
-            if ua.is_empty() {
-                bail!("{key}: updated_at must not be empty");
-            }
-            let last_id: i64 = id_str.parse()
-                .with_context(|| format!("{key}: last_id '{id_str}' is not a valid i64"))?;
-            map.insert(table.clone(), (ua.to_string(), last_id));
-        }
-    }
-    Ok(map)
-}
-
-fn parse_table_timestamp_col(tables: &[String]) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for table in tables {
-        let key = format!("TABLE_TIMESTAMP_{table}");
-        if let Ok(val) = std::env::var(&key) {
-            let val = val.trim();
-            if !val.is_empty() {
-                map.insert(table.clone(), val.to_string());
-            }
-        }
-    }
-    map
-}
-
-fn parse_table_insert_cursor(tables: &[String]) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for table in tables {
-        let key = format!("TABLE_INSERT_CURSOR_{table}");
-        if let Ok(val) = std::env::var(&key) {
-            let val = val.trim();
-            if !val.is_empty() {
-                map.insert(table.clone(), val.to_string());
-            }
-        }
-    }
-    map
-}
-
-fn parse_table_update_cursor(tables: &[String]) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for table in tables {
-        let key = format!("TABLE_UPDATE_CURSOR_{table}");
-        if let Ok(val) = std::env::var(&key) {
-            let val = val.trim();
-            if !val.is_empty() {
-                map.insert(table.clone(), val.to_string());
-            }
-        }
-    }
-    map
-}
-
-pub fn mask_database_url(url: &str) -> String {
-    url::Url::parse(url)
-        .ok()
-        .map(|u| {
-            let scheme = u.scheme();
-            let host = u.host_str().unwrap_or("unknown");
-            let port = u.port().map_or(String::new(), |p| format!(":{p}"));
-            if u.password().is_some() {
-                format!("{scheme}://****:****@{host}{port}")
-            } else if !u.username().is_empty() {
-                format!("{scheme}://{}@{host}{port}", u.username())
-            } else {
-                format!("{scheme}://{host}{port}")
-            }
-        })
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
-pub fn mask_secret(secret: &str) -> String {
-    if secret.len() <= 4 {
-        "****".to_string()
-    } else {
-        let visible = &secret[secret.len() - 4..];
-        format!("****{visible}")
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1039,56 +912,6 @@ mod tests {
             !display.contains("minioadmin") || display.contains("****"),
             "display_safe should mask S3 secret, got: {display}"
         );
-    }
-
-    #[test]
-    fn mask_database_url_with_password() {
-        let masked = mask_database_url("mysql://admin:s3cret@dbhost.example.com:3306/mydb");
-        assert_eq!(masked, "mysql://****:****@dbhost.example.com:3306");
-    }
-
-    #[test]
-    fn mask_database_url_without_password() {
-        let masked = mask_database_url("mysql://admin@dbhost.example.com:3306/mydb");
-        assert_eq!(masked, "mysql://admin@dbhost.example.com:3306");
-    }
-
-    #[test]
-    fn mask_database_url_no_credentials() {
-        let masked = mask_database_url("mysql://dbhost.example.com:3306/mydb");
-        assert_eq!(masked, "mysql://dbhost.example.com:3306");
-    }
-
-    #[test]
-    fn mask_database_url_invalid() {
-        let masked = mask_database_url("not-a-url");
-        assert_eq!(masked, "unknown");
-    }
-
-    #[test]
-    fn mask_database_url_no_port() {
-        let masked = mask_database_url("mysql://user:pass@dbhost/mydb");
-        assert_eq!(masked, "mysql://****:****@dbhost");
-    }
-
-    #[test]
-    fn mask_secret_short_value() {
-        assert_eq!(mask_secret("ab"), "****");
-    }
-
-    #[test]
-    fn mask_secret_exact_four_chars() {
-        assert_eq!(mask_secret("abcd"), "****");
-    }
-
-    #[test]
-    fn mask_secret_long_value() {
-        assert_eq!(mask_secret("mysecretkey123"), "****y123");
-    }
-
-    #[test]
-    fn mask_secret_five_chars() {
-        assert_eq!(mask_secret("abcde"), "****bcde");
     }
 
     #[test]
