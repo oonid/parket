@@ -98,6 +98,7 @@ fn log_startup_banner(config: &config::Config, local_dir: Option<&std::path::Pat
 async fn run_verify(
     config: &config::Config,
     local_dir: Option<&std::path::Path>,
+    tables: Vec<String>,
     deep: bool,
 ) -> i32 {
     let pool = match sqlx::MySqlPool::connect(&config.database_url).await {
@@ -121,8 +122,7 @@ async fn run_verify(
         )
     };
     let delta = parket::verify::DeltaProbeAdapter::new(writer);
-    let cmd =
-        parket::verify::VerifyCommand::new(source, delta, config.tables.clone()).with_deep(deep);
+    let cmd = parket::verify::VerifyCommand::new(source, delta, tables).with_deep(deep);
     match cmd.run().await {
         Ok(parket::verify::VerifyVerdict::Clean) => 0,
         Ok(parket::verify::VerifyVerdict::Discrepancy) => 1,
@@ -130,6 +130,26 @@ async fn run_verify(
             eprintln!("verify failed: {e:#}");
             2
         }
+    }
+}
+
+fn resolve_verify_tables(
+    configured_tables: &[String],
+    requested_table: Option<&str>,
+) -> Result<Vec<String>, String> {
+    match requested_table {
+        Some(table) => configured_tables
+            .iter()
+            .find(|configured| configured.as_str() == table)
+            .cloned()
+            .map(|matched| vec![matched])
+            .ok_or_else(|| {
+                format!(
+                    "table `{table}` is not present in configured TABLES: {}",
+                    configured_tables.join(", ")
+                )
+            }),
+        None => Ok(configured_tables.to_vec()),
     }
 }
 
@@ -255,8 +275,15 @@ async fn async_main() {
         }
     }
 
-    if cli.verify {
-        let code = run_verify(&config, local_dir.as_deref(), cli.verify_deep).await;
+    if let Some(ref verify) = cli.verify {
+        let verify_tables = match resolve_verify_tables(&config.tables, verify.as_deref()) {
+            Ok(tables) => tables,
+            Err(e) => {
+                eprintln!("configuration error: {e}");
+                std::process::exit(2);
+            }
+        };
+        let code = run_verify(&config, local_dir.as_deref(), verify_tables, cli.verify_deep).await;
         std::process::exit(code);
     }
 
@@ -321,7 +348,13 @@ async fn async_main() {
     // --verify-after: reconcile only when the sync itself succeeded.
     if let Some(vcfg) = verify_after_cfg {
         if sync_exit == 0 {
-            let code = run_verify(&vcfg, verify_after_dir.as_deref(), verify_deep).await;
+            let code = run_verify(
+                &vcfg,
+                verify_after_dir.as_deref(),
+                vcfg.tables.clone(),
+                verify_deep,
+            )
+            .await;
             std::process::exit(code);
         }
         eprintln!("verify-after skipped: sync exited with code {sync_exit}");
@@ -462,6 +495,28 @@ mod tests {
         use tracing_subscriber::EnvFilter;
         let filter = EnvFilter::from("parket=debug");
         assert!(filter.max_level_hint().is_some());
+    }
+
+    #[test]
+    fn resolve_verify_tables_returns_all_when_no_table_requested() {
+        let tables = vec!["orders".to_string(), "customers".to_string()];
+        let resolved = resolve_verify_tables(&tables, None).unwrap();
+        assert_eq!(resolved, tables);
+    }
+
+    #[test]
+    fn resolve_verify_tables_returns_single_requested_table() {
+        let tables = vec!["orders".to_string(), "customers".to_string()];
+        let resolved = resolve_verify_tables(&tables, Some("customers")).unwrap();
+        assert_eq!(resolved, vec!["customers".to_string()]);
+    }
+
+    #[test]
+    fn resolve_verify_tables_rejects_unknown_table() {
+        let tables = vec!["orders".to_string(), "customers".to_string()];
+        let err = resolve_verify_tables(&tables, Some("missing")).unwrap_err();
+        assert!(err.contains("missing"));
+        assert!(err.contains("orders, customers"));
     }
 
     #[test]

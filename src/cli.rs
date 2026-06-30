@@ -36,9 +36,11 @@ pub struct Cli {
 
     #[arg(
         long,
-        help = "Reconcile each synced Delta table against the source DB (row counts), then exit"
+        value_name = "TABLE",
+        num_args = 0..=1,
+        help = "Reconcile all synced Delta tables, or one named configured table, against the source DB, then exit"
     )]
-    pub verify: bool,
+    pub verify: Option<Option<String>>,
 
     #[arg(
         long,
@@ -62,6 +64,7 @@ mod tests {
     fn default_mode_is_run() {
         let cli = Cli::try_parse_from(["parket"]).unwrap();
         assert!(!cli.check);
+        assert!(cli.verify.is_none());
     }
 
     #[test]
@@ -106,6 +109,7 @@ mod tests {
         let cli = Cli::try_parse_from(["parket", "--progress"]).unwrap();
         assert!(cli.progress);
         assert!(!cli.check);
+        assert!(cli.verify.is_none());
     }
 
     #[test]
@@ -120,6 +124,7 @@ mod tests {
         let cli = Cli::try_parse_from(["parket"]).unwrap();
         assert!(!cli.check);
         assert!(!cli.progress);
+        assert!(cli.verify.is_none());
     }
 
     #[test]
@@ -195,5 +200,31 @@ mod tests {
             output.contains("--inspect"),
             "help should mention --inspect flag"
         );
+    }
+
+    #[test]
+    fn verify_flag_without_table_parsed() {
+        let cli = Cli::try_parse_from(["parket", "--verify"]).unwrap();
+        assert_eq!(cli.verify, Some(None));
+    }
+
+    #[test]
+    fn verify_flag_with_table_parsed() {
+        let cli = Cli::try_parse_from(["parket", "--verify", "orders"]).unwrap();
+        assert_eq!(cli.verify, Some(Some("orders".to_string())));
+    }
+
+    #[test]
+    fn verify_flag_with_table_and_deep_parsed() {
+        let cli = Cli::try_parse_from(["parket", "--verify", "orders", "--verify-deep"])
+            .unwrap();
+        assert_eq!(cli.verify, Some(Some("orders".to_string())));
+        assert!(cli.verify_deep);
+    }
+
+    #[test]
+    fn bare_table_argument_is_rejected() {
+        let result = Cli::try_parse_from(["parket", "orders"]);
+        assert!(result.is_err());
     }
 }

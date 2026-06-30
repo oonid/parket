@@ -5,7 +5,7 @@ controlled by a small set of flags plus environment variables (see
 [config.md](config.md) for the env reference).
 
 ```
-parket [--check] [--inspect <TABLE>] [--verify] [--verify-deep] [--verify-after] [--progress] [--local <dir>] [--version] [--help]
+parket [--check] [--inspect <TABLE>] [--verify [<TABLE>]] [--verify-deep] [--verify-after] [--progress] [--local <dir>] [--version] [--help]
 ```
 
 All flags are defined in `src/cli.rs`.
@@ -17,7 +17,7 @@ All flags are defined in `src/cli.rs`.
 | _(none)_ | — | — | Run the extract-and-load pipeline |
 | `--check` | — | off | Validate config + connectivity and print a per-table summary; extract nothing |
 | `--inspect <TABLE>` | table name (required) | unset | Evaluate a single table's columns, indexes, and cursor suitability, then exit |
-| `--verify` | — | off | Reconcile each synced Delta table against the source DB (schema, counts, key-set, null census, sampled values), then exit |
+| `--verify [<TABLE>]` | optional table name | off | Reconcile all configured Delta tables, or only the named configured table, against the source DB, then exit |
 | `--verify-deep` | — | off | With `--verify`/`--verify-after`, run strict checks even on tables above the 1M-row cap |
 | `--verify-after` | — | off | After a successful sync, run the same reconciliation; a discrepancy makes the process exit non-zero |
 | `--progress` | — | off | Emit detailed per-batch / per-chunk progress logs |
@@ -154,13 +154,15 @@ an error). Exits `2` on database connection failure or table-not-found.
 
 ```bash
 parket --verify                 # reconcile S3 tables against the source, then exit
+parket --verify orders          # reconcile only the configured `orders` table
 parket --local ./out --verify   # reconcile local tables
 parket --verify --verify-deep   # also reconcile tables larger than the 1M-row cap
 ```
 
-Re-reads each table in `TABLES` from both the source DB and the synced Delta
-output and reports whether they agree. It writes nothing — it is a read-only
-audit you can run after a sync. The check runs in layers, cheapest first:
+Re-reads each table in `TABLES`, or just the configured table passed to
+`--verify <TABLE>`, from both the source DB and the synced Delta output and
+reports whether they agree. It writes nothing — it is a read-only audit you can
+run after a sync. The check runs in layers, cheapest first:
 
 | Layer | What it compares | Verdict effect |
 |-------|------------------|----------------|
@@ -194,7 +196,8 @@ the values themselves.
 
 Per-table verdicts and a final summary (`pass`/`drift`/`discrepancy`/`skipped`
 counts) are printed. Exit codes: `0` clean (all pass/drift/skipped), `1` at least
-one discrepancy, `2` could not run (DB/Delta error).
+one discrepancy, `2` could not run (DB/Delta error or invalid `--verify <TABLE>`
+selection).
 
 ### `--verify-after`
 
