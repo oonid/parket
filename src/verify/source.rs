@@ -2,7 +2,14 @@ use anyhow::{Context, Result};
 use sqlx::Row;
 use std::collections::HashMap;
 
-use super::{ColumnMeta, KeyStats, SourceProbe};
+use super::{ColumnMeta, KeyStats, SourceProbe, SourceScope};
+
+fn scope_predicate_sql(scope: &SourceScope) -> String {
+    format!(
+        "(`{cursor}` < ?) OR (`{cursor}` = ? AND CAST(`id` AS SIGNED) <= ?)",
+        cursor = scope.cursor_col,
+    )
+}
 
 pub struct SourceProbeAdapter {
     pool: sqlx::MySqlPool,
@@ -18,6 +25,34 @@ impl SourceProbe for SourceProbeAdapter {
             .fetch_one(&self.pool)
             .await
             .with_context(|| format!("source COUNT(*) for `{table}`"))?;
+        Ok(row.0)
+    }
+
+    async fn row_count_scoped(&self, table: &str, scope: &SourceScope) -> Result<i64> {
+        let predicate = scope_predicate_sql(scope);
+        let sql = format!("SELECT COUNT(*) FROM `{table}` WHERE {predicate}");
+        let row: (i64,) = sqlx::query_as(&sql)
+            .bind(&scope.updated_at)
+            .bind(&scope.updated_at)
+            .bind(scope.last_id)
+            .fetch_one(&self.pool)
+            .await
+            .with_context(|| {
+                format!(
+                    "source scoped COUNT(*) for `{table}` on `{}`",
+                    scope.cursor_col
+                )
+            })?;
+        Ok(row.0)
+    }
+
+    async fn max_cursor(&self, table: &str, cursor_col: &str) -> Result<Option<String>> {
+        let row: (Option<String>,) = sqlx::query_as(&format!(
+            "SELECT CAST(MAX(`{cursor_col}`) AS CHAR) FROM `{table}`"
+        ))
+        .fetch_one(&self.pool)
+        .await
+        .with_context(|| format!("source MAX(`{cursor_col}`) for `{table}`"))?;
         Ok(row.0)
     }
 
@@ -54,6 +89,39 @@ impl SourceProbe for SourceProbeAdapter {
         .fetch_one(&self.pool)
         .await
         .with_context(|| format!("source key_stats for `{table}`.`{key_col}`"))?;
+        let xor = row.4.unwrap_or(0);
+        Ok(KeyStats {
+            count: row.0,
+            distinct: row.1,
+            min: row.2,
+            max: row.3,
+            xor,
+            distinct_xor: xor,
+        })
+    }
+
+    async fn key_stats_scoped(
+        &self,
+        table: &str,
+        key_col: &str,
+        scope: &SourceScope,
+    ) -> Result<KeyStats> {
+        let predicate = scope_predicate_sql(scope);
+        let sql = format!(
+            "SELECT COUNT(*), COUNT(DISTINCT `{key_col}`),              CAST(MIN(`{key_col}`) AS SIGNED), CAST(MAX(`{key_col}`) AS SIGNED),              CAST(BIT_XOR(`{key_col}`) AS SIGNED) FROM `{table}`              WHERE {predicate}"
+        );
+        let row: (i64, i64, Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(&sql)
+            .bind(&scope.updated_at)
+            .bind(&scope.updated_at)
+            .bind(scope.last_id)
+            .fetch_one(&self.pool)
+            .await
+            .with_context(|| {
+                format!(
+                    "source scoped key_stats for `{table}`.`{key_col}` on `{}`",
+                    scope.cursor_col
+                )
+            })?;
         let xor = row.4.unwrap_or(0);
         Ok(KeyStats {
             count: row.0,
@@ -104,7 +172,13 @@ impl SourceProbe for SourceProbeAdapter {
         Ok(out)
     }
 
-    async fn sample_rows(&self, table: &str, id_col: &str, columns: &[String], ids: &[i64]) -> Result<HashMap<i64, Vec<Option<String>>>> {
+    async fn sample_rows(
+        &self,
+        table: &str,
+        id_col: &str,
+        columns: &[String],
+        ids: &[i64],
+    ) -> Result<HashMap<i64, Vec<Option<String>>>> {
         if columns.is_empty() || ids.is_empty() {
             return Ok(HashMap::new());
         }
