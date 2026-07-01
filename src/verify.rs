@@ -1,12 +1,12 @@
 use anyhow::Result;
 use std::collections::HashMap;
 
-mod source;
 mod delta;
+mod source;
 
-pub use source::SourceProbeAdapter;
-pub use delta::DeltaProbeAdapter;
 use crate::writer::Hwm;
+pub use delta::DeltaProbeAdapter;
+pub use source::SourceProbeAdapter;
 
 /// Table verdict outcome from verification.
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +44,13 @@ pub enum VerifyMode {
 pub struct TablePlan {
     pub table: String,
     pub mode: VerifyMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceScope {
+    pub cursor_col: String,
+    pub updated_at: String,
+    pub last_id: i64,
 }
 
 impl TablePlan {
@@ -108,8 +115,17 @@ const SAMPLE_SIZE: i64 = 100;
 fn is_value_comparable(type_str: &str) -> bool {
     matches!(
         type_str.to_ascii_lowercase().as_str(),
-        "smallint" | "mediumint" | "int" | "integer" | "bigint"
-            | "varchar" | "char" | "text" | "tinytext" | "mediumtext" | "longtext"
+        "smallint"
+            | "mediumint"
+            | "int"
+            | "integer"
+            | "bigint"
+            | "varchar"
+            | "char"
+            | "text"
+            | "tinytext"
+            | "mediumtext"
+            | "longtext"
     )
 }
 
@@ -137,11 +153,24 @@ pub struct KeyStats {
 #[allow(async_fn_in_trait)]
 pub trait SourceProbe: Send + Sync {
     async fn row_count(&self, table: &str) -> Result<i64>;
+    async fn row_count_scoped(&self, table: &str, scope: &SourceScope) -> Result<i64>;
     async fn columns(&self, table: &str) -> Result<Vec<ColumnMeta>>;
     async fn key_stats(&self, table: &str, key_col: &str) -> Result<KeyStats>;
+    async fn key_stats_scoped(
+        &self,
+        table: &str,
+        key_col: &str,
+        scope: &SourceScope,
+    ) -> Result<KeyStats>;
     async fn non_null_counts(&self, table: &str, columns: &[String]) -> Result<Vec<i64>>;
     async fn sample_ids(&self, table: &str, id_col: &str, limit: i64) -> Result<Vec<i64>>;
-    async fn sample_rows(&self, table: &str, id_col: &str, columns: &[String], ids: &[i64]) -> Result<HashMap<i64, Vec<Option<String>>>>;
+    async fn sample_rows(
+        &self,
+        table: &str,
+        id_col: &str,
+        columns: &[String],
+        ids: &[i64],
+    ) -> Result<HashMap<i64, Vec<Option<String>>>>;
 }
 
 /// Delta-side probe (the synced output).
@@ -151,11 +180,21 @@ pub trait DeltaProbe: Send + Sync {
     async fn row_count(&self, table: &str) -> Result<i64>;
     async fn columns(&self, table: &str) -> Result<Vec<ColumnMeta>>;
     async fn key_stats(&self, table: &str, key_col: &str) -> Result<KeyStats>;
+    async fn latest_key_stats(
+        &self,
+        table: &str,
+        key_col: &str,
+        cursor_col: &str,
+    ) -> Result<KeyStats>;
     async fn non_null_counts(&self, table: &str, columns: &[String]) -> Result<Vec<i64>>;
-    async fn sample_rows(&self, table: &str, id_col: &str, columns: &[String], ids: &[i64]) -> Result<HashMap<i64, Vec<Option<String>>>>;
+    async fn sample_rows(
+        &self,
+        table: &str,
+        id_col: &str,
+        columns: &[String],
+        ids: &[i64],
+    ) -> Result<HashMap<i64, Vec<Option<String>>>>;
 }
-
-
 
 pub struct VerifyCommand<S, D> {
     source: S,
@@ -198,6 +237,47 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
         self
     }
 
+    fn key_stats_outcome(
+        source_label: &str,
+        delta_label: &str,
+        source_stats: &KeyStats,
+        delta_stats: &KeyStats,
+    ) -> TableOutcome {
+        if source_stats == delta_stats {
+            TableOutcome::Pass
+        } else if source_stats.distinct == delta_stats.distinct
+            && source_stats.min == delta_stats.min
+            && source_stats.max == delta_stats.max
+            && source_stats.distinct_xor == delta_stats.distinct_xor
+        {
+            TableOutcome::Pass
+        } else if delta_stats.distinct < source_stats.distinct
+            && (delta_stats.max.is_none()
+                || (source_stats.max.is_some() && delta_stats.max <= source_stats.max))
+            && (delta_stats.min.is_none()
+                || (source_stats.min.is_some() && delta_stats.min >= source_stats.min))
+        {
+            TableOutcome::Drift {
+                reason: format!(
+                    "{source_label} advanced past sync: {source_label} distinct={} {delta_label} distinct={} — likely new/changed rows since sync, not a sync error",
+                    source_stats.distinct, delta_stats.distinct
+                ),
+            }
+        } else {
+            TableOutcome::Discrepancy {
+                reason: format!(
+                    "{delta_label} has ids/rows not in {source_label}: {source_label}(distinct={} min={:?} max={:?}) {delta_label}(distinct={} min={:?} max={:?})",
+                    source_stats.distinct,
+                    source_stats.min,
+                    source_stats.max,
+                    delta_stats.distinct,
+                    delta_stats.min,
+                    delta_stats.max
+                ),
+            }
+        }
+    }
+
     /// VS2b: drift-gated tiered verdict + exit codes.
     /// Per-table verdict logic:
     /// 1. Schema: if missing_in_delta -> Discrepancy
@@ -238,81 +318,96 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
             };
             println!(
                 "verify {table} schema: source_cols={} delta_cols={} missing_in_delta={:?} extra_in_delta={:?}  [{schema_flag}]",
-                scols.len(), dcols.len(), missing_in_delta, extra_in_delta
+                scols.len(),
+                dcols.len(),
+                missing_in_delta,
+                extra_in_delta
             );
+            let has_id = scols.iter().any(|c| c.name == "id");
 
-            let src_row_count = self.source.row_count(table).await?;
-            let dlt_row_count = self.delta.row_count(table).await?;
-            let flag = if src_row_count == dlt_row_count {
-                "match"
-            } else {
-                "differ — see verdict"
+            let incremental_scope = match &plan.mode {
+                VerifyMode::Incremental {
+                    cursor_col,
+                    hwm: Some(hwm),
+                } => Some(SourceScope {
+                    cursor_col: cursor_col.clone(),
+                    updated_at: hwm.updated_at.clone(),
+                    last_id: hwm.last_id,
+                }),
+                _ => None,
             };
-            println!("verify {table}: source={src_row_count} delta={dlt_row_count}  [{flag}]");
 
-            // Capture delta key_stats for append-log detection
             let mut delta_keystats: Option<KeyStats> = None;
+            let skip_pass_layers_reason = if incremental_scope.is_some() {
+                Some("incremental scoped value reconciliation is deferred")
+            } else {
+                None
+            };
 
-            // Compute verdict
+            let src_row_count;
+            let delta_label;
+            if let Some(scope) = incremental_scope.as_ref().filter(|_| has_id) {
+                src_row_count = self.source.row_count_scoped(table, scope).await?;
+                delta_label = "delta_latest";
+                let delta_stats = self
+                    .delta
+                    .latest_key_stats(table, "id", &scope.cursor_col)
+                    .await?;
+                let dlt_row_count = delta_stats.count;
+                let flag = if src_row_count == dlt_row_count {
+                    "match"
+                } else {
+                    "differ — see verdict"
+                };
+                println!(
+                    "verify {table} incremental scope: source_scoped={src_row_count} delta_latest={dlt_row_count} cursor={} hwm={}  [{flag}]",
+                    scope.cursor_col,
+                    format!("updated_at={} last_id={}", scope.updated_at, scope.last_id)
+                );
+                delta_keystats = Some(delta_stats);
+            } else {
+                src_row_count = self.source.row_count(table).await?;
+                let dlt_row_count = self.delta.row_count(table).await?;
+                delta_label = "delta";
+                let flag = if src_row_count == dlt_row_count {
+                    "match"
+                } else {
+                    "differ — see verdict"
+                };
+                println!("verify {table}: source={src_row_count} delta={dlt_row_count}  [{flag}]");
+            }
+
             let outcome = if !missing_in_delta.is_empty() {
-                // SCHEMA: missing columns
                 TableOutcome::Discrepancy {
                     reason: format!("missing columns in Delta: {:?}", missing_in_delta),
                 }
             } else if !self.deep && src_row_count > self.row_cap {
-                // SIZE GUARD: skip large tables unless deep is enabled
                 TableOutcome::Skipped {
                     reason: format!(
                         "table has {src_row_count} rows (> cap {cap}); pass --verify-deep to force strict checks",
                         cap = self.row_cap
                     ),
                 }
-            } else if !scols.iter().any(|c| c.name == "id") {
-                // No id column for key-set verdict
+            } else if !has_id {
                 TableOutcome::Skipped {
                     reason: "no `id` column for key-set verdict".to_string(),
                 }
+            } else if let Some(scope) = incremental_scope.as_ref() {
+                let s = self.source.key_stats_scoped(table, "id", scope).await?;
+                let d = delta_keystats.clone().unwrap_or(
+                    self.delta
+                        .latest_key_stats(table, "id", &scope.cursor_col)
+                        .await?,
+                );
+                delta_keystats = Some(d.clone());
+                Self::key_stats_outcome("source_scoped", "delta_latest", &s, &d)
             } else {
-                // Compute key-set verdict
                 let s = self.source.key_stats(table, "id").await?;
                 let d = self.delta.key_stats(table, "id").await?;
                 delta_keystats = Some(d.clone());
-
-                if s == d {
-                    // Full match
-                    TableOutcome::Pass
-                } else if s.distinct == d.distinct
-                    && s.min == d.min
-                    && s.max == d.max
-                    && s.distinct_xor == d.distinct_xor
-                {
-                    // Distinct fallback: same unique ids and their fingerprint
-                    TableOutcome::Pass
-                } else if d.distinct <= s.distinct
-                    && (d.max.is_none() || (s.max.is_some() && d.max <= s.max))
-                    && (d.min.is_none() || (s.min.is_some() && d.min >= s.min))
-                {
-                    // Drift: Delta's range is inside source's range
-                    TableOutcome::Drift {
-                        reason: format!(
-                            "source advanced past sync: source distinct={} delta distinct={} — \
-                             likely new/changed rows since sync, not a sync error",
-                            s.distinct, d.distinct
-                        ),
-                    }
-                } else {
-                    // Discrepancy: Delta has ids not in source or range mismatch
-                    TableOutcome::Discrepancy {
-                        reason: format!(
-                            "Delta has ids/rows not in source: source(distinct={} min={:?} max={:?}) \
-                             delta(distinct={} min={:?} max={:?})",
-                            s.distinct, s.min, s.max, d.distinct, d.min, d.max
-                        ),
-                    }
-                }
+                Self::key_stats_outcome("source", delta_label, &s, &d)
             };
 
-            // Print per-table verdict
             match &outcome {
                 TableOutcome::Pass => {
                     println!("verify {table} VERDICT: PASS");
@@ -328,116 +423,122 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                 }
             }
 
-            // Run non-null census on Pass tables
             if matches!(&outcome, TableOutcome::Pass) {
-                let delta_appendlog = matches!(&delta_keystats, Some(d) if d.count != d.distinct);
-                if delta_appendlog {
-                    let d = delta_keystats.as_ref().unwrap();
-                    println!(
-                        "verify {table} non-null census: skipped (Delta is append-log: {} rows / {} distinct ids — needs latest-per-id dedup)",
-                        d.count, d.distinct
-                    );
-                    println!(
-                        "verify {table} sample: skipped (Delta is append-log: {} rows / {} distinct ids)",
-                        d.count, d.distinct
-                    );
+                if let Some(reason) = skip_pass_layers_reason {
+                    println!("verify {table} non-null census: skipped ({reason})");
+                    println!("verify {table} sample: skipped ({reason})");
                 } else {
-                    let common: Vec<String> = scols
-                        .iter()
-                        .filter(|c| dnames.contains(c.name.as_str()))
-                        .map(|c| c.name.clone())
-                        .collect();
-                    if !common.is_empty() {
-                        let scounts = self.source.non_null_counts(table, &common).await?;
-                        let dcounts = self.delta.non_null_counts(table, &common).await?;
-                        let diffs: Vec<(String, i64, i64)> = common
+                    let delta_appendlog =
+                        matches!(&delta_keystats, Some(d) if d.count != d.distinct);
+                    if delta_appendlog {
+                        let d = delta_keystats.as_ref().unwrap();
+                        println!(
+                            "verify {table} non-null census: skipped (Delta is append-log: {} rows / {} distinct ids — needs latest-per-id dedup)",
+                            d.count, d.distinct
+                        );
+                        println!(
+                            "verify {table} sample: skipped (Delta is append-log: {} rows / {} distinct ids)",
+                            d.count, d.distinct
+                        );
+                    } else {
+                        let common: Vec<String> = scols
                             .iter()
-                            .zip(scounts.iter())
-                            .zip(dcounts.iter())
-                            .filter_map(|((col, s), d)| {
-                                if s != d {
-                                    Some((col.clone(), *s, *d))
-                                } else {
-                                    None
-                                }
-                            })
+                            .filter(|c| dnames.contains(c.name.as_str()))
+                            .map(|c| c.name.clone())
                             .collect();
-                        if diffs.is_empty() {
-                            println!(
-                                "verify {table} non-null census: {} columns match",
-                                common.len()
-                            );
-                        } else {
-                            let diff_str = diffs
+                        if !common.is_empty() {
+                            let scounts = self.source.non_null_counts(table, &common).await?;
+                            let dcounts = self.delta.non_null_counts(table, &common).await?;
+                            let diffs: Vec<(String, i64, i64)> = common
                                 .iter()
-                                .map(|(col, s, d)| format!("{col}={s}/{d}"))
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            println!(
-                                "verify {table} non-null census: DIFFERS in {} column(s): {diff_str}",
-                                diffs.len()
-                            );
+                                .zip(scounts.iter())
+                                .zip(dcounts.iter())
+                                .filter_map(|((col, s), d)| {
+                                    if s != d {
+                                        Some((col.clone(), *s, *d))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            if diffs.is_empty() {
+                                println!(
+                                    "verify {table} non-null census: {} columns match",
+                                    common.len()
+                                );
+                            } else {
+                                let diff_str = diffs
+                                    .iter()
+                                    .map(|(col, s, d)| format!("{col}={s}/{d}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                println!(
+                                    "verify {table} non-null census: DIFFERS in {} column(s): {diff_str}",
+                                    diffs.len()
+                                );
+                            }
                         }
-                    }
 
-                    // Run value spot-check on comparable columns
-                    let comparable: Vec<String> = scols
-                        .iter()
-                        .filter(|c| {
-                            dnames.contains(c.name.as_str())
-                                && is_value_comparable(&c.type_str)
-                                && c.name != "id"
-                        })
-                        .map(|c| c.name.clone())
-                        .collect();
-                    if !comparable.is_empty() {
-                        let ids = self.source.sample_ids(table, "id", SAMPLE_SIZE).await?;
-                        if !ids.is_empty() {
-                            let srows = self
-                                .source
-                                .sample_rows(table, "id", &comparable, &ids)
-                                .await?;
-                            let drows = self
-                                .delta
-                                .sample_rows(table, "id", &comparable, &ids)
-                                .await?;
-                            let mut matched = 0;
-                            let mut missing = 0;
-                            let mut differing: Vec<(i64, Vec<String>)> = vec![];
-                            for id in &ids {
-                                match (srows.get(id), drows.get(id)) {
-                                    (Some(sv), Some(dv)) => {
-                                        let diff_cols: Vec<String> = comparable
-                                            .iter()
-                                            .enumerate()
-                                            .filter_map(|(i, c)| {
-                                                if sv.get(i) != dv.get(i) {
-                                                    Some(c.clone())
-                                                } else {
-                                                    None
-                                                }
-                                            })
-                                            .collect();
-                                        if diff_cols.is_empty() {
-                                            matched += 1;
-                                        } else {
-                                            differing.push((*id, diff_cols));
+                        let comparable: Vec<String> = scols
+                            .iter()
+                            .filter(|c| {
+                                dnames.contains(c.name.as_str())
+                                    && is_value_comparable(&c.type_str)
+                                    && c.name != "id"
+                            })
+                            .map(|c| c.name.clone())
+                            .collect();
+                        if !comparable.is_empty() {
+                            let ids = self.source.sample_ids(table, "id", SAMPLE_SIZE).await?;
+                            if !ids.is_empty() {
+                                let srows = self
+                                    .source
+                                    .sample_rows(table, "id", &comparable, &ids)
+                                    .await?;
+                                let drows = self
+                                    .delta
+                                    .sample_rows(table, "id", &comparable, &ids)
+                                    .await?;
+                                let mut matched = 0;
+                                let mut missing = 0;
+                                let mut differing: Vec<(i64, Vec<String>)> = vec![];
+                                for id in &ids {
+                                    match (srows.get(id), drows.get(id)) {
+                                        (Some(sv), Some(dv)) => {
+                                            let diff_cols: Vec<String> = comparable
+                                                .iter()
+                                                .enumerate()
+                                                .filter_map(|(i, c)| {
+                                                    if sv.get(i) != dv.get(i) {
+                                                        Some(c.clone())
+                                                    } else {
+                                                        None
+                                                    }
+                                                })
+                                                .collect();
+                                            if diff_cols.is_empty() {
+                                                matched += 1;
+                                            } else {
+                                                differing.push((*id, diff_cols));
+                                            }
+                                        }
+                                        _ => {
+                                            missing += 1;
                                         }
                                     }
-                                    _ => {
-                                        missing += 1;
-                                    }
                                 }
-                            }
-                            println!(
-                                "verify {table} sample: checked={} match={} differ={} missing={}",
-                                ids.len(),
-                                matched,
-                                differing.len(),
-                                missing
-                            );
-                            for (id, cols) in differing {
-                                println!("verify {table} sample row {id}: differing columns {cols:?}");
+                                println!(
+                                    "verify {table} sample: checked={} match={} differ={} missing={}",
+                                    ids.len(),
+                                    matched,
+                                    differing.len(),
+                                    missing
+                                );
+                                for (id, cols) in differing {
+                                    println!(
+                                        "verify {table} sample row {id}: differing columns {cols:?}"
+                                    );
+                                }
                             }
                         }
                     }
@@ -447,8 +548,10 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
             outcomes.push(outcome);
         }
 
-        // Count outcomes
-        let pass_count = outcomes.iter().filter(|o| **o == TableOutcome::Pass).count();
+        let pass_count = outcomes
+            .iter()
+            .filter(|o| **o == TableOutcome::Pass)
+            .count();
         let drift_count = outcomes
             .iter()
             .filter(|o| matches!(o, TableOutcome::Drift { .. }))
@@ -467,8 +570,10 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
             pass_count, drift_count, discrepancy_count, skipped_count
         );
 
-        // Determine overall verdict
-        if outcomes.iter().any(|o| matches!(o, TableOutcome::Discrepancy { .. })) {
+        if outcomes
+            .iter()
+            .any(|o| matches!(o, TableOutcome::Discrepancy { .. }))
+        {
             Ok(VerifyVerdict::Discrepancy)
         } else {
             Ok(VerifyVerdict::Clean)
@@ -592,8 +697,12 @@ mod tests {
                 distinct_xor: 0,
             })
         });
-        source.expect_non_null_counts().returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
-        delta.expect_non_null_counts().returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        source
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        delta
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
         source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
         let cmd = VerifyCommand::new(
             source,
@@ -697,8 +806,12 @@ mod tests {
         };
         source.expect_key_stats().returning(move |_, _| stats());
         delta.expect_key_stats().returning(move |_, _| stats());
-        source.expect_non_null_counts().returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
-        delta.expect_non_null_counts().returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        source
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        delta
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
         source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
         let cmd = VerifyCommand::new(source, delta, vec!["users".to_string()]);
         let result = cmd.run().await;
@@ -733,8 +846,12 @@ mod tests {
         };
         source.expect_key_stats().returning(move |_, _| stats());
         delta.expect_key_stats().returning(move |_, _| stats());
-        source.expect_non_null_counts().returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
-        delta.expect_non_null_counts().returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        source
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        delta
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
         source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
         let cmd = VerifyCommand::new(source, delta, vec!["items".to_string()]);
         let result = cmd.run().await;
@@ -1007,8 +1124,12 @@ mod tests {
         };
         source.expect_key_stats().returning(move |_, _| stats());
         delta.expect_key_stats().returning(move |_, _| stats());
-        source.expect_non_null_counts().returning(|_, _| Ok(vec![10, 8]));
-        delta.expect_non_null_counts().returning(|_, _| Ok(vec![10, 8]));
+        source
+            .expect_non_null_counts()
+            .returning(|_, _| Ok(vec![10, 8]));
+        delta
+            .expect_non_null_counts()
+            .returning(|_, _| Ok(vec![10, 8]));
         source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
         let cmd = VerifyCommand::new(source, delta, vec!["users".to_string()]);
         let result = cmd.run().await;
@@ -1050,8 +1171,12 @@ mod tests {
         };
         source.expect_key_stats().returning(move |_, _| stats());
         delta.expect_key_stats().returning(move |_, _| stats());
-        source.expect_non_null_counts().returning(|_, _| Ok(vec![10, 8]));
-        delta.expect_non_null_counts().returning(|_, _| Ok(vec![10, 5]));
+        source
+            .expect_non_null_counts()
+            .returning(|_, _| Ok(vec![10, 8]));
+        delta
+            .expect_non_null_counts()
+            .returning(|_, _| Ok(vec![10, 5]));
         source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
         let cmd = VerifyCommand::new(source, delta, vec!["users".to_string()]);
         let result = cmd.run().await;
@@ -1094,9 +1219,15 @@ mod tests {
         };
         source.expect_key_stats().returning(move |_, _| stats());
         delta.expect_key_stats().returning(move |_, _| stats());
-        source.expect_non_null_counts().returning(|_, _| Ok(vec![10, 8]));
-        delta.expect_non_null_counts().returning(|_, _| Ok(vec![10, 8]));
-        source.expect_sample_ids().returning(|_, _, _| Ok(vec![1, 2]));
+        source
+            .expect_non_null_counts()
+            .returning(|_, _| Ok(vec![10, 8]));
+        delta
+            .expect_non_null_counts()
+            .returning(|_, _| Ok(vec![10, 8]));
+        source
+            .expect_sample_ids()
+            .returning(|_, _, _| Ok(vec![1, 2]));
         let mut sample_rows_map = std::collections::HashMap::new();
         sample_rows_map.insert(1i64, vec![Some("a".to_string())]);
         sample_rows_map.insert(2i64, vec![Some("b".to_string())]);
@@ -1148,9 +1279,15 @@ mod tests {
         };
         source.expect_key_stats().returning(move |_, _| stats());
         delta.expect_key_stats().returning(move |_, _| stats());
-        source.expect_non_null_counts().returning(|_, _| Ok(vec![10, 8]));
-        delta.expect_non_null_counts().returning(|_, _| Ok(vec![10, 8]));
-        source.expect_sample_ids().returning(|_, _, _| Ok(vec![1, 2]));
+        source
+            .expect_non_null_counts()
+            .returning(|_, _| Ok(vec![10, 8]));
+        delta
+            .expect_non_null_counts()
+            .returning(|_, _| Ok(vec![10, 8]));
+        source
+            .expect_sample_ids()
+            .returning(|_, _, _| Ok(vec![1, 2]));
         let mut source_rows_map = std::collections::HashMap::new();
         source_rows_map.insert(1i64, vec![Some("a".to_string())]);
         source_rows_map.insert(2i64, vec![Some("b".to_string())]);
@@ -1172,4 +1309,231 @@ mod tests {
         assert_eq!(result.unwrap(), VerifyVerdict::Clean);
     }
 
+    #[tokio::test]
+    async fn verify_incremental_hwm_scoped_latest_pass() {
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        let cols = || {
+            Ok(vec![
+                ColumnMeta {
+                    name: "id".to_string(),
+                    type_str: "bigint".to_string(),
+                    nullable: false,
+                },
+                ColumnMeta {
+                    name: "updated_at".to_string(),
+                    type_str: "timestamp".to_string(),
+                    nullable: false,
+                },
+            ])
+        };
+        source.expect_columns().returning(move |_| cols());
+        delta.expect_columns().returning(move |_| cols());
+        source.expect_row_count_scoped().returning(|_, scope| {
+            assert_eq!(scope.cursor_col, "updated_at");
+            assert_eq!(scope.updated_at, "2026-06-30 12:00:00");
+            assert_eq!(scope.last_id, 42);
+            Ok(2)
+        });
+        source
+            .expect_key_stats_scoped()
+            .returning(|_, key_col, scope| {
+                assert_eq!(key_col, "id");
+                assert_eq!(scope.cursor_col, "updated_at");
+                Ok(KeyStats {
+                    count: 2,
+                    distinct: 2,
+                    min: Some(43),
+                    max: Some(44),
+                    xor: 7,
+                    distinct_xor: 7,
+                })
+            });
+        delta
+            .expect_latest_key_stats()
+            .returning(|_, key_col, cursor_col| {
+                assert_eq!(key_col, "id");
+                assert_eq!(cursor_col, "updated_at");
+                Ok(KeyStats {
+                    count: 2,
+                    distinct: 2,
+                    min: Some(43),
+                    max: Some(44),
+                    xor: 7,
+                    distinct_xor: 7,
+                })
+            });
+        let cmd =
+            VerifyCommand::new(source, delta, vec!["orders".to_string()]).with_table_plans(vec![
+                TablePlan {
+                    table: "orders".to_string(),
+                    mode: VerifyMode::Incremental {
+                        cursor_col: "updated_at".to_string(),
+                        hwm: Some(Hwm {
+                            updated_at: "2026-06-30 12:00:00".to_string(),
+                            last_id: 42,
+                        }),
+                    },
+                },
+            ]);
+        let result = cmd.run().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), VerifyVerdict::Clean);
+    }
+
+    #[tokio::test]
+    async fn verify_incremental_hwm_scoped_latest_discrepancy() {
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        let cols = || {
+            Ok(vec![
+                ColumnMeta {
+                    name: "id".to_string(),
+                    type_str: "bigint".to_string(),
+                    nullable: false,
+                },
+                ColumnMeta {
+                    name: "updated_at".to_string(),
+                    type_str: "timestamp".to_string(),
+                    nullable: false,
+                },
+            ])
+        };
+        source.expect_columns().returning(move |_| cols());
+        delta.expect_columns().returning(move |_| cols());
+        source.expect_row_count_scoped().returning(|_, _| Ok(2));
+        source.expect_key_stats_scoped().returning(|_, _, _| {
+            Ok(KeyStats {
+                count: 2,
+                distinct: 2,
+                min: Some(43),
+                max: Some(44),
+                xor: 7,
+                distinct_xor: 7,
+            })
+        });
+        delta.expect_latest_key_stats().returning(|_, _, _| {
+            Ok(KeyStats {
+                count: 2,
+                distinct: 2,
+                min: Some(43),
+                max: Some(99),
+                xor: 12,
+                distinct_xor: 12,
+            })
+        });
+        let cmd =
+            VerifyCommand::new(source, delta, vec!["orders".to_string()]).with_table_plans(vec![
+                TablePlan {
+                    table: "orders".to_string(),
+                    mode: VerifyMode::Incremental {
+                        cursor_col: "updated_at".to_string(),
+                        hwm: Some(Hwm {
+                            updated_at: "2026-06-30 12:00:00".to_string(),
+                            last_id: 42,
+                        }),
+                    },
+                },
+            ]);
+        let result = cmd.run().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), VerifyVerdict::Discrepancy);
+    }
+
+    #[tokio::test]
+    async fn verify_incremental_hwm_without_id_skips_key_set() {
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        let cols = || {
+            Ok(vec![ColumnMeta {
+                name: "updated_at".to_string(),
+                type_str: "timestamp".to_string(),
+                nullable: false,
+            }])
+        };
+        source.expect_columns().returning(move |_| cols());
+        delta.expect_columns().returning(move |_| cols());
+        source.expect_row_count().returning(|_| Ok(2));
+        delta.expect_row_count().returning(|_| Ok(2));
+        let cmd =
+            VerifyCommand::new(source, delta, vec!["orders".to_string()]).with_table_plans(vec![
+                TablePlan {
+                    table: "orders".to_string(),
+                    mode: VerifyMode::Incremental {
+                        cursor_col: "updated_at".to_string(),
+                        hwm: Some(Hwm {
+                            updated_at: "2026-06-30 12:00:00".to_string(),
+                            last_id: 42,
+                        }),
+                    },
+                },
+            ]);
+        let result = cmd.run().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), VerifyVerdict::Clean);
+    }
+
+    #[tokio::test]
+    async fn verify_incremental_without_hwm_uses_raw_path() {
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        source.expect_row_count().returning(|_| Ok(5));
+        delta.expect_row_count().returning(|_| Ok(5));
+        let cols = || {
+            Ok(vec![
+                ColumnMeta {
+                    name: "id".to_string(),
+                    type_str: "bigint".to_string(),
+                    nullable: false,
+                },
+                ColumnMeta {
+                    name: "updated_at".to_string(),
+                    type_str: "timestamp".to_string(),
+                    nullable: false,
+                },
+            ])
+        };
+        source.expect_columns().returning(move |_| cols());
+        delta.expect_columns().returning(move |_| cols());
+        source.expect_key_stats().returning(|_, _| {
+            Ok(KeyStats {
+                count: 5,
+                distinct: 5,
+                min: Some(1),
+                max: Some(5),
+                xor: 7,
+                distinct_xor: 7,
+            })
+        });
+        delta.expect_key_stats().returning(|_, _| {
+            Ok(KeyStats {
+                count: 5,
+                distinct: 5,
+                min: Some(1),
+                max: Some(5),
+                xor: 7,
+                distinct_xor: 7,
+            })
+        });
+        source
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        delta
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
+        let cmd =
+            VerifyCommand::new(source, delta, vec!["orders".to_string()]).with_table_plans(vec![
+                TablePlan {
+                    table: "orders".to_string(),
+                    mode: VerifyMode::Incremental {
+                        cursor_col: "updated_at".to_string(),
+                        hwm: None,
+                    },
+                },
+            ]);
+        let result = cmd.run().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), VerifyVerdict::Clean);
+    }
 }

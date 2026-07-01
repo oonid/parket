@@ -3,8 +3,8 @@ use deltalake::arrow::array::{Array, Int64Array, StringArray, StringViewArray};
 use deltalake::datafusion::prelude::SessionContext;
 use std::collections::HashMap;
 
+use super::{ColumnMeta, DeltaProbe, KeyStats};
 use crate::writer::DeltaWriter;
-use super::{ColumnMeta, KeyStats, DeltaProbe};
 
 pub struct DeltaProbeAdapter {
     writer: DeltaWriter,
@@ -19,7 +19,11 @@ impl DeltaProbe for DeltaProbeAdapter {
         let t = self.writer.open_table(table).await?;
         let ctx = SessionContext::new();
         ctx.register_table("t", t.table_provider().await?)?;
-        let batches = ctx.sql("SELECT count(*) AS n FROM t").await?.collect().await?;
+        let batches = ctx
+            .sql("SELECT count(*) AS n FROM t")
+            .await?
+            .collect()
+            .await?;
         let n = batches
             .first()
             .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
@@ -76,6 +80,44 @@ impl DeltaProbe for DeltaProbeAdapter {
         })
     }
 
+    async fn latest_key_stats(
+        &self,
+        table: &str,
+        key_col: &str,
+        cursor_col: &str,
+    ) -> Result<KeyStats> {
+        let t = self.writer.open_table(table).await?;
+        let ctx = SessionContext::new();
+        ctx.register_table("t", t.table_provider().await?)?;
+        let sql = format!(
+            "WITH ranked AS (              SELECT cast(`{key_col}` as bigint) AS key_value,                     row_number() OVER (PARTITION BY cast(`{key_col}` as bigint) ORDER BY `{cursor_col}` DESC) AS rn              FROM t              )              SELECT count(*) AS c, count(distinct key_value) AS d,                     min(key_value) AS mn, max(key_value) AS mx,                     bit_xor(key_value) AS x, bit_xor(distinct key_value) AS dx              FROM ranked WHERE rn = 1"
+        );
+        let batches = ctx.sql(&sql).await?.collect().await?;
+        let b = batches
+            .first()
+            .context("delta latest_key_stats: empty result")?;
+        let col_opt = |i: usize| -> Option<i64> {
+            b.column(i)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .and_then(|a| {
+                    if a.is_empty() || a.is_null(0) {
+                        None
+                    } else {
+                        Some(a.value(0))
+                    }
+                })
+        };
+        Ok(KeyStats {
+            count: col_opt(0).unwrap_or(0),
+            distinct: col_opt(1).unwrap_or(0),
+            min: col_opt(2),
+            max: col_opt(3),
+            xor: col_opt(4).unwrap_or(0),
+            distinct_xor: col_opt(5).unwrap_or(0),
+        })
+    }
+
     async fn non_null_counts(&self, table: &str, columns: &[String]) -> Result<Vec<i64>> {
         if columns.is_empty() {
             return Ok(vec![]);
@@ -91,10 +133,13 @@ impl DeltaProbe for DeltaProbeAdapter {
             .join(", ");
         let sql = format!("SELECT {select_list} FROM t");
         let batches = ctx.sql(&sql).await?.collect().await?;
-        let b = batches.first().context("delta non_null_counts: empty result")?;
+        let b = batches
+            .first()
+            .context("delta non_null_counts: empty result")?;
         let mut out = Vec::with_capacity(columns.len());
         for i in 0..columns.len() {
-            let val = b.column(i)
+            let val = b
+                .column(i)
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .and_then(|a| {
@@ -110,7 +155,13 @@ impl DeltaProbe for DeltaProbeAdapter {
         Ok(out)
     }
 
-    async fn sample_rows(&self, table: &str, id_col: &str, columns: &[String], ids: &[i64]) -> Result<HashMap<i64, Vec<Option<String>>>> {
+    async fn sample_rows(
+        &self,
+        table: &str,
+        id_col: &str,
+        columns: &[String],
+        ids: &[i64],
+    ) -> Result<HashMap<i64, Vec<Option<String>>>> {
         if columns.is_empty() || ids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -127,11 +178,13 @@ impl DeltaProbe for DeltaProbeAdapter {
             .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        let sql = format!("SELECT {select_list} FROM t WHERE cast(`{id_col}` as bigint) IN ({ids_list})");
+        let sql =
+            format!("SELECT {select_list} FROM t WHERE cast(`{id_col}` as bigint) IN ({ids_list})");
         let batches = ctx.sql(&sql).await?.collect().await?;
         let mut map = HashMap::new();
         for b in batches {
-            let id_col_arr = b.column(0)
+            let id_col_arr = b
+                .column(0)
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .context("delta sample_rows: id column is not Int64Array")?;
@@ -171,8 +224,8 @@ impl DeltaProbe for DeltaProbeAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deltalake::arrow::datatypes::{DataType, Field};
     use deltalake::arrow::array::StringArray;
+    use deltalake::arrow::datatypes::{DataType, Field};
     use deltalake::arrow::record_batch::RecordBatch;
 
     #[tokio::test]
@@ -297,11 +350,7 @@ mod tests {
         let counts = probe
             .non_null_counts(
                 "orders",
-                &[
-                    "id".to_string(),
-                    "name".to_string(),
-                    "qty".to_string(),
-                ],
+                &["id".to_string(), "name".to_string(), "qty".to_string()],
             )
             .await
             .unwrap();
@@ -347,10 +396,7 @@ mod tests {
             rows.get(&1),
             Some(&vec![Some("a".to_string()), Some("10".to_string())])
         );
-        assert_eq!(
-            rows.get(&2),
-            Some(&vec![None, Some("20".to_string())])
-        );
+        assert_eq!(rows.get(&2), Some(&vec![None, Some("20".to_string())]));
         assert_eq!(
             rows.get(&3),
             Some(&vec![Some("c".to_string()), Some("30".to_string())])
