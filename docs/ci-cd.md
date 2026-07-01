@@ -26,7 +26,7 @@ Parket uses two GitHub Actions workflows: **CI** for continuous quality checks a
 
 **File:** `.github/workflows/release.yml`
 
-**Trigger:** Push of a version tag (`v*`, e.g. `v0.1.0`).
+**Trigger:** Push of a version tag (`v*`, e.g. `v0.1.1`).
 
 ### Jobs
 
@@ -62,7 +62,7 @@ Builds a multi-arch Docker image and pushes to GitHub Container Registry.
 
 **Image tags:**
 - `ghcr.io/oonid/parket:latest`
-- `ghcr.io/oonid/parket:<version>` (extracted from tag, e.g. `0.1.0`)
+- `ghcr.io/oonid/parket:<version>` (extracted from tag, e.g. `0.1.1`)
 
 **Platforms:** `linux/amd64`, `linux/arm64`
 
@@ -76,8 +76,8 @@ Builds a multi-arch Docker image and pushes to GitHub Container Registry.
 To create a release:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 This triggers the release workflow which:

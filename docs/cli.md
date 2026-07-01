@@ -259,13 +259,13 @@ On every normal invocation (not `--check`), parket logs an INFO startup banner.
 S3 mode:
 
 ```
-parket v0.1.0 starting  version=0.1.0 tables=3 database_host="mysql://****:****@dbhost:3306" s3_bucket=data-lake
+parket v0.1.1 starting  version=0.1.1 tables=3 database_host="mysql://****:****@dbhost:3306" s3_bucket=data-lake
 ```
 
 Local mode:
 
 ```
-parket v0.1.0 starting (local mode)  version=0.1.0 tables=3 database_host="mysql://****:****@dbhost:3306" local_dir=/data/delta
+parket v0.1.1 starting (local mode)  version=0.1.1 tables=3 database_host="mysql://****:****@dbhost:3306" local_dir=/data/delta
 ```
 
 Sensitive values (database password, S3 secret key) are masked via
