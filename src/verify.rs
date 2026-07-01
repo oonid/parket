@@ -278,6 +278,65 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
         }
     }
 
+    fn two_stream_key_stats_outcome(
+        source_label: &str,
+        delta_label: &str,
+        source_stats: &KeyStats,
+        delta_stats: &KeyStats,
+    ) -> TableOutcome {
+        if source_stats == delta_stats {
+            return TableOutcome::Pass;
+        }
+
+        let source_range_contained_by_delta = match (source_stats.min, source_stats.max) {
+            (None, None) => true,
+            (Some(source_min), Some(source_max)) => match (delta_stats.min, delta_stats.max) {
+                (Some(delta_min), Some(delta_max)) => {
+                    delta_min <= source_min && source_max <= delta_max
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+
+        let delta_has_extra_evidence = source_stats.count < delta_stats.count
+            || source_stats.distinct < delta_stats.distinct;
+
+        if delta_has_extra_evidence
+            && source_stats.count <= delta_stats.count
+            && source_stats.distinct <= delta_stats.distinct
+            && source_range_contained_by_delta
+        {
+            TableOutcome::Drift {
+                reason: format!(
+                    "{delta_label} may legitimately retain extra ids/rows in two_stream mode: aggregate stats show {source_label}(count={} distinct={} min={:?} max={:?}) within {delta_label}(count={} distinct={} min={:?} max={:?}), but this does not prove exact set equality",
+                    source_stats.count,
+                    source_stats.distinct,
+                    source_stats.min,
+                    source_stats.max,
+                    delta_stats.count,
+                    delta_stats.distinct,
+                    delta_stats.min,
+                    delta_stats.max
+                ),
+            }
+        } else {
+            TableOutcome::Discrepancy {
+                reason: format!(
+                    "{source_label} appears to have ids/rows missing from {delta_label} in two_stream mode: {source_label}(count={} distinct={} min={:?} max={:?}) {delta_label}(count={} distinct={} min={:?} max={:?})",
+                    source_stats.count,
+                    source_stats.distinct,
+                    source_stats.min,
+                    source_stats.max,
+                    delta_stats.count,
+                    delta_stats.distinct,
+                    delta_stats.min,
+                    delta_stats.max
+                ),
+            }
+        }
+    }
+
     /// VS2b: drift-gated tiered verdict + exit codes.
     /// Per-table verdict logic:
     /// 1. Schema: if missing_in_delta -> Discrepancy
@@ -286,6 +345,7 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
     ///    - Full match (all fields equal) -> Pass
     ///    - Distinct fallback (distinct+min+max+distinct_xor match) -> Pass
     ///    - Drift (delta range inside source range, delta smaller) -> Drift (not a failure)
+    ///    - Two-stream uses a separate conservative asymmetry path
     ///    - Else -> Discrepancy
     pub async fn run(&self) -> Result<VerifyVerdict> {
         let mut outcomes = Vec::new();
@@ -405,7 +465,11 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                 let s = self.source.key_stats(table, "id").await?;
                 let d = self.delta.key_stats(table, "id").await?;
                 delta_keystats = Some(d.clone());
-                Self::key_stats_outcome("source", delta_label, &s, &d)
+                if matches!(&plan.mode, VerifyMode::TwoStream { .. }) {
+                    Self::two_stream_key_stats_outcome("source", delta_label, &s, &d)
+                } else {
+                    Self::key_stats_outcome("source", delta_label, &s, &d)
+                }
             };
 
             match &outcome {
@@ -1033,6 +1097,213 @@ mod tests {
         assert!(result.is_ok());
         // Pass due to distinct-fallback, but census/sample are skipped (no panic on unexpected calls)
         assert_eq!(result.unwrap(), VerifyVerdict::Clean);
+    }
+
+    #[tokio::test]
+    async fn verify_two_stream_exact_key_stats_pass() {
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        source.expect_row_count().returning(|_| Ok(4));
+        delta.expect_row_count().returning(|_| Ok(4));
+        let cols = || {
+            Ok(vec![ColumnMeta {
+                name: "id".to_string(),
+                type_str: "bigint".to_string(),
+                nullable: false,
+            }])
+        };
+        source.expect_columns().returning(move |_| cols());
+        delta.expect_columns().returning(move |_| cols());
+        let stats = || {
+            Ok(KeyStats {
+                count: 4,
+                distinct: 4,
+                min: Some(10),
+                max: Some(13),
+                xor: 3,
+                distinct_xor: 3,
+            })
+        };
+        source.expect_key_stats().returning(move |_, _| stats());
+        delta.expect_key_stats().returning(move |_, _| stats());
+        source
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        delta
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
+        let cmd =
+            VerifyCommand::new(source, delta, vec!["users".to_string()]).with_table_plans(vec![
+                TablePlan {
+                    table: "users".to_string(),
+                    mode: VerifyMode::TwoStream {
+                        insert_cursor: "id".to_string(),
+                        update_cursor: "updated_at".to_string(),
+                        update_hwm: None,
+                        insert_hwm: Some(13),
+                    },
+                },
+            ]);
+        let result = cmd.run().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), VerifyVerdict::Clean);
+    }
+
+    #[tokio::test]
+    async fn verify_two_stream_delta_superset_is_non_failing_drift() {
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        source.expect_row_count().returning(|_| Ok(3));
+        delta.expect_row_count().returning(|_| Ok(5));
+        let cols = || {
+            Ok(vec![ColumnMeta {
+                name: "id".to_string(),
+                type_str: "bigint".to_string(),
+                nullable: false,
+            }])
+        };
+        source.expect_columns().returning(move |_| cols());
+        delta.expect_columns().returning(move |_| cols());
+        source.expect_key_stats().returning(|_, _| {
+            Ok(KeyStats {
+                count: 3,
+                distinct: 3,
+                min: Some(2),
+                max: Some(4),
+                xor: 4,
+                distinct_xor: 4,
+            })
+        });
+        delta.expect_key_stats().returning(|_, _| {
+            Ok(KeyStats {
+                count: 5,
+                distinct: 5,
+                min: Some(1),
+                max: Some(6),
+                xor: 1,
+                distinct_xor: 1,
+            })
+        });
+        let cmd =
+            VerifyCommand::new(source, delta, vec!["users".to_string()]).with_table_plans(vec![
+                TablePlan {
+                    table: "users".to_string(),
+                    mode: VerifyMode::TwoStream {
+                        insert_cursor: "id".to_string(),
+                        update_cursor: "updated_at".to_string(),
+                        update_hwm: None,
+                        insert_hwm: Some(6),
+                    },
+                },
+            ]);
+        let result = cmd.run().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), VerifyVerdict::Clean);
+    }
+
+    #[tokio::test]
+    async fn verify_two_stream_equal_size_key_mismatch_is_discrepancy() {
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        source.expect_row_count().returning(|_| Ok(3));
+        delta.expect_row_count().returning(|_| Ok(3));
+        let cols = || {
+            Ok(vec![ColumnMeta {
+                name: "id".to_string(),
+                type_str: "bigint".to_string(),
+                nullable: false,
+            }])
+        };
+        source.expect_columns().returning(move |_| cols());
+        delta.expect_columns().returning(move |_| cols());
+        source.expect_key_stats().returning(|_, _| {
+            Ok(KeyStats {
+                count: 3,
+                distinct: 3,
+                min: Some(2),
+                max: Some(4),
+                xor: 5,
+                distinct_xor: 5,
+            })
+        });
+        delta.expect_key_stats().returning(|_, _| {
+            Ok(KeyStats {
+                count: 3,
+                distinct: 3,
+                min: Some(1),
+                max: Some(5),
+                xor: 7,
+                distinct_xor: 7,
+            })
+        });
+        let cmd =
+            VerifyCommand::new(source, delta, vec!["users".to_string()]).with_table_plans(vec![
+                TablePlan {
+                    table: "users".to_string(),
+                    mode: VerifyMode::TwoStream {
+                        insert_cursor: "id".to_string(),
+                        update_cursor: "updated_at".to_string(),
+                        update_hwm: None,
+                        insert_hwm: Some(5),
+                    },
+                },
+            ]);
+        let result = cmd.run().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), VerifyVerdict::Discrepancy);
+    }
+
+    #[tokio::test]
+    async fn verify_two_stream_source_missing_from_delta_is_discrepancy() {
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        source.expect_row_count().returning(|_| Ok(5));
+        delta.expect_row_count().returning(|_| Ok(4));
+        let cols = || {
+            Ok(vec![ColumnMeta {
+                name: "id".to_string(),
+                type_str: "bigint".to_string(),
+                nullable: false,
+            }])
+        };
+        source.expect_columns().returning(move |_| cols());
+        delta.expect_columns().returning(move |_| cols());
+        source.expect_key_stats().returning(|_, _| {
+            Ok(KeyStats {
+                count: 5,
+                distinct: 5,
+                min: Some(1),
+                max: Some(7),
+                xor: 2,
+                distinct_xor: 2,
+            })
+        });
+        delta.expect_key_stats().returning(|_, _| {
+            Ok(KeyStats {
+                count: 4,
+                distinct: 4,
+                min: Some(1),
+                max: Some(6),
+                xor: 1,
+                distinct_xor: 1,
+            })
+        });
+        let cmd =
+            VerifyCommand::new(source, delta, vec!["users".to_string()]).with_table_plans(vec![
+                TablePlan {
+                    table: "users".to_string(),
+                    mode: VerifyMode::TwoStream {
+                        insert_cursor: "id".to_string(),
+                        update_cursor: "updated_at".to_string(),
+                        update_hwm: None,
+                        insert_hwm: Some(6),
+                    },
+                },
+            ]);
+        let result = cmd.run().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), VerifyVerdict::Discrepancy);
     }
 
     #[tokio::test]
