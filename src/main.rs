@@ -12,6 +12,7 @@ use parket::preflight::{
     NoopPreflightStorage, PreflightCheck, PreflightHwmAdapter, PreflightInspectAdapter,
     PreflightStorageAdapter,
 };
+use anyhow::Context;
 use parket::writer::DeltaWriter;
 
 fn init_tracing() {
@@ -95,6 +96,59 @@ fn log_startup_banner(config: &config::Config, local_dir: Option<&std::path::Pat
 
 /// Run `--verify` reconciliation against the synced Delta tables.
 /// Returns a process exit code: 0 = clean, 1 = discrepancy, 2 = could not run.
+async fn build_verify_table_plans(
+    config: &config::Config,
+    writer: &DeltaWriter,
+    tables: &[String],
+) -> anyhow::Result<Vec<parket::verify::TablePlan>> {
+    let mut plans = Vec::with_capacity(tables.len());
+
+    for table in tables {
+        let mode = if let Some((insert_cursor, update_cursor)) = config.two_stream(table) {
+            let update_hwm = writer
+                .read_hwm(table)
+                .await
+                .with_context(|| format!("read update HWM for verify table `{table}`"))?;
+            let insert_hwm = writer
+                .read_insert_hwm(table)
+                .await
+                .with_context(|| format!("read insert HWM for verify table `{table}`"))?;
+            parket::verify::VerifyMode::TwoStream {
+                insert_cursor,
+                update_cursor,
+                update_hwm,
+                insert_hwm,
+            }
+        } else if matches!(
+            config.table_modes.get(table),
+            Some(config::ExtractionMode::Incremental)
+        ) {
+            let hwm = writer
+                .read_hwm(table)
+                .await
+                .with_context(|| format!("read HWM for verify table `{table}`"))?;
+            parket::verify::VerifyMode::Incremental {
+                cursor_col: config.timestamp_col(table).to_string(),
+                hwm,
+            }
+        } else if matches!(
+            config.table_modes.get(table),
+            Some(config::ExtractionMode::FullRefresh)
+        ) {
+            parket::verify::VerifyMode::FullRefresh
+        } else {
+            parket::verify::VerifyMode::Basic
+        };
+
+        plans.push(parket::verify::TablePlan {
+            table: table.clone(),
+            mode,
+        });
+    }
+
+    Ok(plans)
+}
+
 async fn run_verify(
     config: &config::Config,
     local_dir: Option<&std::path::Path>,
@@ -121,8 +175,17 @@ async fn run_verify(
             &config.s3_secret_access_key,
         )
     };
+    let table_plans = match build_verify_table_plans(config, &writer, &tables).await {
+        Ok(plans) => plans,
+        Err(e) => {
+            eprintln!("verify failed: {e:#}");
+            return 2;
+        }
+    };
     let delta = parket::verify::DeltaProbeAdapter::new(writer);
-    let cmd = parket::verify::VerifyCommand::new(source, delta, tables).with_deep(deep);
+    let cmd = parket::verify::VerifyCommand::new(source, delta, tables)
+        .with_table_plans(table_plans)
+        .with_deep(deep);
     match cmd.run().await {
         Ok(parket::verify::VerifyVerdict::Clean) => 0,
         Ok(parket::verify::VerifyVerdict::Discrepancy) => 1,

@@ -6,6 +6,7 @@ mod delta;
 
 pub use source::SourceProbeAdapter;
 pub use delta::DeltaProbeAdapter;
+use crate::writer::Hwm;
 
 /// Table verdict outcome from verification.
 #[derive(Debug, Clone, PartialEq)]
@@ -21,6 +22,81 @@ pub enum TableOutcome {
 pub enum VerifyVerdict {
     Clean,
     Discrepancy,
+}
+
+#[derive(Debug, Clone)]
+pub enum VerifyMode {
+    Basic,
+    FullRefresh,
+    Incremental {
+        cursor_col: String,
+        hwm: Option<Hwm>,
+    },
+    TwoStream {
+        insert_cursor: String,
+        update_cursor: String,
+        update_hwm: Option<Hwm>,
+        insert_hwm: Option<i64>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct TablePlan {
+    pub table: String,
+    pub mode: VerifyMode,
+}
+
+impl TablePlan {
+    pub fn basic(table: impl Into<String>) -> Self {
+        Self {
+            table: table.into(),
+            mode: VerifyMode::Basic,
+        }
+    }
+
+    fn describe(&self) -> String {
+        format!("mode={}", self.mode.describe())
+    }
+}
+
+impl VerifyMode {
+    fn describe(&self) -> String {
+        match self {
+            VerifyMode::Basic => "basic".to_string(),
+            VerifyMode::FullRefresh => "full_refresh".to_string(),
+            VerifyMode::Incremental { cursor_col, hwm } => {
+                format!(
+                    "incremental cursor={} hwm={}",
+                    cursor_col,
+                    format_hwm(hwm.as_ref())
+                )
+            }
+            VerifyMode::TwoStream {
+                insert_cursor,
+                update_cursor,
+                update_hwm,
+                insert_hwm,
+            } => format!(
+                "two_stream insert_cursor={} update_cursor={} update_hwm={} insert_hwm={}",
+                insert_cursor,
+                update_cursor,
+                format_hwm(update_hwm.as_ref()),
+                format_i64_hwm(*insert_hwm)
+            ),
+        }
+    }
+}
+
+fn format_hwm(hwm: Option<&Hwm>) -> String {
+    match hwm {
+        Some(hwm) => format!("updated_at={} last_id={}", hwm.updated_at, hwm.last_id),
+        None => "none".to_string(),
+    }
+}
+
+fn format_i64_hwm(hwm: Option<i64>) -> String {
+    hwm.map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string())
 }
 
 const DEFAULT_ROW_CAP: i64 = 1_000_000;
@@ -85,18 +161,36 @@ pub struct VerifyCommand<S, D> {
     source: S,
     delta: D,
     tables: Vec<String>,
+    table_plans: std::collections::HashMap<String, TablePlan>,
     deep: bool,
     row_cap: i64,
 }
 impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
     pub fn new(source: S, delta: D, tables: Vec<String>) -> Self {
+        let table_plans = tables
+            .iter()
+            .cloned()
+            .map(|table| {
+                let plan = TablePlan::basic(table.clone());
+                (table, plan)
+            })
+            .collect();
         Self {
             source,
             delta,
             tables,
+            table_plans,
             deep: false,
             row_cap: DEFAULT_ROW_CAP,
         }
+    }
+
+    pub fn with_table_plans(mut self, table_plans: Vec<TablePlan>) -> Self {
+        self.table_plans = table_plans
+            .into_iter()
+            .map(|plan| (plan.table.clone(), plan))
+            .collect();
+        self
     }
 
     pub fn with_deep(mut self, deep: bool) -> Self {
@@ -117,6 +211,10 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
         let mut outcomes = Vec::new();
 
         for table in &self.tables {
+            let default_plan = TablePlan::basic(table.clone());
+            let plan = self.table_plans.get(table).unwrap_or(&default_plan);
+            println!("verify {table} plan: {}", plan.describe());
+
             let scols = self.source.columns(table).await?;
             let dcols = self.delta.columns(table).await?;
             let dnames: std::collections::HashSet<&str> =
@@ -381,6 +479,76 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_plan_describe_includes_mode_and_hwms() {
+        let incremental = TablePlan {
+            table: "orders".to_string(),
+            mode: VerifyMode::Incremental {
+                cursor_col: "updated_at".to_string(),
+                hwm: Some(Hwm {
+                    updated_at: "2026-06-30 12:00:00".to_string(),
+                    last_id: 42,
+                }),
+            },
+        };
+        assert_eq!(
+            incremental.describe(),
+            "mode=incremental cursor=updated_at hwm=updated_at=2026-06-30 12:00:00 last_id=42"
+        );
+
+        let two_stream = TablePlan {
+            table: "users".to_string(),
+            mode: VerifyMode::TwoStream {
+                insert_cursor: "id".to_string(),
+                update_cursor: "updated_at".to_string(),
+                update_hwm: None,
+                insert_hwm: Some(99),
+            },
+        };
+        assert_eq!(
+            two_stream.describe(),
+            "mode=two_stream insert_cursor=id update_cursor=updated_at update_hwm=none insert_hwm=99"
+        );
+    }
+
+    #[test]
+    fn verify_command_new_defaults_table_plans_to_basic() {
+        let source = MockSourceProbe::new();
+        let delta = MockDeltaProbe::new();
+        let cmd = VerifyCommand::new(source, delta, vec!["orders".to_string()]);
+        assert_eq!(cmd.table_plans.len(), 1);
+        let plan = cmd.table_plans.get("orders").unwrap();
+        assert_eq!(plan.table, "orders");
+        assert!(matches!(plan.mode, VerifyMode::Basic));
+    }
+
+    #[test]
+    fn verify_command_matches_table_plans_by_name() {
+        let source = MockSourceProbe::new();
+        let delta = MockDeltaProbe::new();
+        let cmd = VerifyCommand::new(
+            source,
+            delta,
+            vec!["orders".to_string(), "users".to_string()],
+        )
+        .with_table_plans(vec![
+            TablePlan {
+                table: "users".to_string(),
+                mode: VerifyMode::FullRefresh,
+            },
+            TablePlan::basic("orders"),
+        ]);
+
+        assert!(matches!(
+            cmd.table_plans.get("users").unwrap().mode,
+            VerifyMode::FullRefresh
+        ));
+        assert!(matches!(
+            cmd.table_plans.get("orders").unwrap().mode,
+            VerifyMode::Basic
+        ));
+    }
 
     #[tokio::test]
     async fn verify_reports_counts_for_each_table() {
