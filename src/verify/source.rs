@@ -46,6 +46,16 @@ impl SourceProbe for SourceProbeAdapter {
         Ok(row.0)
     }
 
+    async fn max_cursor(&self, table: &str, cursor_col: &str) -> Result<Option<String>> {
+        let row: (Option<String>,) = sqlx::query_as(&format!(
+            "SELECT CAST(MAX(`{cursor_col}`) AS CHAR) FROM `{table}`"
+        ))
+        .fetch_one(&self.pool)
+        .await
+        .with_context(|| format!("source MAX(`{cursor_col}`) for `{table}`"))?;
+        Ok(row.0)
+    }
+
     async fn columns(&self, table: &str) -> Result<Vec<ColumnMeta>> {
         let rows: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM information_schema.columns \

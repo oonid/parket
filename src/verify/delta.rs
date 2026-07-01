@@ -13,6 +13,17 @@ impl DeltaProbeAdapter {
     pub fn new(writer: DeltaWriter) -> Self {
         Self { writer }
     }
+
+    fn first_string_value(batch: &deltalake::arrow::record_batch::RecordBatch) -> Option<String> {
+        let column = batch.column(0);
+        if let Some(arr) = column.as_any().downcast_ref::<StringArray>() {
+            (!arr.is_empty() && !arr.is_null(0)).then(|| arr.value(0).to_string())
+        } else if let Some(arr) = column.as_any().downcast_ref::<StringViewArray>() {
+            (!arr.is_empty() && !arr.is_null(0)).then(|| arr.value(0).to_string())
+        } else {
+            None
+        }
+    }
 }
 impl DeltaProbe for DeltaProbeAdapter {
     async fn row_count(&self, table: &str) -> Result<i64> {
@@ -30,6 +41,15 @@ impl DeltaProbe for DeltaProbeAdapter {
             .map(|a| a.value(0))
             .unwrap_or(0);
         Ok(n)
+    }
+
+    async fn max_cursor(&self, table: &str, cursor_col: &str) -> Result<Option<String>> {
+        let t = self.writer.open_table(table).await?;
+        let ctx = SessionContext::new();
+        ctx.register_table("t", t.table_provider().await?)?;
+        let sql = format!("SELECT cast(max(`{cursor_col}`) as varchar) AS max_cursor FROM t");
+        let batches = ctx.sql(&sql).await?.collect().await?;
+        Ok(batches.first().and_then(Self::first_string_value))
     }
 
     async fn columns(&self, table: &str) -> Result<Vec<ColumnMeta>> {

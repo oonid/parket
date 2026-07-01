@@ -92,6 +92,14 @@ impl VerifyMode {
             ),
         }
     }
+
+    fn freshness_cursor(&self) -> Option<&str> {
+        match self {
+            VerifyMode::Incremental { cursor_col, .. } => Some(cursor_col.as_str()),
+            VerifyMode::TwoStream { update_cursor, .. } => Some(update_cursor.as_str()),
+            VerifyMode::Basic | VerifyMode::FullRefresh => None,
+        }
+    }
 }
 
 fn format_hwm(hwm: Option<&Hwm>) -> String {
@@ -154,6 +162,7 @@ pub struct KeyStats {
 pub trait SourceProbe: Send + Sync {
     async fn row_count(&self, table: &str) -> Result<i64>;
     async fn row_count_scoped(&self, table: &str, scope: &SourceScope) -> Result<i64>;
+    async fn max_cursor(&self, table: &str, cursor_col: &str) -> Result<Option<String>>;
     async fn columns(&self, table: &str) -> Result<Vec<ColumnMeta>>;
     async fn key_stats(&self, table: &str, key_col: &str) -> Result<KeyStats>;
     async fn key_stats_scoped(
@@ -178,6 +187,7 @@ pub trait SourceProbe: Send + Sync {
 #[allow(async_fn_in_trait)]
 pub trait DeltaProbe: Send + Sync {
     async fn row_count(&self, table: &str) -> Result<i64>;
+    async fn max_cursor(&self, table: &str, cursor_col: &str) -> Result<Option<String>>;
     async fn columns(&self, table: &str) -> Result<Vec<ColumnMeta>>;
     async fn key_stats(&self, table: &str, key_col: &str) -> Result<KeyStats>;
     async fn latest_key_stats(
@@ -299,8 +309,8 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
             _ => false,
         };
 
-        let delta_has_extra_evidence = source_stats.count < delta_stats.count
-            || source_stats.distinct < delta_stats.distinct;
+        let delta_has_extra_evidence =
+            source_stats.count < delta_stats.count || source_stats.distinct < delta_stats.distinct;
 
         if delta_has_extra_evidence
             && source_stats.count <= delta_stats.count
@@ -383,6 +393,13 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                 missing_in_delta,
                 extra_in_delta
             );
+            if let Some(cursor) = plan.mode.freshness_cursor() {
+                let source_max = self.source.max_cursor(table, cursor).await?;
+                let delta_max = self.delta.max_cursor(table, cursor).await?;
+                println!(
+                    "verify {table} freshness: cursor={cursor} source_max={source_max:?} delta_max={delta_max:?}"
+                );
+            }
             let has_id = scols.iter().any(|c| c.name == "id");
 
             let incremental_scope = match &plan.mode {
@@ -779,6 +796,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verify_basic_mode_does_not_probe_freshness() {
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        source.expect_row_count().returning(|_| Ok(2));
+        delta.expect_row_count().returning(|_| Ok(2));
+        let cols = || {
+            Ok(vec![ColumnMeta {
+                name: "id".to_string(),
+                type_str: "bigint".to_string(),
+                nullable: false,
+            }])
+        };
+        source.expect_columns().returning(move |_| cols());
+        delta.expect_columns().returning(move |_| cols());
+        let stats = || {
+            Ok(KeyStats {
+                count: 2,
+                distinct: 2,
+                min: Some(1),
+                max: Some(2),
+                xor: 3,
+                distinct_xor: 3,
+            })
+        };
+        source.expect_key_stats().returning(move |_, _| stats());
+        delta.expect_key_stats().returning(move |_, _| stats());
+        source
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        delta
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
+        let cmd = VerifyCommand::new(source, delta, vec!["orders".to_string()]);
+        let result = cmd.run().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), VerifyVerdict::Clean);
+    }
+
+    #[tokio::test]
     async fn verify_reports_schema_diff() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
@@ -1114,6 +1171,16 @@ mod tests {
         };
         source.expect_columns().returning(move |_| cols());
         delta.expect_columns().returning(move |_| cols());
+        source.expect_max_cursor().returning(|table, cursor_col| {
+            assert_eq!(table, "users");
+            assert_eq!(cursor_col, "updated_at");
+            Ok(Some("2026-06-30 12:00:00".to_string()))
+        });
+        delta.expect_max_cursor().returning(|table, cursor_col| {
+            assert_eq!(table, "users");
+            assert_eq!(cursor_col, "updated_at");
+            Ok(Some("2026-06-30T12:00:00.000000".to_string()))
+        });
         let stats = || {
             Ok(KeyStats {
                 count: 4,
@@ -1165,6 +1232,12 @@ mod tests {
         };
         source.expect_columns().returning(move |_| cols());
         delta.expect_columns().returning(move |_| cols());
+        source
+            .expect_max_cursor()
+            .returning(|_, _| Ok(Some("2026-06-30 12:00:00".to_string())));
+        delta
+            .expect_max_cursor()
+            .returning(|_, _| Ok(Some("2026-06-30T12:00:00.000000".to_string())));
         source.expect_key_stats().returning(|_, _| {
             Ok(KeyStats {
                 count: 3,
@@ -1217,6 +1290,12 @@ mod tests {
         };
         source.expect_columns().returning(move |_| cols());
         delta.expect_columns().returning(move |_| cols());
+        source
+            .expect_max_cursor()
+            .returning(|_, _| Ok(Some("2026-06-30 12:00:00".to_string())));
+        delta
+            .expect_max_cursor()
+            .returning(|_, _| Ok(Some("2026-06-30T12:00:00.000000".to_string())));
         source.expect_key_stats().returning(|_, _| {
             Ok(KeyStats {
                 count: 3,
@@ -1269,6 +1348,12 @@ mod tests {
         };
         source.expect_columns().returning(move |_| cols());
         delta.expect_columns().returning(move |_| cols());
+        source
+            .expect_max_cursor()
+            .returning(|_, _| Ok(Some("2026-06-30 12:00:00".to_string())));
+        delta
+            .expect_max_cursor()
+            .returning(|_, _| Ok(Some("2026-06-30T12:00:00.000000".to_string())));
         source.expect_key_stats().returning(|_, _| {
             Ok(KeyStats {
                 count: 5,
@@ -1600,6 +1685,16 @@ mod tests {
         };
         source.expect_columns().returning(move |_| cols());
         delta.expect_columns().returning(move |_| cols());
+        source.expect_max_cursor().returning(|table, cursor_col| {
+            assert_eq!(table, "orders");
+            assert_eq!(cursor_col, "updated_at");
+            Ok(Some("2026-06-30 12:00:00".to_string()))
+        });
+        delta.expect_max_cursor().returning(|table, cursor_col| {
+            assert_eq!(table, "orders");
+            assert_eq!(cursor_col, "updated_at");
+            Ok(Some("2026-06-30T12:00:00.000000".to_string()))
+        });
         source.expect_row_count_scoped().returning(|_, scope| {
             assert_eq!(scope.cursor_col, "updated_at");
             assert_eq!(scope.updated_at, "2026-06-30 12:00:00");
@@ -1672,6 +1767,12 @@ mod tests {
         };
         source.expect_columns().returning(move |_| cols());
         delta.expect_columns().returning(move |_| cols());
+        source
+            .expect_max_cursor()
+            .returning(|_, _| Ok(Some("2026-06-30 12:00:00".to_string())));
+        delta
+            .expect_max_cursor()
+            .returning(|_, _| Ok(Some("2026-06-30T12:00:00.000000".to_string())));
         source.expect_row_count_scoped().returning(|_, _| Ok(2));
         source.expect_key_stats_scoped().returning(|_, _, _| {
             Ok(KeyStats {
@@ -1724,6 +1825,12 @@ mod tests {
         };
         source.expect_columns().returning(move |_| cols());
         delta.expect_columns().returning(move |_| cols());
+        source
+            .expect_max_cursor()
+            .returning(|_, _| Ok(Some("2026-06-30 12:00:00".to_string())));
+        delta
+            .expect_max_cursor()
+            .returning(|_, _| Ok(Some("2026-06-30T12:00:00.000000".to_string())));
         source.expect_row_count().returning(|_| Ok(2));
         delta.expect_row_count().returning(|_| Ok(2));
         let cmd =
@@ -1766,6 +1873,12 @@ mod tests {
         };
         source.expect_columns().returning(move |_| cols());
         delta.expect_columns().returning(move |_| cols());
+        source
+            .expect_max_cursor()
+            .returning(|_, _| Ok(Some("2026-06-30 12:00:00".to_string())));
+        delta
+            .expect_max_cursor()
+            .returning(|_, _| Ok(Some("2026-06-30T12:00:00.000000".to_string())));
         source.expect_key_stats().returning(|_, _| {
             Ok(KeyStats {
                 count: 5,
