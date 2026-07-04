@@ -9,7 +9,6 @@ use deltalake::datafusion::execution::memory_pool::FairSpillPool;
 use deltalake::datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use deltalake::datafusion::prelude::{SessionConfig, SessionContext};
 use deltalake::protocol::SaveMode;
-use std::collections::HashSet;
 use tracing::info;
 
 impl DeltaWriter {
@@ -207,6 +206,9 @@ impl DeltaWriter {
         // Dedup the incoming batches by key_col (same pattern as merge_batch).
         let schema = batches[0].schema();
         let merged = deltalake::arrow::compute::concat_batches(&schema, &batches)?;
+        // `merged` now owns the data; free the source Vec so we don't hold it alongside
+        // the concatenated copy and the collected dedup output (peak-memory reduction).
+        drop(batches);
         let ctx = SessionContext::new();
         ctx.register_batch("delete_source_raw", merged)?;
 
@@ -220,32 +222,34 @@ impl DeltaWriter {
 
         // Collect the distinct i64 keys present in the deduplicated batches.
         // Handle Int64Array, Int32Array, UInt64Array, UInt32Array.
-        let mut ids: HashSet<i64> = HashSet::new();
+        // Keys are already distinct (the dedup SQL keeps one row per key_col), so a Vec
+        // preserves distinctness without the HashSet's hash overhead.
+        let mut ids: Vec<i64> = Vec::new();
         for b in &deduped_batches {
             let idx = b.schema().index_of(key_col)?;
             let c = b.column(idx);
             if let Some(a) = c.as_any().downcast_ref::<Int64Array>() {
                 for i in 0..a.len() {
                     if !a.is_null(i) {
-                        ids.insert(a.value(i));
+                        ids.push(a.value(i));
                     }
                 }
             } else if let Some(a) = c.as_any().downcast_ref::<Int32Array>() {
                 for i in 0..a.len() {
                     if !a.is_null(i) {
-                        ids.insert(a.value(i) as i64);
+                        ids.push(a.value(i) as i64);
                     }
                 }
             } else if let Some(a) = c.as_any().downcast_ref::<UInt64Array>() {
                 for i in 0..a.len() {
                     if !a.is_null(i) {
-                        ids.insert(a.value(i) as i64);
+                        ids.push(a.value(i) as i64);
                     }
                 }
             } else if let Some(a) = c.as_any().downcast_ref::<UInt32Array>() {
                 for i in 0..a.len() {
                     if !a.is_null(i) {
-                        ids.insert(a.value(i) as i64);
+                        ids.push(a.value(i) as i64);
                     }
                 }
             } else {
@@ -256,16 +260,20 @@ impl DeltaWriter {
             }
         }
 
-        // 1) DELETE the existing rows for those keys (streaming scan+filter+rewrite).
-        let table = if ids.is_empty() {
-            table
-        } else {
-            let list: Vec<_> = ids.iter().map(|id| lit(*id)).collect();
-            let predicate = cast(col(key_col), DataType::Int64).in_list(list, false);
-            let (t, _metrics) = table.delete().with_predicate(predicate).await?;
+        // 1) DELETE the existing rows for those keys (streaming scan+filter+rewrite), in
+        //    bounded-size chunks. A single IN-list over every key gets OR-normalized into a
+        //    deep predicate tree whose plan traversal overflows the stack on large batches
+        //    (the reason main.rs runs on a 512 MB stack); chunking caps the depth.
+        const DELETE_KEYS_PER_CHUNK: usize = 1024;
+        if !ids.is_empty() {
+            for chunk in ids.chunks(DELETE_KEYS_PER_CHUNK) {
+                let list: Vec<_> = chunk.iter().map(|id| lit(*id)).collect();
+                let predicate = cast(col(key_col), DataType::Int64).in_list(list, false);
+                let (t, _metrics) = table.delete().with_predicate(predicate).await?;
+                table = t;
+            }
             info!(table = table_name, keys = ids.len(), "delete_then_append: deleted existing rows for incoming keys");
-            t
-        };
+        }
 
         // 2) APPEND the deduplicated versions; the watermarks ride on this commit.
         let total_rows: usize = deduped_batches.iter().map(|b| b.num_rows()).sum();
@@ -1362,5 +1370,69 @@ mod tests {
             .downcast_ref::<deltalake::arrow::array::Int64Array>()
             .unwrap();
         assert_eq!(cnt_col.value(0), 0i64);
+    }
+
+    #[tokio::test]
+    async fn delete_then_append_spans_multiple_delete_chunks() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        writer.ensure_table("t", schema.clone()).await.unwrap();
+
+        // Seed 2500 rows (value="old") — spans ~3 delete chunks at 1024 keys/chunk.
+        let n: i64 = 2500;
+        let seed_ids: Vec<i64> = (1..=n).collect();
+        let seed_vals: Vec<&str> = vec!["old"; n as usize];
+        let seed = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(seed_ids.clone())),
+                Arc::new(StringArray::from(seed_vals)),
+            ],
+        )
+        .unwrap();
+        let t = writer.open_table("t").await.unwrap();
+        t.write(vec![seed])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .unwrap();
+
+        // Upsert every row to value="new" via delete_then_append (crosses chunk boundaries).
+        let new_vals: Vec<&str> = vec!["new"; n as usize];
+        let update = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(seed_ids.clone())),
+                Arc::new(StringArray::from(new_vals)),
+            ],
+        )
+        .unwrap();
+        writer
+            .delete_then_append("t", vec![update], "id", Some(n), None)
+            .await
+            .unwrap();
+
+        // Read back: exactly n rows, all ids distinct, and none left as "old".
+        let t = writer.open_table("t").await.unwrap();
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        let provider = t.table_provider().await.unwrap();
+        ctx.register_table("t", provider).unwrap();
+        let batches = ctx
+            .sql("SELECT COUNT(*) AS c, COUNT(DISTINCT id) AS d, SUM(CASE WHEN value = 'old' THEN 1 ELSE 0 END) AS old_cnt FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let b = &batches[0];
+        let c = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+        let d = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+        let old_cnt = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+        assert_eq!(c, n, "row count after upsert should equal seed count (no dupes)");
+        assert_eq!(d, n, "all ids distinct");
+        assert_eq!(old_cnt, 0, "every row must be updated to the new version");
     }
 }
