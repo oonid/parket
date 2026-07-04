@@ -73,7 +73,8 @@ impl DeltaProbe for DeltaProbeAdapter {
         let sql = format!(
             "SELECT count(*) AS c, count(distinct `{key_col}`) AS d, \
              min(cast(`{key_col}` as bigint)) AS mn, max(cast(`{key_col}` as bigint)) AS mx, \
-             bit_xor(cast(`{key_col}` as bigint)) AS x, bit_xor(distinct cast(`{key_col}` as bigint)) AS dx FROM t"
+             bit_xor(cast(`{key_col}` as bigint)) AS x, bit_xor(distinct cast(`{key_col}` as bigint)) AS dx, \
+             cast(sum(distinct cast(`{key_col}` as decimal(38,0))) as varchar) AS sm FROM t"
         );
         let batches = ctx.sql(&sql).await?.collect().await?;
         let b = batches.first().context("delta key_stats: empty result")?;
@@ -90,6 +91,15 @@ impl DeltaProbe for DeltaProbeAdapter {
                     }
                 })
         };
+        let col_str = |i: usize| -> Option<String> {
+            let c = b.column(i);
+            if let Some(a) = c.as_any().downcast_ref::<StringArray>() {
+                (!a.is_empty() && !a.is_null(0)).then(|| a.value(0).to_string())
+            } else if let Some(a) = c.as_any().downcast_ref::<StringViewArray>() {
+                (!a.is_empty() && !a.is_null(0)).then(|| a.value(0).to_string())
+            } else { None }
+        };
+        let sum = col_str(6).and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
         Ok(KeyStats {
             count: col_opt(0).unwrap_or(0),
             distinct: col_opt(1).unwrap_or(0),
@@ -97,6 +107,7 @@ impl DeltaProbe for DeltaProbeAdapter {
             max: col_opt(3),
             xor: col_opt(4).unwrap_or(0),
             distinct_xor: col_opt(5).unwrap_or(0),
+            sum,
         })
     }
 
@@ -110,7 +121,7 @@ impl DeltaProbe for DeltaProbeAdapter {
         let ctx = SessionContext::new();
         ctx.register_table("t", t.table_provider().await?)?;
         let sql = format!(
-            "WITH ranked AS (              SELECT cast(`{key_col}` as bigint) AS key_value,                     row_number() OVER (PARTITION BY cast(`{key_col}` as bigint) ORDER BY `{cursor_col}` DESC) AS rn              FROM t              )              SELECT count(*) AS c, count(distinct key_value) AS d,                     min(key_value) AS mn, max(key_value) AS mx,                     bit_xor(key_value) AS x, bit_xor(distinct key_value) AS dx              FROM ranked WHERE rn = 1"
+            "WITH ranked AS (              SELECT cast(`{key_col}` as bigint) AS key_value,                     row_number() OVER (PARTITION BY cast(`{key_col}` as bigint) ORDER BY `{cursor_col}` DESC) AS rn              FROM t              )              SELECT count(*) AS c, count(distinct key_value) AS d,                     min(key_value) AS mn, max(key_value) AS mx,                     bit_xor(key_value) AS x, bit_xor(distinct key_value) AS dx,                     cast(sum(cast(key_value as decimal(38,0))) as varchar) AS sm              FROM ranked WHERE rn = 1"
         );
         let batches = ctx.sql(&sql).await?.collect().await?;
         let b = batches
@@ -128,6 +139,15 @@ impl DeltaProbe for DeltaProbeAdapter {
                     }
                 })
         };
+        let col_str = |i: usize| -> Option<String> {
+            let c = b.column(i);
+            if let Some(a) = c.as_any().downcast_ref::<StringArray>() {
+                (!a.is_empty() && !a.is_null(0)).then(|| a.value(0).to_string())
+            } else if let Some(a) = c.as_any().downcast_ref::<StringViewArray>() {
+                (!a.is_empty() && !a.is_null(0)).then(|| a.value(0).to_string())
+            } else { None }
+        };
+        let sum = col_str(6).and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
         Ok(KeyStats {
             count: col_opt(0).unwrap_or(0),
             distinct: col_opt(1).unwrap_or(0),
@@ -135,6 +155,7 @@ impl DeltaProbe for DeltaProbeAdapter {
             max: col_opt(3),
             xor: col_opt(4).unwrap_or(0),
             distinct_xor: col_opt(5).unwrap_or(0),
+            sum,
         })
     }
 

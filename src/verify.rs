@@ -154,6 +154,7 @@ pub struct KeyStats {
     pub max: Option<i64>,
     pub xor: i64,
     pub distinct_xor: i64,
+    pub sum: i128,
 }
 
 /// Source-side probe (the live DB).
@@ -253,12 +254,12 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
         source_stats: &KeyStats,
         delta_stats: &KeyStats,
     ) -> TableOutcome {
-        if source_stats == delta_stats {
-            TableOutcome::Pass
-        } else if source_stats.distinct == delta_stats.distinct
-            && source_stats.min == delta_stats.min
-            && source_stats.max == delta_stats.max
-            && source_stats.distinct_xor == delta_stats.distinct_xor
+        if source_stats == delta_stats
+            || (source_stats.distinct == delta_stats.distinct
+                && source_stats.min == delta_stats.min
+                && source_stats.max == delta_stats.max
+                && source_stats.distinct_xor == delta_stats.distinct_xor
+                && source_stats.sum == delta_stats.sum)
         {
             TableOutcome::Pass
         } else if delta_stats.distinct < source_stats.distinct
@@ -437,9 +438,10 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                     "differ — see verdict"
                 };
                 println!(
-                    "verify {table} incremental scope: source_scoped={src_row_count} delta_latest={dlt_row_count} cursor={} hwm={}  [{flag}]",
+                    "verify {table} incremental scope: source_scoped={src_row_count} delta_latest={dlt_row_count} cursor={} hwm=updated_at={} last_id={}  [{flag}]",
                     scope.cursor_col,
-                    format!("updated_at={} last_id={}", scope.updated_at, scope.last_id)
+                    scope.updated_at,
+                    scope.last_id
                 );
                 delta_keystats = Some(delta_stats);
             } else {
@@ -766,6 +768,7 @@ mod tests {
                 max: None,
                 xor: 0,
                 distinct_xor: 0,
+                sum: 0,
             })
         });
         delta.expect_key_stats().returning(|_, _| {
@@ -776,6 +779,7 @@ mod tests {
                 max: None,
                 xor: 0,
                 distinct_xor: 0,
+                sum: 0,
             })
         });
         source
@@ -818,6 +822,7 @@ mod tests {
                 max: Some(2),
                 xor: 3,
                 distinct_xor: 3,
+                sum: 3,
             })
         };
         source.expect_key_stats().returning(move |_, _| stats());
@@ -882,6 +887,7 @@ mod tests {
                 max: None,
                 xor: 0,
                 distinct_xor: 0,
+                sum: 0,
             })
         });
         delta.expect_key_stats().returning(|_, _| {
@@ -892,6 +898,7 @@ mod tests {
                 max: None,
                 xor: 0,
                 distinct_xor: 0,
+                sum: 0,
             })
         });
         let cmd = VerifyCommand::new(source, delta, vec!["users".to_string()]);
@@ -923,6 +930,7 @@ mod tests {
                 max: Some(3),
                 xor: 1,
                 distinct_xor: 1,
+                sum: 6,
             })
         };
         source.expect_key_stats().returning(move |_, _| stats());
@@ -963,6 +971,7 @@ mod tests {
                 max: Some(5),
                 xor: 7,
                 distinct_xor: 7,
+                sum: 15,
             })
         };
         source.expect_key_stats().returning(move |_, _| stats());
@@ -1003,6 +1012,7 @@ mod tests {
                 max: Some(10),
                 xor: 11,
                 distinct_xor: 11,
+                sum: 11,
             })
         });
         delta.expect_key_stats().returning(|_, _| {
@@ -1013,6 +1023,7 @@ mod tests {
                 max: Some(5),
                 xor: 15,
                 distinct_xor: 15,
+                sum: 15,
             })
         });
         let cmd = VerifyCommand::new(source, delta, vec!["events".to_string()]);
@@ -1045,6 +1056,7 @@ mod tests {
                 max: Some(5),
                 xor: 7,
                 distinct_xor: 7,
+                sum: 7,
             })
         });
         delta.expect_key_stats().returning(|_, _| {
@@ -1055,6 +1067,7 @@ mod tests {
                 max: Some(10),
                 xor: 15,
                 distinct_xor: 15,
+                sum: 15,
             })
         });
         let cmd = VerifyCommand::new(source, delta, vec!["orders".to_string()]);
@@ -1086,6 +1099,7 @@ mod tests {
                 max: Some(3),
                 xor: 1,
                 distinct_xor: 1,
+                sum: 1,
             })
         });
         delta.expect_key_stats().returning(|_, _| {
@@ -1096,6 +1110,7 @@ mod tests {
                 max: Some(3),
                 xor: 5,
                 distinct_xor: 1,
+                sum: 1,
             })
         });
         let cmd = VerifyCommand::new(source, delta, vec!["logs".to_string()]);
@@ -1135,6 +1150,7 @@ mod tests {
                 max: Some(3),
                 xor: 1,
                 distinct_xor: 1,
+                sum: 1,
             })
         });
         delta.expect_key_stats().returning(|_, _| {
@@ -1145,6 +1161,7 @@ mod tests {
                 max: Some(3),
                 xor: 5,
                 distinct_xor: 1,
+                sum: 1,
             })
         });
         // Do NOT set expect_non_null_counts or expect_sample_ids — they must not be called
@@ -1189,6 +1206,7 @@ mod tests {
                 max: Some(13),
                 xor: 3,
                 distinct_xor: 3,
+                sum: 3,
             })
         };
         source.expect_key_stats().returning(move |_, _| stats());
@@ -1246,6 +1264,7 @@ mod tests {
                 max: Some(4),
                 xor: 4,
                 distinct_xor: 4,
+                sum: 4,
             })
         });
         delta.expect_key_stats().returning(|_, _| {
@@ -1256,6 +1275,7 @@ mod tests {
                 max: Some(6),
                 xor: 1,
                 distinct_xor: 1,
+                sum: 1,
             })
         });
         let cmd =
@@ -1304,6 +1324,7 @@ mod tests {
                 max: Some(4),
                 xor: 5,
                 distinct_xor: 5,
+                sum: 5,
             })
         });
         delta.expect_key_stats().returning(|_, _| {
@@ -1314,6 +1335,7 @@ mod tests {
                 max: Some(5),
                 xor: 7,
                 distinct_xor: 7,
+                sum: 7,
             })
         });
         let cmd =
@@ -1362,6 +1384,7 @@ mod tests {
                 max: Some(7),
                 xor: 2,
                 distinct_xor: 2,
+                sum: 2,
             })
         });
         delta.expect_key_stats().returning(|_, _| {
@@ -1372,6 +1395,7 @@ mod tests {
                 max: Some(6),
                 xor: 1,
                 distinct_xor: 1,
+                sum: 1,
             })
         });
         let cmd =
@@ -1476,6 +1500,7 @@ mod tests {
                 max: Some(10),
                 xor: 15,
                 distinct_xor: 15,
+                sum: 15,
             })
         };
         source.expect_key_stats().returning(move |_, _| stats());
@@ -1523,6 +1548,7 @@ mod tests {
                 max: Some(10),
                 xor: 15,
                 distinct_xor: 15,
+                sum: 15,
             })
         };
         source.expect_key_stats().returning(move |_, _| stats());
@@ -1571,6 +1597,7 @@ mod tests {
                 max: Some(10),
                 xor: 15,
                 distinct_xor: 15,
+                sum: 15,
             })
         };
         source.expect_key_stats().returning(move |_, _| stats());
@@ -1631,6 +1658,7 @@ mod tests {
                 max: Some(10),
                 xor: 15,
                 distinct_xor: 15,
+                sum: 15,
             })
         };
         source.expect_key_stats().returning(move |_, _| stats());
@@ -1713,6 +1741,7 @@ mod tests {
                     max: Some(44),
                     xor: 7,
                     distinct_xor: 7,
+                    sum: 7,
                 })
             });
         delta
@@ -1727,6 +1756,7 @@ mod tests {
                     max: Some(44),
                     xor: 7,
                     distinct_xor: 7,
+                    sum: 7,
                 })
             });
         let cmd =
@@ -1782,6 +1812,7 @@ mod tests {
                 max: Some(44),
                 xor: 7,
                 distinct_xor: 7,
+                sum: 7,
             })
         });
         delta.expect_latest_key_stats().returning(|_, _, _| {
@@ -1792,6 +1823,7 @@ mod tests {
                 max: Some(99),
                 xor: 12,
                 distinct_xor: 12,
+                sum: 12,
             })
         });
         let cmd =
@@ -1887,6 +1919,7 @@ mod tests {
                 max: Some(5),
                 xor: 7,
                 distinct_xor: 7,
+                sum: 7,
             })
         });
         delta.expect_key_stats().returning(|_, _| {
@@ -1897,6 +1930,7 @@ mod tests {
                 max: Some(5),
                 xor: 7,
                 distinct_xor: 7,
+                sum: 7,
             })
         });
         source
@@ -1919,5 +1953,32 @@ mod tests {
         let result = cmd.run().await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), VerifyVerdict::Clean);
+    }
+
+    #[test]
+    fn key_stats_outcome_sum_breaks_xor_collision() {
+        // Test that sum breaks XOR collisions. Two key sets {1,3,5,8} and {1,2,4,8}
+        // both have count=4, distinct=4, min=1, max=8, xor=15, distinct_xor=15,
+        // but different sums (17 vs 15). Outcome must NOT be Pass.
+        let s = KeyStats {
+            count: 4,
+            distinct: 4,
+            min: Some(1),
+            max: Some(8),
+            xor: 15,
+            distinct_xor: 15,
+            sum: 17,
+        };
+        let d = KeyStats {
+            count: 4,
+            distinct: 4,
+            min: Some(1),
+            max: Some(8),
+            xor: 15,
+            distinct_xor: 15,
+            sum: 15,
+        };
+        let outcome = VerifyCommand::<MockSourceProbe, MockDeltaProbe>::key_stats_outcome("source", "delta", &s, &d);
+        assert!(!matches!(outcome, TableOutcome::Pass), "distinct-sum must break the xor collision");
     }
 }

@@ -81,15 +81,16 @@ impl SourceProbe for SourceProbeAdapter {
         // the fingerprint over distinct values — we reuse it for `distinct_xor`. The
         // Delta side, which may carry append-log duplicates, computes a true
         // bit_xor(distinct ...).
-        let row: (i64, i64, Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(&format!(
+        let row: (i64, i64, Option<i64>, Option<i64>, Option<i64>, Option<String>) = sqlx::query_as(&format!(
             "SELECT COUNT(*), COUNT(DISTINCT `{key_col}`), \
              CAST(MIN(`{key_col}`) AS SIGNED), CAST(MAX(`{key_col}`) AS SIGNED), \
-             CAST(BIT_XOR(`{key_col}`) AS SIGNED) FROM `{table}`"
+             CAST(BIT_XOR(`{key_col}`) AS SIGNED), CAST(SUM(`{key_col}`) AS CHAR) FROM `{table}`"
         ))
         .fetch_one(&self.pool)
         .await
         .with_context(|| format!("source key_stats for `{table}`.`{key_col}`"))?;
         let xor = row.4.unwrap_or(0);
+        let sum = row.5.as_deref().unwrap_or("0").parse::<i128>().unwrap_or(0);
         Ok(KeyStats {
             count: row.0,
             distinct: row.1,
@@ -97,6 +98,7 @@ impl SourceProbe for SourceProbeAdapter {
             max: row.3,
             xor,
             distinct_xor: xor,
+            sum,
         })
     }
 
@@ -108,9 +110,9 @@ impl SourceProbe for SourceProbeAdapter {
     ) -> Result<KeyStats> {
         let predicate = scope_predicate_sql(scope);
         let sql = format!(
-            "SELECT COUNT(*), COUNT(DISTINCT `{key_col}`),              CAST(MIN(`{key_col}`) AS SIGNED), CAST(MAX(`{key_col}`) AS SIGNED),              CAST(BIT_XOR(`{key_col}`) AS SIGNED) FROM `{table}`              WHERE {predicate}"
+            "SELECT COUNT(*), COUNT(DISTINCT `{key_col}`),              CAST(MIN(`{key_col}`) AS SIGNED), CAST(MAX(`{key_col}`) AS SIGNED),              CAST(BIT_XOR(`{key_col}`) AS SIGNED), CAST(SUM(`{key_col}`) AS CHAR) FROM `{table}`              WHERE {predicate}"
         );
-        let row: (i64, i64, Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(&sql)
+        let row: (i64, i64, Option<i64>, Option<i64>, Option<i64>, Option<String>) = sqlx::query_as(&sql)
             .bind(&scope.updated_at)
             .bind(&scope.updated_at)
             .bind(scope.last_id)
@@ -123,6 +125,7 @@ impl SourceProbe for SourceProbeAdapter {
                 )
             })?;
         let xor = row.4.unwrap_or(0);
+        let sum = row.5.as_deref().unwrap_or("0").parse::<i128>().unwrap_or(0);
         Ok(KeyStats {
             count: row.0,
             distinct: row.1,
@@ -130,6 +133,7 @@ impl SourceProbe for SourceProbeAdapter {
             max: row.3,
             xor,
             distinct_xor: xor,
+            sum,
         })
     }
 
