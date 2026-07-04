@@ -1,10 +1,13 @@
-# Verify: Per-Column Value Fingerprints (V1b-1)
+# Verify: Per-Column Value Fingerprints (V1b-1 & V1b-2)
 
 ## Overview
 
-The `--verify` command performs a multi-layer check of a synced table's integrity. **V1b-1** adds a per-column **value fingerprint** layer that detects data corruption beyond key-set identity checks.
+The `--verify` command performs a multi-layer check of a synced table's integrity. **V1b-1** and **V1b-2** add per-column **value fingerprint** layers that detect data corruption beyond key-set identity checks.
 
 When a table reaches the **Pass** verdict after key-set checks, the value-fingerprint layer computes engine-side aggregates for each column and compares them between source and Delta. A mismatch **downgrades the verdict to Discrepancy**, causing `verify` to exit with code 1.
+
+- **V1b-1** (initial): Checks non-append-log, non-scoped tables (full-refresh, basic, two-stream)
+- **V1b-2** (incremental): Checks incremental tables that have a HWM by comparing source scoped to the HWM window against Delta latest-per-id scoped to the same HWM
 
 ## How It Works
 
@@ -29,11 +32,12 @@ For each column, a fingerprint is computed based on its data type. The fingerpri
 
 The value-fingerprint check runs **only** when:
 1. The table reaches **Pass** verdict after key-set checks
-2. The table is **not append-log** (i.e., row count == distinct ID count)
-3. The table is **not scoped** (non-incremental, or incremental without a HWM)
-4. The table has at least one comparable column (id is excluded)
+2. The table has at least one comparable column (id is excluded)
 
-If any of these conditions fail, the check is skipped.
+The check then takes one of three paths:
+- **Incremental with HWM (V1b-2)**: Compare source scoped to the HWM vs Delta latest-per-id scoped to the same HWM
+- **Non-scoped, non-append-log (V1b-1)**: Full comparison (full-refresh, basic, two-stream modes)
+- **No-HWM append-log incremental**: Skip with a note (no fair comparison window possible)
 
 ### Mismatch Handling
 
@@ -62,10 +66,13 @@ If any column's fingerprint differs between source and Delta:
   - Example: changing "cat" → "dog" (same length, same row count) will NOT be detected
   - This is a deliberate tradeoff to avoid cross-engine collation issues
 
-### Append-Log Tables
+### Incremental Tables
 
-- **Two-stream / incremental append-log tables** (count > distinct) skip value checks here
-- Value verification for append-log tables is deferred to **V1b-2** (append-log / latest-per-id step)
+- **Incremental tables WITH a HWM**: Value aggregates are checked (V1b-2), source scoped to the HWM vs Delta latest-per-id scoped to the same HWM
+- **Incremental tables WITHOUT a HWM**: Value checks are skipped — no fair comparison window (the source may have advanced beyond the last sync point)
+- **Append-log tables**: Row-level census/sample checks are deferred (they require deduplication); value aggregates are checked separately if a HWM is present
+
+Note: The key-set (ID-presence) check's HWM scoping is a separate audit follow-up (V7); only the value-aggregate path is HWM-scoped on both sides here.
 
 ### Integration Testing
 

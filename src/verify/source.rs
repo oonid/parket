@@ -272,4 +272,61 @@ impl SourceProbe for SourceProbeAdapter {
         }
         Ok(fingerprints)
     }
+
+    async fn value_aggregates_scoped(
+        &self,
+        table: &str,
+        columns: &[ColumnAgg],
+        scope: &SourceScope,
+    ) -> Result<Vec<String>> {
+        let predicate = scope_predicate_sql(scope);
+        let mut fingerprints = Vec::with_capacity(columns.len());
+        for col in columns {
+            let c = &col.name;
+            let fp = match col.kind {
+                AggKind::Integer => {
+                    let sql = format!("SELECT CAST(SUM(`{c}`) AS CHAR), CAST(MIN(`{c}`) AS CHAR), CAST(MAX(`{c}`) AS CHAR) FROM `{table}` WHERE {predicate}");
+                    let row: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(&sql)
+                        .bind(&scope.updated_at).bind(&scope.updated_at).bind(scope.last_id)
+                        .fetch_one(&self.pool).await
+                        .with_context(|| format!("source value_aggregates_scoped {table}.{c}"))?;
+                    super::fp_num(row.0.as_deref(), row.1.as_deref(), row.2.as_deref())
+                }
+                AggKind::Decimal => {
+                    let sql = format!("SELECT CAST(CAST(SUM(`{c}`) AS DECIMAL(38,10)) AS CHAR), CAST(CAST(MIN(`{c}`) AS DECIMAL(38,10)) AS CHAR), CAST(CAST(MAX(`{c}`) AS DECIMAL(38,10)) AS CHAR) FROM `{table}` WHERE {predicate}");
+                    let row: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(&sql)
+                        .bind(&scope.updated_at).bind(&scope.updated_at).bind(scope.last_id)
+                        .fetch_one(&self.pool).await
+                        .with_context(|| format!("source value_aggregates_scoped {table}.{c}"))?;
+                    super::fp_num(row.0.as_deref(), row.1.as_deref(), row.2.as_deref())
+                }
+                AggKind::DatetimeSec => {
+                    let sql = format!("SELECT DATE_FORMAT(MIN(`{c}`), '%Y-%m-%d %H:%i:%s'), DATE_FORMAT(MAX(`{c}`), '%Y-%m-%d %H:%i:%s') FROM `{table}` WHERE {predicate}");
+                    let row: (Option<String>, Option<String>) = sqlx::query_as(&sql)
+                        .bind(&scope.updated_at).bind(&scope.updated_at).bind(scope.last_id)
+                        .fetch_one(&self.pool).await
+                        .with_context(|| format!("source value_aggregates_scoped {table}.{c}"))?;
+                    super::fp_minmax(row.0.as_deref(), row.1.as_deref())
+                }
+                AggKind::DateOnly => {
+                    let sql = format!("SELECT DATE_FORMAT(MIN(`{c}`), '%Y-%m-%d'), DATE_FORMAT(MAX(`{c}`), '%Y-%m-%d') FROM `{table}` WHERE {predicate}");
+                    let row: (Option<String>, Option<String>) = sqlx::query_as(&sql)
+                        .bind(&scope.updated_at).bind(&scope.updated_at).bind(scope.last_id)
+                        .fetch_one(&self.pool).await
+                        .with_context(|| format!("source value_aggregates_scoped {table}.{c}"))?;
+                    super::fp_minmax(row.0.as_deref(), row.1.as_deref())
+                }
+                AggKind::TextMass => {
+                    let sql = format!("SELECT CAST(SUM(CHAR_LENGTH(`{c}`)) AS CHAR), COUNT(`{c}`) FROM `{table}` WHERE {predicate}");
+                    let row: (Option<String>, i64) = sqlx::query_as(&sql)
+                        .bind(&scope.updated_at).bind(&scope.updated_at).bind(scope.last_id)
+                        .fetch_one(&self.pool).await
+                        .with_context(|| format!("source value_aggregates_scoped {table}.{c}"))?;
+                    super::fp_textmass(row.0.as_deref(), row.1)
+                }
+            };
+            fingerprints.push(fp);
+        }
+        Ok(fingerprints)
+    }
 }

@@ -222,6 +222,7 @@ pub trait SourceProbe: Send + Sync {
         ids: &[i64],
     ) -> Result<HashMap<i64, Vec<Option<String>>>>;
     async fn value_aggregates(&self, table: &str, columns: &[ColumnAgg]) -> Result<Vec<String>>;
+    async fn value_aggregates_scoped(&self, table: &str, columns: &[ColumnAgg], scope: &SourceScope) -> Result<Vec<String>>;
 }
 
 /// Delta-side probe (the synced output).
@@ -247,6 +248,7 @@ pub trait DeltaProbe: Send + Sync {
         ids: &[i64],
     ) -> Result<HashMap<i64, Vec<Option<String>>>>;
     async fn value_aggregates(&self, table: &str, columns: &[ColumnAgg]) -> Result<Vec<String>>;
+    async fn value_aggregates_latest(&self, table: &str, columns: &[ColumnAgg], cursor_col: &str, scope: &SourceScope) -> Result<Vec<String>>;
 }
 
 pub struct VerifyCommand<S, D> {
@@ -459,7 +461,7 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
 
             let mut delta_keystats: Option<KeyStats> = None;
             let skip_pass_layers_reason = if incremental_scope.is_some() {
-                Some("incremental scoped value reconciliation is deferred")
+                Some("row-level census/sample deferred for incremental scope (value-aggregates checked separately)")
             } else {
                 None
             };
@@ -533,19 +535,38 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                 }
             };
 
-            // V1b-1: per-column value verification (non-append-log, non-scoped path). A mismatch
-            // downgrades Pass -> Discrepancy so verify exits 1 on value corruption.
-            if matches!(outcome, TableOutcome::Pass) && skip_pass_layers_reason.is_none() {
-                let appendlog = matches!(&delta_keystats, Some(d) if d.count != d.distinct);
-                if !appendlog {
-                    let specs: Vec<ColumnAgg> = scols
-                        .iter()
-                        .filter(|c| dnames.contains(c.name.as_str()) && c.name != "id")
-                        .filter_map(|c| agg_kind(&c.type_str).map(|k| ColumnAgg { name: c.name.clone(), kind: k }))
-                        .collect();
-                    if !specs.is_empty() {
-                        let sfp = self.source.value_aggregates(table, &specs).await?;
-                        let dfp = self.delta.value_aggregates(table, &specs).await?;
+            // Per-column value verification. A mismatch downgrades Pass -> Discrepancy.
+            //  - incremental-with-HWM (scoped): source scoped-to-HWM vs Delta latest-per-id
+            //    scoped-to-HWM (V1b-2).
+            //  - non-scoped, non-append-log (full-refresh/basic/two-stream): full compare (V1b-1).
+            //  - no-HWM append-log incremental: no fair window -> skip with a note.
+            if matches!(outcome, TableOutcome::Pass) {
+                let specs: Vec<ColumnAgg> = scols
+                    .iter()
+                    .filter(|c| dnames.contains(c.name.as_str()) && c.name != "id")
+                    .filter_map(|c| agg_kind(&c.type_str).map(|k| ColumnAgg { name: c.name.clone(), kind: k }))
+                    .collect();
+                if !specs.is_empty() {
+                    let pair: Option<(Vec<String>, Vec<String>)> =
+                        if let Some(scope) = incremental_scope.as_ref() {
+                            Some((
+                                self.source.value_aggregates_scoped(table, &specs, scope).await?,
+                                self.delta
+                                    .value_aggregates_latest(table, &specs, &scope.cursor_col, scope)
+                                    .await?,
+                            ))
+                        } else if matches!(&delta_keystats, Some(d) if d.count != d.distinct) {
+                            println!(
+                                "verify {table} value-aggregates: skipped (append-log without HWM — no fair comparison window)"
+                            );
+                            None
+                        } else {
+                            Some((
+                                self.source.value_aggregates(table, &specs).await?,
+                                self.delta.value_aggregates(table, &specs).await?,
+                            ))
+                        };
+                    if let Some((sfp, dfp)) = pair {
                         let mismatches: Vec<String> = specs
                             .iter()
                             .enumerate()
@@ -1906,6 +1927,12 @@ mod tests {
                     sum: 7,
                 })
             });
+        source
+            .expect_value_aggregates_scoped()
+            .returning(|_, _, _| Ok(vec![]));
+        delta
+            .expect_value_aggregates_latest()
+            .returning(|_, _, _, _| Ok(vec![]));
         let cmd =
             VerifyCommand::new(source, delta, vec!["orders".to_string()]).with_table_plans(vec![
                 TablePlan {
@@ -1973,6 +2000,12 @@ mod tests {
                 sum: 12,
             })
         });
+        source
+            .expect_value_aggregates_scoped()
+            .returning(|_, _, _| Ok(vec![]));
+        delta
+            .expect_value_aggregates_latest()
+            .returning(|_, _, _, _| Ok(vec![]));
         let cmd =
             VerifyCommand::new(source, delta, vec!["orders".to_string()]).with_table_plans(vec![
                 TablePlan {
@@ -2243,6 +2276,156 @@ mod tests {
         let result = cmd.run().await;
         assert!(result.is_ok());
         // Mismatch downgrades to Discrepancy
+        assert_eq!(result.unwrap(), VerifyVerdict::Discrepancy);
+    }
+
+    #[tokio::test]
+    async fn verify_incremental_scoped_value_match_stays_pass() {
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        let cols = || {
+            Ok(vec![
+                ColumnMeta {
+                    name: "id".to_string(),
+                    type_str: "bigint".to_string(),
+                    nullable: false,
+                },
+                ColumnMeta {
+                    name: "updated_at".to_string(),
+                    type_str: "timestamp".to_string(),
+                    nullable: false,
+                },
+                ColumnMeta {
+                    name: "amount".to_string(),
+                    type_str: "int".to_string(),
+                    nullable: true,
+                },
+            ])
+        };
+        source.expect_columns().returning(move |_| cols());
+        delta.expect_columns().returning(move |_| cols());
+        source.expect_max_cursor().returning(|_, _| Ok(Some("2026-06-30 12:00:00".to_string())));
+        delta.expect_max_cursor().returning(|_, _| Ok(Some("2026-06-30T12:00:00.000000".to_string())));
+        source.expect_row_count_scoped().returning(|_, _| Ok(2));
+        source.expect_key_stats_scoped().returning(|_, _, _| {
+            Ok(KeyStats {
+                count: 2,
+                distinct: 2,
+                min: Some(43),
+                max: Some(44),
+                xor: 7,
+                distinct_xor: 7,
+                sum: 87,
+            })
+        });
+        delta.expect_latest_key_stats().returning(|_, _, _| {
+            Ok(KeyStats {
+                count: 2,
+                distinct: 2,
+                min: Some(43),
+                max: Some(44),
+                xor: 7,
+                distinct_xor: 7,
+                sum: 87,
+            })
+        });
+        // Value aggregates match on both sides (scoped)
+        source
+            .expect_value_aggregates_scoped()
+            .returning(|_, _, _| Ok(vec!["sum=6|min=1|max=3".to_string()]));
+        delta
+            .expect_value_aggregates_latest()
+            .returning(|_, _, _, _| Ok(vec!["sum=6|min=1|max=3".to_string()]));
+        let cmd =
+            VerifyCommand::new(source, delta, vec!["orders".to_string()]).with_table_plans(vec![
+                TablePlan {
+                    table: "orders".to_string(),
+                    mode: VerifyMode::Incremental {
+                        cursor_col: "updated_at".to_string(),
+                        hwm: Some(Hwm {
+                            updated_at: "2026-06-30 12:00:00".to_string(),
+                            last_id: 42,
+                        }),
+                    },
+                },
+            ]);
+        let result = cmd.run().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), VerifyVerdict::Clean);
+    }
+
+    #[tokio::test]
+    async fn verify_incremental_scoped_value_mismatch_downgrades() {
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        let cols = || {
+            Ok(vec![
+                ColumnMeta {
+                    name: "id".to_string(),
+                    type_str: "bigint".to_string(),
+                    nullable: false,
+                },
+                ColumnMeta {
+                    name: "updated_at".to_string(),
+                    type_str: "timestamp".to_string(),
+                    nullable: false,
+                },
+                ColumnMeta {
+                    name: "amount".to_string(),
+                    type_str: "int".to_string(),
+                    nullable: true,
+                },
+            ])
+        };
+        source.expect_columns().returning(move |_| cols());
+        delta.expect_columns().returning(move |_| cols());
+        source.expect_max_cursor().returning(|_, _| Ok(Some("2026-06-30 12:00:00".to_string())));
+        delta.expect_max_cursor().returning(|_, _| Ok(Some("2026-06-30T12:00:00.000000".to_string())));
+        source.expect_row_count_scoped().returning(|_, _| Ok(2));
+        source.expect_key_stats_scoped().returning(|_, _, _| {
+            Ok(KeyStats {
+                count: 2,
+                distinct: 2,
+                min: Some(43),
+                max: Some(44),
+                xor: 7,
+                distinct_xor: 7,
+                sum: 87,
+            })
+        });
+        delta.expect_latest_key_stats().returning(|_, _, _| {
+            Ok(KeyStats {
+                count: 2,
+                distinct: 2,
+                min: Some(43),
+                max: Some(44),
+                xor: 7,
+                distinct_xor: 7,
+                sum: 87,
+            })
+        });
+        // Value aggregates differ (scoped)
+        source
+            .expect_value_aggregates_scoped()
+            .returning(|_, _, _| Ok(vec!["sum=6|min=1|max=3".to_string()]));
+        delta
+            .expect_value_aggregates_latest()
+            .returning(|_, _, _, _| Ok(vec!["sum=9|min=2|max=3".to_string()]));
+        let cmd =
+            VerifyCommand::new(source, delta, vec!["orders".to_string()]).with_table_plans(vec![
+                TablePlan {
+                    table: "orders".to_string(),
+                    mode: VerifyMode::Incremental {
+                        cursor_col: "updated_at".to_string(),
+                        hwm: Some(Hwm {
+                            updated_at: "2026-06-30 12:00:00".to_string(),
+                            last_id: 42,
+                        }),
+                    },
+                },
+            ]);
+        let result = cmd.run().await;
+        assert!(result.is_ok());
         assert_eq!(result.unwrap(), VerifyVerdict::Discrepancy);
     }
 }
