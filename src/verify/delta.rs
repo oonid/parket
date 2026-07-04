@@ -3,7 +3,7 @@ use deltalake::arrow::array::{Array, Int64Array, StringArray, StringViewArray};
 use deltalake::datafusion::prelude::SessionContext;
 use std::collections::HashMap;
 
-use super::{ColumnMeta, DeltaProbe, KeyStats};
+use super::{AggKind, ColumnAgg, ColumnMeta, DeltaProbe, KeyStats};
 use crate::writer::DeltaWriter;
 
 pub struct DeltaProbeAdapter {
@@ -16,6 +16,17 @@ impl DeltaProbeAdapter {
 
     fn first_string_value(batch: &deltalake::arrow::record_batch::RecordBatch) -> Option<String> {
         let column = batch.column(0);
+        if let Some(arr) = column.as_any().downcast_ref::<StringArray>() {
+            (!arr.is_empty() && !arr.is_null(0)).then(|| arr.value(0).to_string())
+        } else if let Some(arr) = column.as_any().downcast_ref::<StringViewArray>() {
+            (!arr.is_empty() && !arr.is_null(0)).then(|| arr.value(0).to_string())
+        } else {
+            None
+        }
+    }
+
+    fn str_at(batch: &deltalake::arrow::record_batch::RecordBatch, col_idx: usize) -> Option<String> {
+        let column = batch.column(col_idx);
         if let Some(arr) = column.as_any().downcast_ref::<StringArray>() {
             (!arr.is_empty() && !arr.is_null(0)).then(|| arr.value(0).to_string())
         } else if let Some(arr) = column.as_any().downcast_ref::<StringViewArray>() {
@@ -259,6 +270,88 @@ impl DeltaProbe for DeltaProbeAdapter {
             }
         }
         Ok(map)
+    }
+
+    async fn value_aggregates(&self, table: &str, columns: &[ColumnAgg]) -> Result<Vec<String>> {
+        let t = self.writer.open_table(table).await?;
+        let ctx = SessionContext::new();
+        ctx.register_table("t", t.table_provider().await?)?;
+
+        let mut fingerprints = Vec::with_capacity(columns.len());
+        for col in columns {
+            let fp = match col.kind {
+                AggKind::Integer => {
+                    let sql = format!(
+                        "SELECT cast(sum(cast(`{col}` as decimal(38,0))) as varchar), cast(min(cast(`{col}` as bigint)) as varchar), cast(max(cast(`{col}` as bigint)) as varchar) FROM t",
+                        col = col.name
+                    );
+                    let batches = ctx.sql(&sql).await?.collect().await?;
+                    let b = batches.first().context("delta value_aggregates Integer: empty result")?;
+                    let sum = Self::str_at(b, 0);
+                    let min = Self::str_at(b, 1);
+                    let max = Self::str_at(b, 2);
+                    super::fp_num(sum.as_deref(), min.as_deref(), max.as_deref())
+                }
+                AggKind::Decimal => {
+                    let sql = format!(
+                        "SELECT cast(sum(cast(`{col}` as decimal(38,10))) as varchar), cast(min(cast(`{col}` as decimal(38,10))) as varchar), cast(max(cast(`{col}` as decimal(38,10))) as varchar) FROM t",
+                        col = col.name
+                    );
+                    let batches = ctx.sql(&sql).await?.collect().await?;
+                    let b = batches.first().context("delta value_aggregates Decimal: empty result")?;
+                    let sum = Self::str_at(b, 0);
+                    let min = Self::str_at(b, 1);
+                    let max = Self::str_at(b, 2);
+                    super::fp_num(sum.as_deref(), min.as_deref(), max.as_deref())
+                }
+                AggKind::DatetimeSec => {
+                    let sql = format!(
+                        "SELECT substr(replace(cast(min(`{col}`) as varchar), 'T', ' '), 1, 19), substr(replace(cast(max(`{col}`) as varchar), 'T', ' '), 1, 19) FROM t",
+                        col = col.name
+                    );
+                    let batches = ctx.sql(&sql).await?.collect().await?;
+                    let b = batches.first().context("delta value_aggregates DatetimeSec: empty result")?;
+                    let min = Self::str_at(b, 0);
+                    let max = Self::str_at(b, 1);
+                    super::fp_minmax(min.as_deref(), max.as_deref())
+                }
+                AggKind::DateOnly => {
+                    let sql = format!(
+                        "SELECT substr(cast(min(`{col}`) as varchar), 1, 10), substr(cast(max(`{col}`) as varchar), 1, 10) FROM t",
+                        col = col.name
+                    );
+                    let batches = ctx.sql(&sql).await?.collect().await?;
+                    let b = batches.first().context("delta value_aggregates DateOnly: empty result")?;
+                    let min = Self::str_at(b, 0);
+                    let max = Self::str_at(b, 1);
+                    super::fp_minmax(min.as_deref(), max.as_deref())
+                }
+                AggKind::TextMass => {
+                    let sql = format!(
+                        "SELECT cast(sum(char_length(`{col}`)) as varchar), count(`{col}`) FROM t",
+                        col = col.name
+                    );
+                    let batches = ctx.sql(&sql).await?.collect().await?;
+                    let b = batches.first().context("delta value_aggregates TextMass: empty result")?;
+                    let len_sum = Self::str_at(b, 0);
+                    let count = b
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .and_then(|a| {
+                            if a.is_empty() || a.is_null(0) {
+                                None
+                            } else {
+                                Some(a.value(0))
+                            }
+                        })
+                        .unwrap_or(0);
+                    super::fp_textmass(len_sum.as_deref(), count)
+                }
+            };
+            fingerprints.push(fp);
+        }
+        Ok(fingerprints)
     }
 }
 

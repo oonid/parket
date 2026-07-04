@@ -145,6 +145,46 @@ pub struct ColumnMeta {
     pub nullable: bool,
 }
 
+/// What kind of value-aggregate fingerprint to compute for a column.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AggKind {
+    Integer,       // exact SUM/MIN/MAX
+    Decimal,       // SUM/MIN/MAX at fixed scale 10 (exact for <=10 fractional digits)
+    DatetimeSec,   // MIN/MAX truncated to whole seconds
+    DateOnly,      // MIN/MAX date only
+    TextMass,      // SUM(CHAR_LENGTH) + non-null COUNT (collation-independent)
+}
+
+#[derive(Debug, Clone)]
+pub struct ColumnAgg {
+    pub name: String,
+    pub kind: AggKind,
+}
+
+/// Classify a MariaDB DATA_TYPE string into an AggKind, or None to skip
+/// (tinyint/bool, float/double, time, json/blob/binary/enum/set, and anything unknown).
+pub(crate) fn agg_kind(type_str: &str) -> Option<AggKind> {
+    match type_str.to_ascii_lowercase().as_str() {
+        "smallint" | "mediumint" | "int" | "integer" | "bigint" => Some(AggKind::Integer),
+        "decimal" | "numeric" => Some(AggKind::Decimal),
+        "datetime" | "timestamp" => Some(AggKind::DatetimeSec),
+        "date" => Some(AggKind::DateOnly),
+        "varchar" | "char" | "text" | "tinytext" | "mediumtext" | "longtext" => Some(AggKind::TextMass),
+        _ => None,
+    }
+}
+
+/// Canonical fingerprint builders — BOTH probes MUST use these so the strings match byte-for-byte.
+pub(crate) fn fp_num(sum: Option<&str>, min: Option<&str>, max: Option<&str>) -> String {
+    format!("sum={}|min={}|max={}", sum.unwrap_or("∅"), min.unwrap_or("∅"), max.unwrap_or("∅"))
+}
+pub(crate) fn fp_minmax(min: Option<&str>, max: Option<&str>) -> String {
+    format!("min={}|max={}", min.unwrap_or("∅"), max.unwrap_or("∅"))
+}
+pub(crate) fn fp_textmass(len_sum: Option<&str>, count: i64) -> String {
+    format!("len={}|n={}", len_sum.unwrap_or("0"), count)
+}
+
 /// L2 key-set fingerprint over a table's PK column.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeyStats {
@@ -181,6 +221,7 @@ pub trait SourceProbe: Send + Sync {
         columns: &[String],
         ids: &[i64],
     ) -> Result<HashMap<i64, Vec<Option<String>>>>;
+    async fn value_aggregates(&self, table: &str, columns: &[ColumnAgg]) -> Result<Vec<String>>;
 }
 
 /// Delta-side probe (the synced output).
@@ -205,6 +246,7 @@ pub trait DeltaProbe: Send + Sync {
         columns: &[String],
         ids: &[i64],
     ) -> Result<HashMap<i64, Vec<Option<String>>>>;
+    async fn value_aggregates(&self, table: &str, columns: &[ColumnAgg]) -> Result<Vec<String>>;
 }
 
 pub struct VerifyCommand<S, D> {
@@ -456,7 +498,7 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                 println!("verify {table}: source={src_row_count} delta={dlt_row_count}  [{flag}]");
             }
 
-            let outcome = if !missing_in_delta.is_empty() {
+            let mut outcome = if !missing_in_delta.is_empty() {
                 TableOutcome::Discrepancy {
                     reason: format!("missing columns in Delta: {:?}", missing_in_delta),
                 }
@@ -490,6 +532,44 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                     Self::key_stats_outcome("source", delta_label, &s, &d)
                 }
             };
+
+            // V1b-1: per-column value verification (non-append-log, non-scoped path). A mismatch
+            // downgrades Pass -> Discrepancy so verify exits 1 on value corruption.
+            if matches!(outcome, TableOutcome::Pass) && skip_pass_layers_reason.is_none() {
+                let appendlog = matches!(&delta_keystats, Some(d) if d.count != d.distinct);
+                if !appendlog {
+                    let specs: Vec<ColumnAgg> = scols
+                        .iter()
+                        .filter(|c| dnames.contains(c.name.as_str()) && c.name != "id")
+                        .filter_map(|c| agg_kind(&c.type_str).map(|k| ColumnAgg { name: c.name.clone(), kind: k }))
+                        .collect();
+                    if !specs.is_empty() {
+                        let sfp = self.source.value_aggregates(table, &specs).await?;
+                        let dfp = self.delta.value_aggregates(table, &specs).await?;
+                        let mismatches: Vec<String> = specs
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| sfp.get(*i) != dfp.get(*i))
+                            .map(|(i, s)| {
+                                format!(
+                                    "{} ({:?}: source={} delta={})",
+                                    s.name,
+                                    s.kind,
+                                    sfp.get(i).map(|x| x.as_str()).unwrap_or("<none>"),
+                                    dfp.get(i).map(|x| x.as_str()).unwrap_or("<none>")
+                                )
+                            })
+                            .collect();
+                        if mismatches.is_empty() {
+                            println!("verify {table} value-aggregates: {} column(s) match", specs.len());
+                        } else {
+                            outcome = TableOutcome::Discrepancy {
+                                reason: format!("column value mismatch: {}", mismatches.join(", ")),
+                            };
+                        }
+                    }
+                }
+            }
 
             match &outcome {
                 TableOutcome::Pass => {
@@ -789,6 +869,12 @@ mod tests {
             .expect_non_null_counts()
             .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
         source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
+        source
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec![]));
+        delta
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec![]));
         let cmd = VerifyCommand::new(
             source,
             delta,
@@ -834,6 +920,12 @@ mod tests {
             .expect_non_null_counts()
             .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
         source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
+        source
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec![]));
+        delta
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec![]));
         let cmd = VerifyCommand::new(source, delta, vec!["orders".to_string()]);
         let result = cmd.run().await;
         assert!(result.is_ok());
@@ -942,6 +1034,12 @@ mod tests {
             .expect_non_null_counts()
             .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
         source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
+        source
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec![]));
+        delta
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec![]));
         let cmd = VerifyCommand::new(source, delta, vec!["users".to_string()]);
         let result = cmd.run().await;
         assert!(result.is_ok());
@@ -983,6 +1081,12 @@ mod tests {
             .expect_non_null_counts()
             .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
         source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
+        source
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec![]));
+        delta
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec![]));
         let cmd = VerifyCommand::new(source, delta, vec!["items".to_string()]);
         let result = cmd.run().await;
         assert!(result.is_ok());
@@ -1113,6 +1217,19 @@ mod tests {
                 sum: 1,
             })
         });
+        source
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        delta
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
+        source
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec![]));
+        delta
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec![]));
         let cmd = VerifyCommand::new(source, delta, vec!["logs".to_string()]);
         let result = cmd.run().await;
         assert!(result.is_ok());
@@ -1218,6 +1335,12 @@ mod tests {
             .expect_non_null_counts()
             .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
         source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
+        source
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec![]));
+        delta
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec![]));
         let cmd =
             VerifyCommand::new(source, delta, vec!["users".to_string()]).with_table_plans(vec![
                 TablePlan {
@@ -1512,6 +1635,12 @@ mod tests {
             .expect_non_null_counts()
             .returning(|_, _| Ok(vec![10, 8]));
         source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
+        source
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec!["sum=45|min=1|max=10".to_string()]));
+        delta
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec!["sum=45|min=1|max=10".to_string()]));
         let cmd = VerifyCommand::new(source, delta, vec!["users".to_string()]);
         let result = cmd.run().await;
         assert!(result.is_ok());
@@ -1560,6 +1689,12 @@ mod tests {
             .expect_non_null_counts()
             .returning(|_, _| Ok(vec![10, 5]));
         source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
+        source
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec!["len=45|n=8".to_string()]));
+        delta
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec!["len=45|n=8".to_string()]));
         let cmd = VerifyCommand::new(source, delta, vec!["users".to_string()]);
         let result = cmd.run().await;
         assert!(result.is_ok());
@@ -1622,6 +1757,12 @@ mod tests {
         delta
             .expect_sample_rows()
             .returning(move |_, _, _, _| Ok(sample_rows_map_delta.clone()));
+        source
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec!["len=2|n=2".to_string()]));
+        delta
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec!["len=2|n=2".to_string()]));
         let cmd = VerifyCommand::new(source, delta, vec!["users".to_string()]);
         let result = cmd.run().await;
         assert!(result.is_ok());
@@ -1686,6 +1827,12 @@ mod tests {
         delta
             .expect_sample_rows()
             .returning(move |_, _, _, _| Ok(delta_rows_for_closure.clone()));
+        source
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec!["len=2|n=2".to_string()]));
+        delta
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec!["len=2|n=2".to_string()]));
         let cmd = VerifyCommand::new(source, delta, vec!["users".to_string()]);
         let result = cmd.run().await;
         assert!(result.is_ok());
@@ -1940,6 +2087,12 @@ mod tests {
             .expect_non_null_counts()
             .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
         source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
+        source
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec![]));
+        delta
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec![]));
         let cmd =
             VerifyCommand::new(source, delta, vec!["orders".to_string()]).with_table_plans(vec![
                 TablePlan {
@@ -1980,5 +2133,116 @@ mod tests {
         };
         let outcome = VerifyCommand::<MockSourceProbe, MockDeltaProbe>::key_stats_outcome("source", "delta", &s, &d);
         assert!(!matches!(outcome, TableOutcome::Pass), "distinct-sum must break the xor collision");
+    }
+
+    #[tokio::test]
+    async fn verify_value_aggregates_match_stays_pass() {
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        source.expect_row_count().returning(|_| Ok(3));
+        delta.expect_row_count().returning(|_| Ok(3));
+        let cols = || {
+            Ok(vec![
+                ColumnMeta {
+                    name: "id".to_string(),
+                    type_str: "bigint".to_string(),
+                    nullable: false,
+                },
+                ColumnMeta {
+                    name: "amount".to_string(),
+                    type_str: "int".to_string(),
+                    nullable: true,
+                },
+            ])
+        };
+        source.expect_columns().returning(move |_| cols());
+        delta.expect_columns().returning(move |_| cols());
+        let stats = || {
+            Ok(KeyStats {
+                count: 3,
+                distinct: 3,
+                min: Some(1),
+                max: Some(3),
+                xor: 1,
+                distinct_xor: 1,
+                sum: 6,
+            })
+        };
+        source.expect_key_stats().returning(move |_, _| stats());
+        delta.expect_key_stats().returning(move |_, _| stats());
+        source
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        delta
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
+        // Value aggregates match on both sides
+        source
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec!["sum=6|min=1|max=3".to_string()]));
+        delta
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec!["sum=6|min=1|max=3".to_string()]));
+        let cmd = VerifyCommand::new(source, delta, vec!["orders".to_string()]);
+        let result = cmd.run().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), VerifyVerdict::Clean);
+    }
+
+    #[tokio::test]
+    async fn verify_value_aggregates_mismatch_downgrades_to_discrepancy() {
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        source.expect_row_count().returning(|_| Ok(3));
+        delta.expect_row_count().returning(|_| Ok(3));
+        let cols = || {
+            Ok(vec![
+                ColumnMeta {
+                    name: "id".to_string(),
+                    type_str: "bigint".to_string(),
+                    nullable: false,
+                },
+                ColumnMeta {
+                    name: "amount".to_string(),
+                    type_str: "int".to_string(),
+                    nullable: true,
+                },
+            ])
+        };
+        source.expect_columns().returning(move |_| cols());
+        delta.expect_columns().returning(move |_| cols());
+        let stats = || {
+            Ok(KeyStats {
+                count: 3,
+                distinct: 3,
+                min: Some(1),
+                max: Some(3),
+                xor: 1,
+                distinct_xor: 1,
+                sum: 6,
+            })
+        };
+        source.expect_key_stats().returning(move |_, _| stats());
+        delta.expect_key_stats().returning(move |_, _| stats());
+        source
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        delta
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
+        // Value aggregates differ
+        source
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec!["sum=6|min=1|max=3".to_string()]));
+        delta
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec!["sum=9|min=2|max=3".to_string()]));
+        let cmd = VerifyCommand::new(source, delta, vec!["orders".to_string()]);
+        let result = cmd.run().await;
+        assert!(result.is_ok());
+        // Mismatch downgrades to Discrepancy
+        assert_eq!(result.unwrap(), VerifyVerdict::Discrepancy);
     }
 }

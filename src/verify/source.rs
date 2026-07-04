@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use sqlx::Row;
 use std::collections::HashMap;
 
-use super::{ColumnMeta, KeyStats, SourceProbe, SourceScope};
+use super::{AggKind, ColumnAgg, ColumnMeta, KeyStats, SourceProbe, SourceScope};
 
 fn scope_predicate_sql(scope: &SourceScope) -> String {
     format!(
@@ -211,5 +211,65 @@ impl SourceProbe for SourceProbeAdapter {
             map.insert(id, vals);
         }
         Ok(map)
+    }
+
+    async fn value_aggregates(&self, table: &str, columns: &[ColumnAgg]) -> Result<Vec<String>> {
+        let mut fingerprints = Vec::with_capacity(columns.len());
+        for col in columns {
+            let fp = match col.kind {
+                AggKind::Integer => {
+                    let row: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(&format!(
+                        "SELECT CAST(SUM(`{col}`) AS CHAR), CAST(MIN(`{col}`) AS CHAR), CAST(MAX(`{col}`) AS CHAR) FROM `{table}`",
+                        col = col.name
+                    ))
+                    .fetch_one(&self.pool)
+                    .await
+                    .with_context(|| format!("source value_aggregates {table}.{}", col.name))?;
+                    super::fp_num(row.0.as_deref(), row.1.as_deref(), row.2.as_deref())
+                }
+                AggKind::Decimal => {
+                    let row: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(&format!(
+                        "SELECT CAST(CAST(SUM(`{col}`) AS DECIMAL(38,10)) AS CHAR), CAST(CAST(MIN(`{col}`) AS DECIMAL(38,10)) AS CHAR), CAST(CAST(MAX(`{col}`) AS DECIMAL(38,10)) AS CHAR) FROM `{table}`",
+                        col = col.name
+                    ))
+                    .fetch_one(&self.pool)
+                    .await
+                    .with_context(|| format!("source value_aggregates {table}.{}", col.name))?;
+                    super::fp_num(row.0.as_deref(), row.1.as_deref(), row.2.as_deref())
+                }
+                AggKind::DatetimeSec => {
+                    let row: (Option<String>, Option<String>) = sqlx::query_as(&format!(
+                        "SELECT DATE_FORMAT(MIN(`{col}`), '%Y-%m-%d %H:%i:%s'), DATE_FORMAT(MAX(`{col}`), '%Y-%m-%d %H:%i:%s') FROM `{table}`",
+                        col = col.name
+                    ))
+                    .fetch_one(&self.pool)
+                    .await
+                    .with_context(|| format!("source value_aggregates {table}.{}", col.name))?;
+                    super::fp_minmax(row.0.as_deref(), row.1.as_deref())
+                }
+                AggKind::DateOnly => {
+                    let row: (Option<String>, Option<String>) = sqlx::query_as(&format!(
+                        "SELECT DATE_FORMAT(MIN(`{col}`), '%Y-%m-%d'), DATE_FORMAT(MAX(`{col}`), '%Y-%m-%d') FROM `{table}`",
+                        col = col.name
+                    ))
+                    .fetch_one(&self.pool)
+                    .await
+                    .with_context(|| format!("source value_aggregates {table}.{}", col.name))?;
+                    super::fp_minmax(row.0.as_deref(), row.1.as_deref())
+                }
+                AggKind::TextMass => {
+                    let row: (Option<String>, i64) = sqlx::query_as(&format!(
+                        "SELECT CAST(SUM(CHAR_LENGTH(`{col}`)) AS CHAR), COUNT(`{col}`) FROM `{table}`",
+                        col = col.name
+                    ))
+                    .fetch_one(&self.pool)
+                    .await
+                    .with_context(|| format!("source value_aggregates {table}.{}", col.name))?;
+                    super::fp_textmass(row.0.as_deref(), row.1)
+                }
+            };
+            fingerprints.push(fp);
+        }
+        Ok(fingerprints)
     }
 }
