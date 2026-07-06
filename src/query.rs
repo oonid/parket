@@ -25,6 +25,7 @@ impl QueryBuilder {
         table: &str,
         columns: &[String],
         timestamp_col: &str,
+        key_col: &str,
         hwm_updated_at: Option<&str>,
         hwm_last_id: Option<i64>,
         batch_size: u64,
@@ -32,16 +33,17 @@ impl QueryBuilder {
         let col_list = format_columns(columns);
         let quoted_table = backtick(table);
         let ts = backtick(timestamp_col);
+        let key = backtick(key_col);
 
         match (hwm_updated_at, hwm_last_id) {
             (Some(updated_at), Some(last_id)) => {
                 format!(
-                    "SELECT {col_list} FROM {quoted_table} WHERE {ts} IS NOT NULL AND (({ts} = '{updated_at}' AND `id` > {last_id}) OR ({ts} > '{updated_at}')) ORDER BY {ts} ASC, `id` ASC LIMIT {batch_size}"
+                    "SELECT {col_list} FROM {quoted_table} WHERE {ts} IS NOT NULL AND (({ts} = '{updated_at}' AND {key} > {last_id}) OR ({ts} > '{updated_at}')) ORDER BY {ts} ASC, {key} ASC LIMIT {batch_size}"
                 )
             }
             _ => {
                 format!(
-                    "SELECT {col_list} FROM {quoted_table} WHERE {ts} IS NOT NULL ORDER BY {ts} ASC, `id` ASC LIMIT {batch_size}"
+                    "SELECT {col_list} FROM {quoted_table} WHERE {ts} IS NOT NULL ORDER BY {ts} ASC, {key} ASC LIMIT {batch_size}"
                 )
             }
         }
@@ -125,6 +127,7 @@ mod tests {
                 "updated_at".to_string(),
             ],
             "updated_at",
+            "id",
             Some("2026-03-28 09:00:00"),
             Some(500),
             10000,
@@ -148,6 +151,7 @@ mod tests {
                 "updated_at".to_string(),
             ],
             "updated_at",
+            "id",
             None,
             None,
             10000,
@@ -258,6 +262,7 @@ mod tests {
             "orders",
             &["id".to_string()],
             "updated_at",
+            "id",
             Some("2026-01-01 00:00:00"),
             Some(42),
             5000,
@@ -277,6 +282,7 @@ mod tests {
             "orders",
             &["id".to_string()],
             "updated_at",
+            "id",
             Some("2026-01-01 00:00:00"),
             None,
             10000,
@@ -295,6 +301,7 @@ mod tests {
             "orders",
             &["id".to_string()],
             "updated_at",
+            "id",
             None,
             Some(42),
             10000,
@@ -332,6 +339,7 @@ mod tests {
                 "updated_at".to_string(),
             ],
             "updated_at",
+            "id",
             Some("2026-03-28 09:00:00"),
             Some(500),
             10000,
@@ -345,12 +353,37 @@ mod tests {
 
     #[test]
     fn incremental_no_hwm_exact_output() {
-        let sql =
-            QueryBuilder::build_incremental_query("orders", &["id".to_string()], "updated_at", None, None, 5000);
+        let sql = QueryBuilder::build_incremental_query(
+            "orders",
+            &["id".to_string()],
+            "updated_at",
+            "id",
+            None,
+            None,
+            5000,
+        );
 
         assert_eq!(
             sql,
             "SELECT `id` FROM `orders` WHERE `updated_at` IS NOT NULL ORDER BY `updated_at` ASC, `id` ASC LIMIT 5000"
+        );
+    }
+
+    #[test]
+    fn incremental_custom_key_column_exact_output() {
+        let sql = QueryBuilder::build_incremental_query(
+            "orders",
+            &["order_id".to_string(), "updated_at".to_string()],
+            "updated_at",
+            "order_id",
+            Some("2026-03-28 09:00:00"),
+            Some(500),
+            10000,
+        );
+
+        assert_eq!(
+            sql,
+            "SELECT `order_id`, `updated_at` FROM `orders` WHERE `updated_at` IS NOT NULL AND ((`updated_at` = '2026-03-28 09:00:00' AND `order_id` > 500) OR (`updated_at` > '2026-03-28 09:00:00')) ORDER BY `updated_at` ASC, `order_id` ASC LIMIT 10000"
         );
     }
 
@@ -364,6 +397,7 @@ mod tests {
                 "completed_at".to_string(),
             ],
             "completed_at",
+            "id",
             Some("2026-03-28 09:00:00"),
             Some(500),
             10000,
@@ -428,6 +462,7 @@ mod tests {
             "orders",
             &["id".to_string()],
             "updated_at",
+            "id",
             Some("2026-03-28 09:00:00"),
             Some(500),
             10000,
@@ -439,6 +474,7 @@ mod tests {
             "orders",
             &["id".to_string()],
             "updated_at",
+            "id",
             None,
             None,
             10000,

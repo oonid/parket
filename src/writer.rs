@@ -18,7 +18,7 @@ mod schema;
 mod two_stream;
 
 use hwm::build_commit_properties;
-pub use hwm::{extract_hwm_from_batch, extract_max_id};
+pub use hwm::{extract_hwm_from_batch, extract_max_id, hwm_has_advanced};
 use schema::*;
 
 /// True only when the error means the Delta table does not exist yet (so "no HWM" is

@@ -1,10 +1,10 @@
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use tracing::info;
 
 use crate::query::QueryBuilder;
-use crate::writer::{extract_hwm_from_batch, extract_max_id, Hwm};
+use crate::writer::{extract_hwm_from_batch, extract_max_id, hwm_has_advanced, Hwm};
 
 use super::Orchestrator;
 use super::{DeltaWrite, Extract, SchemaInspect, StateManage};
@@ -90,7 +90,10 @@ where
             if self.progress { info!(table = table_name, after_hwm = ?update_hwm, "two-stream update: fetching chunk"); }
             let t_extract = Instant::now();
             let sql = QueryBuilder::build_incremental_query(
-                table_name, columns, update_col,
+                table_name,
+                columns,
+                update_col,
+                insert_col,
                 update_hwm.as_ref().map(|h| h.updated_at.as_str()),
                 update_hwm.as_ref().map(|h| h.last_id),
                 batch_size,
@@ -100,7 +103,20 @@ where
             if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) { break; }
             let chunk_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
             let arrow_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
-            let new_hwm = batches.last().and_then(|b| extract_hwm_from_batch(b, update_col));
+            let new_hwm = batches
+                .last()
+                .and_then(|b| extract_hwm_from_batch(b, update_col, insert_col));
+            if chunk_rows == batch_size {
+                match new_hwm.as_ref() {
+                    None => bail!(
+                        "two-stream update batch for table `{table_name}` could not extract HWM from a full batch"
+                    ),
+                    Some(next_hwm) if !hwm_has_advanced(update_hwm.as_ref(), next_hwm) => bail!(
+                        "two-stream update batch for table `{table_name}` did not advance HWM on a full batch"
+                    ),
+                    Some(_) => {}
+                }
+            }
             if self.progress { info!(table = table_name, rows = chunk_rows, extract_ms, "two-stream update: extracted, merging"); }
             let t_write = Instant::now();
             if std::env::var("UPDATE_STRATEGY").as_deref() == Ok("merge") {
@@ -390,6 +406,255 @@ mod tests {
         let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
         let result = orch.run().await;
         assert!(matches!(result, ExitCode::Success));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn two_stream_update_uses_insert_cursor_for_multi_batch_paging() {
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_insert_cursor.insert("orders".to_string(), "order_id".to_string());
+        config.table_update_cursor.insert("orders".to_string(), "updated_at".to_string());
+
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| crate::state::AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| {
+                Ok(vec![
+                    crate::discovery::ColumnInfo {
+                        name: "order_id".to_string(),
+                        data_type: "bigint".to_string(),
+                        column_type: "bigint(20)".to_string(),
+                    },
+                    crate::discovery::ColumnInfo {
+                        name: "name".to_string(),
+                        data_type: "varchar".to_string(),
+                        column_type: "varchar(255)".to_string(),
+                    },
+                    crate::discovery::ColumnInfo {
+                        name: "updated_at".to_string(),
+                        data_type: "timestamp".to_string(),
+                        column_type: "timestamp".to_string(),
+                    },
+                ])
+            });
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        schema_mock
+            .expect_max_timestamp()
+            .returning(|_, _| Ok(None));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        extract_mock
+            .expect_batch_size()
+            .returning(|| 1);
+        writer_mock
+            .expect_ensure_table()
+            .returning(|_, _| Ok(()));
+        writer_mock
+            .expect_get_schema()
+            .returning(|_| Ok(None));
+        writer_mock
+            .expect_read_insert_hwm()
+            .returning(|_| Ok(Some(100)));
+        writer_mock
+            .expect_read_hwm()
+            .returning(|_| Ok(Some(crate::writer::Hwm {
+                updated_at: "2026-06-01T00:00:00.000000".to_string(),
+                last_id: 49,
+            })));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        extract_mock
+            .expect_extract()
+            .returning(move |sql| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                match count {
+                    0 => Ok(vec![]),
+                    1 => {
+                        assert!(sql.contains("(`updated_at` = '2026-06-01T00:00:00.000000' AND `order_id` > 49)"));
+                        assert!(sql.contains("ORDER BY `updated_at` ASC, `order_id` ASC"));
+                        let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                            deltalake::arrow::datatypes::Field::new("order_id", deltalake::arrow::datatypes::DataType::Int64, false),
+                            deltalake::arrow::datatypes::Field::new("name", deltalake::arrow::datatypes::DataType::Utf8, false),
+                            deltalake::arrow::datatypes::Field::new("updated_at", deltalake::arrow::datatypes::DataType::Utf8, false),
+                        ]));
+                        let batch = RecordBatch::try_new(
+                            schema,
+                            vec![
+                                Arc::new(deltalake::arrow::array::Int64Array::from(vec![50i64])),
+                                Arc::new(deltalake::arrow::array::StringArray::from(vec!["first"])),
+                                Arc::new(deltalake::arrow::array::StringArray::from(vec!["2026-06-01T00:00:00.000000"])),
+                            ],
+                        )
+                        .unwrap();
+                        Ok(vec![batch])
+                    }
+                    2 => {
+                        assert!(sql.contains("(`updated_at` = '2026-06-01T00:00:00.000000' AND `order_id` > 50)"));
+                        assert!(sql.contains("ORDER BY `updated_at` ASC, `order_id` ASC"));
+                        let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                            deltalake::arrow::datatypes::Field::new("order_id", deltalake::arrow::datatypes::DataType::Int64, false),
+                            deltalake::arrow::datatypes::Field::new("name", deltalake::arrow::datatypes::DataType::Utf8, false),
+                            deltalake::arrow::datatypes::Field::new("updated_at", deltalake::arrow::datatypes::DataType::Utf8, false),
+                        ]));
+                        let batch = RecordBatch::try_new(
+                            schema,
+                            vec![
+                                Arc::new(deltalake::arrow::array::Int64Array::from(vec![51i64])),
+                                Arc::new(deltalake::arrow::array::StringArray::from(vec!["second"])),
+                                Arc::new(deltalake::arrow::array::StringArray::from(vec!["2026-06-01T00:00:00.000000"])),
+                            ],
+                        )
+                        .unwrap();
+                        Ok(vec![batch])
+                    }
+                    _ => Ok(vec![]),
+                }
+            });
+
+        writer_mock
+            .expect_append_two_stream()
+            .times(0)
+            .returning(|_, _, _, _| Ok(()));
+        writer_mock
+            .expect_delete_then_append()
+            .times(2)
+            .returning(|_, _, _, _, _| Ok(()));
+        state_mock
+            .expect_update_table()
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success));
+        assert_eq!(call_count.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn two_stream_update_full_batch_without_hwm_progress_fails_before_write() {
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_insert_cursor.insert("orders".to_string(), "order_id".to_string());
+        config.table_update_cursor.insert("orders".to_string(), "updated_at".to_string());
+
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| crate::state::AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| {
+                Ok(vec![
+                    crate::discovery::ColumnInfo {
+                        name: "order_id".to_string(),
+                        data_type: "bigint".to_string(),
+                        column_type: "bigint(20)".to_string(),
+                    },
+                    crate::discovery::ColumnInfo {
+                        name: "name".to_string(),
+                        data_type: "varchar".to_string(),
+                        column_type: "varchar(255)".to_string(),
+                    },
+                    crate::discovery::ColumnInfo {
+                        name: "updated_at".to_string(),
+                        data_type: "timestamp".to_string(),
+                        column_type: "timestamp".to_string(),
+                    },
+                ])
+            });
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        schema_mock
+            .expect_max_timestamp()
+            .returning(|_, _| Ok(None));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        extract_mock
+            .expect_batch_size()
+            .returning(|| 1);
+        writer_mock
+            .expect_ensure_table()
+            .returning(|_, _| Ok(()));
+        writer_mock
+            .expect_get_schema()
+            .returning(|_| Ok(None));
+        writer_mock
+            .expect_read_insert_hwm()
+            .returning(|_| Ok(Some(100)));
+        writer_mock
+            .expect_read_hwm()
+            .returning(|_| Ok(Some(crate::writer::Hwm {
+                updated_at: "2026-06-01T00:00:00.000000".to_string(),
+                last_id: 50,
+            })));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        extract_mock
+            .expect_extract()
+            .returning(move |_| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    Ok(vec![])
+                } else if count == 1 {
+                    let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                        deltalake::arrow::datatypes::Field::new("order_id", deltalake::arrow::datatypes::DataType::Int64, false),
+                        deltalake::arrow::datatypes::Field::new("name", deltalake::arrow::datatypes::DataType::Utf8, false),
+                        deltalake::arrow::datatypes::Field::new(
+                            "updated_at",
+                            deltalake::arrow::datatypes::DataType::Utf8,
+                            false,
+                        ),
+                    ]));
+                    let batch = RecordBatch::try_new(
+                        schema,
+                        vec![
+                            Arc::new(deltalake::arrow::array::Int64Array::from(vec![50i64])),
+                            Arc::new(deltalake::arrow::array::StringArray::from(vec!["stuck"])),
+                            Arc::new(deltalake::arrow::array::StringArray::from(vec!["2026-06-01T00:00:00.000000"])),
+                        ],
+                    )
+                    .unwrap();
+                    Ok(vec![batch])
+                } else {
+                    Ok(vec![])
+                }
+            });
+
+        writer_mock
+            .expect_append_two_stream()
+            .times(0)
+            .returning(|_, _, _, _| Ok(()));
+        writer_mock
+            .expect_delete_then_append()
+            .times(0)
+            .returning(|_, _, _, _, _| Ok(()));
+        state_mock
+            .expect_update_table()
+            .withf(|_, state, _| state.last_run_status.as_deref() == Some("failed"))
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Fatal));
     }
 
     #[tokio::test]

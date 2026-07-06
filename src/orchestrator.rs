@@ -581,12 +581,14 @@ mod tests {
                     let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
                         deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int32, false),
                         deltalake::arrow::datatypes::Field::new("val", deltalake::arrow::datatypes::DataType::Int32, false),
+                        deltalake::arrow::datatypes::Field::new("updated_at", deltalake::arrow::datatypes::DataType::Utf8, false),
                     ]));
                     let batch = deltalake::arrow::record_batch::RecordBatch::try_new(
                         schema,
                         vec![
+                            Arc::new(deltalake::arrow::array::Int32Array::from(vec![count as i32 + 1])),
                             Arc::new(deltalake::arrow::array::Int32Array::from(vec![1i32])),
-                            Arc::new(deltalake::arrow::array::Int32Array::from(vec![1i32])),
+                            Arc::new(deltalake::arrow::array::StringArray::from(vec![format!("2026-01-01T00:00:0{count}.000000")])),
                         ],
                     )
                     .unwrap();
@@ -1114,12 +1116,14 @@ mod tests {
                     let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
                         deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int32, false),
                         deltalake::arrow::datatypes::Field::new("val", deltalake::arrow::datatypes::DataType::Int32, false),
+                        deltalake::arrow::datatypes::Field::new("updated_at", deltalake::arrow::datatypes::DataType::Utf8, false),
                     ]));
                     let batch = deltalake::arrow::record_batch::RecordBatch::try_new(
                         schema,
                         vec![
+                            Arc::new(deltalake::arrow::array::Int32Array::from(vec![count as i32 + 1])),
                             Arc::new(deltalake::arrow::array::Int32Array::from(vec![1i32])),
-                            Arc::new(deltalake::arrow::array::Int32Array::from(vec![1i32])),
+                            Arc::new(deltalake::arrow::array::StringArray::from(vec![format!("2026-01-01T00:00:0{count}.000000")])),
                         ],
                     )
                     .unwrap();

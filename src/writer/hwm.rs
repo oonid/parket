@@ -6,9 +6,9 @@ use deltalake::arrow::record_batch::RecordBatch;
 use super::datetime::extract_timestamp_as_strings;
 use super::Hwm;
 
-pub fn extract_hwm_from_batch(batch: &RecordBatch, timestamp_col: &str) -> Option<Hwm> {
+pub fn extract_hwm_from_batch(batch: &RecordBatch, timestamp_col: &str, key_col: &str) -> Option<Hwm> {
     let timestamp_col_data = batch.column_by_name(timestamp_col)?;
-    let id_col = batch.column_by_name("id")?;
+    let key_col_data = batch.column_by_name(key_col)?;
 
     let n = batch.num_rows();
     if n == 0 {
@@ -16,7 +16,7 @@ pub fn extract_hwm_from_batch(batch: &RecordBatch, timestamp_col: &str) -> Optio
     }
 
     let timestamp_strings = extract_timestamp_as_strings(timestamp_col_data)?;
-    let ids = extract_id_as_i64(id_col)?;
+    let ids = extract_id_as_i64(key_col_data)?;
 
     // Build candidate list filtering out empty (NULL) timestamps
     let candidates: Vec<(usize, &str, i64)> = timestamp_strings
@@ -42,6 +42,16 @@ pub fn extract_hwm_from_batch(batch: &RecordBatch, timestamp_col: &str) -> Optio
         updated_at: max_ts.to_string(),
         last_id: *max_id,
     })
+}
+
+pub fn hwm_has_advanced(current: Option<&Hwm>, next: &Hwm) -> bool {
+    match current {
+        None => true,
+        Some(current) => {
+            next.updated_at > current.updated_at
+                || (next.updated_at == current.updated_at && next.last_id > current.last_id)
+        }
+    }
 }
 
 /// Max integer key in a batch — the insert-stream watermark. `key_col` is the
@@ -160,7 +170,7 @@ mod tests {
             vec!["a"],
             vec![1743158400000000i64],
         );
-        let hwm = extract_hwm_from_batch(&batch, "updated_at").unwrap();
+        let hwm = extract_hwm_from_batch(&batch, "updated_at", "id").unwrap();
         assert_eq!(hwm.last_id, 42);
         assert!(hwm.updated_at.contains("2025"));
     }
@@ -172,7 +182,7 @@ mod tests {
             vec!["a", "b", "c"],
             vec![1000000i64, 3000000i64, 2000000i64],
         );
-        let hwm = extract_hwm_from_batch(&batch, "updated_at").unwrap();
+        let hwm = extract_hwm_from_batch(&batch, "updated_at", "id").unwrap();
         assert_eq!(hwm.last_id, 2);
     }
 
@@ -183,7 +193,7 @@ mod tests {
             vec!["a", "b", "c"],
             vec![5000000i64, 5000000i64, 5000000i64],
         );
-        let hwm = extract_hwm_from_batch(&batch, "updated_at").unwrap();
+        let hwm = extract_hwm_from_batch(&batch, "updated_at", "id").unwrap();
         assert_eq!(hwm.last_id, 50);
     }
 
@@ -197,7 +207,7 @@ mod tests {
         let id_arr = Int32Array::from(vec![10i32, 20i32, 5i32]);
         let ts_arr = StringArray::from(vec!["2026-01-01T00:00:01.000000", "2026-01-01T00:00:03.000000", "2026-01-01T00:00:02.000000"]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(ts_arr)]).unwrap();
-        let hwm = extract_hwm_from_batch(&batch, "updated_at").expect("Int32 id must produce a HWM");
+        let hwm = extract_hwm_from_batch(&batch, "updated_at", "id").expect("Int32 id must produce a HWM");
         assert_eq!(hwm.last_id, 20);
         assert!(hwm.updated_at.contains("00:03"));
     }
@@ -216,7 +226,7 @@ mod tests {
             "2026-06-07T12:30:00.000000",
         ]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(ts_arr)]).unwrap();
-        let hwm = extract_hwm_from_batch(&batch, "updated_at").expect("Utf8 timestamp must produce a HWM");
+        let hwm = extract_hwm_from_batch(&batch, "updated_at", "id").expect("Utf8 timestamp must produce a HWM");
         assert_eq!(hwm.last_id, 2);
         assert_eq!(hwm.updated_at, "2026-06-07T13:00:00.000000");
     }
@@ -236,19 +246,19 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(ts_arr)]).unwrap();
 
-        assert!(extract_hwm_from_batch(&batch, "updated_at").is_none());
+        assert!(extract_hwm_from_batch(&batch, "updated_at", "id").is_none());
     }
 
     #[test]
     fn extract_hwm_missing_updated_at_returns_none() {
         let batch = make_batch_no_updated_at();
-        assert!(extract_hwm_from_batch(&batch, "updated_at").is_none());
+        assert!(extract_hwm_from_batch(&batch, "updated_at", "id").is_none());
     }
 
     #[test]
     fn extract_hwm_missing_id_returns_none() {
         let batch = make_batch_no_id();
-        assert!(extract_hwm_from_batch(&batch, "updated_at").is_none());
+        assert!(extract_hwm_from_batch(&batch, "updated_at", "id").is_none());
     }
 
     #[test]
@@ -262,7 +272,7 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(ts_arr)]).unwrap();
 
-        let hwm = extract_hwm_from_batch(&batch, "updated_at").unwrap();
+        let hwm = extract_hwm_from_batch(&batch, "updated_at", "id").unwrap();
         assert_eq!(hwm.last_id, 2);
         assert_eq!(hwm.updated_at, "2026-03-28 10:00:00");
     }
@@ -282,7 +292,7 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(ts_arr)]).unwrap();
 
-        let hwm = extract_hwm_from_batch(&batch, "updated_at").unwrap();
+        let hwm = extract_hwm_from_batch(&batch, "updated_at", "id").unwrap();
         assert_eq!(hwm.last_id, 2);
     }
 
@@ -301,7 +311,7 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(ts_arr)]).unwrap();
 
-        let hwm = extract_hwm_from_batch(&batch, "updated_at").unwrap();
+        let hwm = extract_hwm_from_batch(&batch, "updated_at", "id").unwrap();
         assert_eq!(hwm.last_id, 1);
     }
 
@@ -312,7 +322,7 @@ mod tests {
             vec!["c", "b", "a"],
             vec![3000000i64, 2000000i64, 1000000i64],
         );
-        let hwm = extract_hwm_from_batch(&batch, "updated_at").unwrap();
+        let hwm = extract_hwm_from_batch(&batch, "updated_at", "id").unwrap();
         assert_eq!(hwm.last_id, 3);
     }
 
@@ -323,7 +333,7 @@ mod tests {
             vec!["c", "b", "a"],
             vec![5000000i64, 5000000i64, 5000000i64],
         );
-        let hwm = extract_hwm_from_batch(&batch, "updated_at").unwrap();
+        let hwm = extract_hwm_from_batch(&batch, "updated_at", "id").unwrap();
         assert_eq!(hwm.last_id, 30);
     }
 
@@ -345,7 +355,7 @@ mod tests {
         ]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(ts_arr)]).unwrap();
 
-        let hwm = extract_hwm_from_batch(&batch, "updated_at").unwrap();
+        let hwm = extract_hwm_from_batch(&batch, "updated_at", "id").unwrap();
         assert_eq!(hwm.last_id, 3);
     }
 
@@ -363,7 +373,7 @@ mod tests {
         let ts_arr = TimestampMillisecondArray::from(vec![Some(1000i64), None]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(ts_arr)]).unwrap();
 
-        let hwm = extract_hwm_from_batch(&batch, "updated_at").unwrap();
+        let hwm = extract_hwm_from_batch(&batch, "updated_at", "id").unwrap();
         assert_eq!(hwm.last_id, 1);
     }
 
@@ -381,7 +391,7 @@ mod tests {
         let ts_arr = TimestampSecondArray::from(vec![None, Some(2000i64)]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(ts_arr)]).unwrap();
 
-        let hwm = extract_hwm_from_batch(&batch, "updated_at").unwrap();
+        let hwm = extract_hwm_from_batch(&batch, "updated_at", "id").unwrap();
         assert_eq!(hwm.last_id, 2);
     }
 
@@ -396,7 +406,7 @@ mod tests {
         let ts_arr = Float64Array::from(vec![1.0f64]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(ts_arr)]).unwrap();
 
-        assert!(extract_hwm_from_batch(&batch, "updated_at").is_none());
+        assert!(extract_hwm_from_batch(&batch, "updated_at", "id").is_none());
     }
 
     #[test]
@@ -414,7 +424,7 @@ mod tests {
         let ts_arr = TimestampMicrosecondArray::from(vec![1000000i64]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(ts_arr)]).unwrap();
 
-        let hwm = extract_hwm_from_batch(&batch, "updated_at").expect("Int32 id must produce a HWM");
+        let hwm = extract_hwm_from_batch(&batch, "updated_at", "id").expect("Int32 id must produce a HWM");
         assert_eq!(hwm.last_id, 1);
     }
 
@@ -432,7 +442,7 @@ mod tests {
         ]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(ts_arr)]).unwrap();
 
-        let hwm = extract_hwm_from_batch(&batch, "updated_at").unwrap();
+        let hwm = extract_hwm_from_batch(&batch, "updated_at", "id").unwrap();
         assert_eq!(hwm.last_id, 3);
         assert_eq!(hwm.updated_at, "2026-03-28 11:00:00");
     }
@@ -451,8 +461,27 @@ mod tests {
         ]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(ts_arr)]).unwrap();
 
-        let hwm = extract_hwm_from_batch(&batch, "completed_at").unwrap();
+        let hwm = extract_hwm_from_batch(&batch, "completed_at", "id").unwrap();
         assert_eq!(hwm.last_id, 3);
+        assert_eq!(hwm.updated_at, "2026-01-01 12:00:00");
+    }
+
+    #[test]
+    fn extract_hwm_custom_key_column_name() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("order_id", DataType::Int64, false),
+            Field::new("updated_at", DataType::Utf8, false),
+        ]));
+        let key_arr = Int64Array::from(vec![10i64, 20i64, 15i64]);
+        let ts_arr = StringArray::from(vec![
+            "2026-01-01 10:00:00",
+            "2026-01-01 12:00:00",
+            "2026-01-01 11:00:00",
+        ]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(key_arr), Arc::new(ts_arr)]).unwrap();
+
+        let hwm = extract_hwm_from_batch(&batch, "updated_at", "order_id").unwrap();
+        assert_eq!(hwm.last_id, 20);
         assert_eq!(hwm.updated_at, "2026-01-01 12:00:00");
     }
 
@@ -472,7 +501,7 @@ mod tests {
         ]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(ts_arr)]).unwrap();
 
-        let hwm = extract_hwm_from_batch(&batch, "updated_at").unwrap();
+        let hwm = extract_hwm_from_batch(&batch, "updated_at", "id").unwrap();
         assert_eq!(hwm.last_id, 3);
         assert_eq!(hwm.updated_at, "2026-03-28 11:00:00");
     }
@@ -488,7 +517,7 @@ mod tests {
         let ts_arr = StringArray::from(vec![None as Option<&str>, None, None]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(ts_arr)]).unwrap();
 
-        assert!(extract_hwm_from_batch(&batch, "updated_at").is_none());
+        assert!(extract_hwm_from_batch(&batch, "updated_at", "id").is_none());
     }
 
     #[test]

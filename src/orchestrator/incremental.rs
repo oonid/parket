@@ -1,10 +1,10 @@
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use tracing::info;
 
 use crate::query::QueryBuilder;
-use crate::writer::extract_hwm_from_batch;
+use crate::writer::{extract_hwm_from_batch, hwm_has_advanced};
 
 use super::Orchestrator;
 use super::{DeltaWrite, Extract, SchemaInspect, StateManage};
@@ -51,6 +51,7 @@ where
                 table_name,
                 columns,
                 ts_col,
+                "id",
                 current_hwm.as_ref().map(|h| h.updated_at.as_str()),
                 current_hwm.as_ref().map(|h| h.last_id),
                 batch_size,
@@ -69,8 +70,19 @@ where
 
             let batch_hwm = batches
                 .last()
-                .and_then(|b| extract_hwm_from_batch(b, ts_col))
-                .clone();
+                .and_then(|b| extract_hwm_from_batch(b, ts_col, "id"));
+
+            if batch_rows == batch_size {
+                match batch_hwm.as_ref() {
+                    None => bail!(
+                        "incremental batch for table `{table_name}` could not extract HWM from a full batch"
+                    ),
+                    Some(next_hwm) if !hwm_has_advanced(current_hwm.as_ref(), next_hwm) => bail!(
+                        "incremental batch for table `{table_name}` did not advance HWM on a full batch"
+                    ),
+                    Some(_) => {}
+                }
+            }
 
             self.writer
                 .append_batch(table_name, batches, batch_hwm.clone())
@@ -214,6 +226,75 @@ mod tests {
         let result = orch.run().await;
         assert!(matches!(result, ExitCode::Success));
         assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn incremental_full_batch_without_hwm_fails_before_append() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config(vec!["orders".to_string()]);
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| crate::state::AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        writer_mock
+            .expect_ensure_table()
+            .returning(|_, _| Ok(()));
+        writer_mock
+            .expect_get_schema()
+            .returning(|_| Ok(None));
+        writer_mock
+            .expect_read_hwm()
+            .returning(|_| Ok(None));
+        extract_mock
+            .expect_batch_size()
+            .returning(|| 1);
+        extract_mock
+            .expect_extract()
+            .returning(|_| {
+                let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                    deltalake::arrow::datatypes::Field::new(
+                        "updated_at",
+                        deltalake::arrow::datatypes::DataType::Timestamp(
+                            deltalake::arrow::datatypes::TimeUnit::Microsecond,
+                            None,
+                        ),
+                        false,
+                    ),
+                ]));
+                let batch = RecordBatch::try_new(
+                    schema,
+                    vec![Arc::new(
+                        deltalake::arrow::array::TimestampMicrosecondArray::from(vec![1743158400000000i64]),
+                    )],
+                )
+                .unwrap();
+                Ok(vec![batch])
+            });
+        writer_mock
+            .expect_append_batch()
+            .times(0)
+            .returning(|_, _, _| Ok(()));
+        state_mock
+            .expect_update_table()
+            .withf(|_, state, _| state.last_run_status.as_deref() == Some("failed"))
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Fatal));
     }
 
     #[tokio::test]
