@@ -1,9 +1,38 @@
 # Audit findings register (living document)
 
-**Status date:** 2026-07-06. This is the single source of truth for audit findings — it consolidates
-`docs/audit-2026-07-04.md` (retired; content carried forward here) and the second-pass results in
-`docs/audit-2026-07-06.md` (kept for its detailed analysis; finding IDs below reference it).
-Target runtime: an **8 GB RAM** VM. Workflow: fix one finding at a time (plan → confirm → implement+test → review → commit); gate = `cargo build && cargo clippy --all-targets -- -D warnings && cargo test --lib`.
+**Status date:** 2026-07-06. This is the single source of truth for audit findings and remediation
+process — it consolidates `docs/audit-2026-07-04.md` and `docs/handoff-2026-07-06.md` (both retired;
+content carried forward here) and the second-pass results in `docs/audit-2026-07-06.md` (kept for its
+detailed analysis; finding IDs below reference it). Target runtime: an **8 GB RAM** VM.
+
+## 0. Process, gate, and state
+
+**Gate (run after every change; never trust a sub-agent's self-reported exit codes — re-run yourself
+and read the real output; stale IDE diagnostics have also misled here, `cargo` is the arbiter):**
+```bash
+cargo build
+cargo clippy --all-targets -- -D warnings   # zero-tolerance; --all-targets, not just --lib (see N6)
+cargo test --lib                             # unit tests, no Docker
+cargo llvm-cov --lib --fail-under-lines 90   # CI hard gate
+# cargo test  → integration tests, needs Docker (MariaDB + MinIO via testcontainers)
+```
+
+**Working conventions (from the maintainer):** no `Co-Authored-By`/AI-attribution trailers in
+commits; conventional-commit subjects (`fix(...)`, `feat(...)`, `docs(...)`); one finding at a time in
+a plan → confirm → implement+test → review → commit loop, stopping for confirmation between steps;
+snapshot branch (`snapshot/pre-<step>-<date>`) before starting each fix; small reviewable diffs; never
+weaken an existing test assertion to make it pass.
+
+**Branch state (2026-07-06):** active work on `test/verify-docker-integration` (C1 `8065c38`,
+R2 `4baa0f0`, docs, WIP Docker verify tests + uncommitted vendored `date→Utf8` edit in
+`vendor/connector_arrow` — see N4/T1). `audit/critical-fixes` is parked at R1 (`a600e77`);
+fast-forward it and prune the redundant `snapshot/*` / `fix/r2-hwm-progress` branches once the
+Docker tests land. Nothing is pushed to a remote; base `b59fd47` (= origin/master).
+
+**Standing caveat:** the verify value-aggregate SQL is review-verified plus MemTable-measured
+(see audit-2026-07-06 §4a), but full cross-engine equality is only proven by the Docker integration
+suite — until T2/T3 land and run green, treat verify's cross-engine correctness as plausible, not
+proven.
 
 ---
 
