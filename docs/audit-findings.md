@@ -24,17 +24,20 @@ snapshot branch (`snapshot/pre-<step>-<date>`) before starting each fix; small r
 weaken an existing test assertion to make it pass.
 
 **Branch state (2026-07-06):** active work on `test/verify-docker-integration` (C1 `8065c38`,
-R2 `4baa0f0`, docs, vendored pin bump `2cfcf59`; WIP Docker verify tests still uncommitted).
+R2 `4baa0f0`, docs, vendored pin bump `2cfcf59`, Docker verify tests `342e6f5`).
 `vendor/connector_arrow` is pinned to `e84c87f` on the oonid fork (`fix/mysql-type-coverage`,
 upstream PR #79) — repoint `.gitmodules` to aljazerzen once merged. `audit/critical-fixes` is
 parked at R1 (`a600e77`); fast-forward it and prune the redundant `snapshot/*` /
 `fix/r2-hwm-progress` branches once the Docker tests land. parket itself is not pushed to a
 remote; base `b59fd47` (= origin/master).
 
-**Standing caveat:** the verify value-aggregate SQL is review-verified plus MemTable-measured
-(see audit-2026-07-06 §4a), but full cross-engine equality is only proven by the Docker integration
-suite — until T2/T3 land and run green, treat verify's cross-engine correctness as plausible, not
-proven.
+**Cross-engine status (updated after `342e6f5`):** the verify value-aggregate SQL is now
+**execution-proven** against real MariaDB + MinIO for: full-refresh/basic deep verify across
+INT/DECIMAL/DATETIME(6)/DATE/VARCHAR incl. NULL + multibyte (Clean on match, Discrepancy on a pure
+value drift), and incremental HWM-scoped verify (Clean in-window, post-HWM rows genuinely excluded,
+in-window drift detected). Still unproven under Docker: the two-stream verify verdict path
+(`two_stream_key_stats_outcome`), the Drift and size-guard Skipped tiers, VARCHAR-only drift in
+isolation, and exact set-equality beyond the aggregate fingerprints.
 
 ---
 
@@ -49,6 +52,7 @@ proven.
 | C1 | `8065c38` | full-refresh keyset pagination (integer single-col PK) + deterministic OFFSET fallback — residuals: N8, T-gap |
 | R2 | `4baa0f0` | HWM no-progress guard (incremental + two-stream update) — residuals: N2, N3, N6, N7 |
 | V7 (value path) | `2d8da09` | Delta value aggregates HWM-scoped symmetric with source — key path still open (VA6) |
+| T1–T5 | `342e6f5` | Docker verify tests committed + strengthened: corruption→Discrepancy (both paths), post-HWM scope exclusion, NULL + multibyte rows; ran green under real MariaDB+MinIO (Opus-reviewed) |
 | N4 (+N1 mappings) | `2cfcf59` | vendored connector_arrow pinned to `e84c87f` (fork): DATE/MEDIUMINT/VARBINARY/JSON mapped instead of `todo!()` panic; upstreamed as [connector_arrow#79](https://github.com/aljazerzen/connector_arrow/pull/79) — switch `.gitmodules` back to upstream once merged |
 
 ## 2. Open — Critical
@@ -57,7 +61,7 @@ proven.
 ## 3. Open — High
 - **N2** — two-stream **insert** loop has no progress guard; `SMALLINT`/`TINYINT` cursor → `extract_max_id` None on a full chunk → infinite duplicate appends. Fix: mirror R2 bail; widen `extract_id_as_i64` to Int8/16/UInt8/16 (`writer/hwm.rs`).
 - **N3** — `incremental.rs:54,73` still hardcodes `"id"`; with the schema-evolution column filter, R2's guard becomes a permanent hard failure. Fix: thread the discovered key; force key+cursor into `select_columns`.
-- **N4/T1** — ~~vendored fix separable from the tests~~ **done** (`2cfcf59`, PR #79): fresh clones now fetch the fixed commit from the fork. Remaining T1 work: commit the WIP Docker verify tests themselves (plus T2–T5 additions).
+- **N4/T1** — ~~vendored fix separable from the tests~~ **done** (`2cfcf59`, PR #79): fresh clones now fetch the fixed commit from the fork. T1 completed in full by `342e6f5` (tests committed with T2–T5 strengthening).
 - **N5** — unsigned ints: Delta schema created signed (`mariadb_type_to_arrow` ignores ` unsigned`), batches arrive `UInt*`; evolution check structurally blind (O10). Verify live in Docker, then map/cast. Related: `extract_id_as_i64` `as i64` wraps past 2⁶³; full-refresh keyset bails only after chunk-0 overwrite.
 - **VA1** — DataFusion `sum(decimal(38,10))` silently wrong on precision overflow (measured) vs MySQL saturation → false Discrepancy on huge decimal sums. Guard by magnitude or skip SUM for at-risk columns.
 - **VA3** — verify memory on 8 GB: `latest_key_stats` full-log window sort runs **before** the row-cap guard; cap measures source not Delta log; per-column CTE re-scans; unbounded SessionContext. Fix: cap first, one multi-column aggregate query, bounded RuntimeEnv.
@@ -98,7 +102,7 @@ proven.
 - **V6** — verify sample = lowest 100 ids only; recent rows never spot-checked.
 - **V8** — unsigned-key CAST asymmetry in verify (saturate vs overflow) → false verdicts on `BIGINT UNSIGNED > 2⁶³`.
 - **O9/O11/O12** — failed-run state wipes last-success metadata + `schema_columns_hash` write-only; `TABLE_TIMESTAMP` validated before mode resolution (fails tables that never use it); `--verify` mode resolution is a third divergent copy — auto-detected incremental verifies as `Basic`. Shared mode-resolver fixes O5/O7/O12 together.
-- **T2/T3/T4/T5** — verify Docker tests: add corruption→Discrepancy case (acceptance bar), a post-HWM source row (scope falsifiability), NULL rows, multibyte text. Suite also lacks keyset page-boundary (C1) and R2-bail coverage.
+- **T2–T5** — ~~corruption/scope/NULL/multibyte test coverage~~ **done** (`342e6f5`). Still open (T6): two-stream verify verdicts, Drift + Skipped tiers, VARCHAR-only drift isolation under Docker; suite also lacks keyset page-boundary (C1) and R2-bail coverage.
 
 ## 5. Open — Low
 - **L1** calendar: O(|years|) loop + `i64` overflow near extremes (`calendar.rs:7-19`).
