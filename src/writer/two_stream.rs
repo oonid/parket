@@ -162,7 +162,14 @@ impl DeltaWriter {
     pub async fn read_insert_hwm(&self, table_name: &str) -> Result<Option<i64>> {
         let table = match self.open_table(table_name).await {
             Ok(t) => t,
-            Err(_) => return Ok(None),
+            Err(e) => {
+                if super::is_missing_table_error(&e) {
+                    return Ok(None);
+                }
+                return Err(e).context(format!(
+                    "read insert HWM: could not open Delta table `{table_name}`"
+                ));
+            }
         };
         let mut history = table.history(Some(1)).await?.collect::<Vec<_>>();
         let commit_info = match history.pop() {
@@ -302,6 +309,21 @@ mod tests {
         let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
         let insert_hwm = writer.read_insert_hwm("nonexistent").await.unwrap();
         assert!(insert_hwm.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_insert_hwm_s3_error_propagates() {
+        let writer = DeltaWriter::new(
+            "nonexistent-bucket",
+            "prefix",
+            Some("http://localhost:1"),
+            "us-east-1",
+            "fake",
+            "fake",
+        );
+
+        let result = writer.read_insert_hwm("nonexistent").await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

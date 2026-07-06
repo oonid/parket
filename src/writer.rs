@@ -21,6 +21,24 @@ use hwm::build_commit_properties;
 pub use hwm::{extract_hwm_from_batch, extract_max_id};
 use schema::*;
 
+/// True only when the error means the Delta table does not exist yet (so "no HWM" is
+/// the correct answer). Mirrors the classification `ensure_table` uses to decide it must
+/// create the table. Any OTHER error (transient S3, auth, network) must NOT be treated
+/// as "missing" — returning None there causes a from-scratch re-extract and duplicate rows.
+pub(crate) fn is_missing_table_error(e: &anyhow::Error) -> bool {
+    if let Some(dte) = e.downcast_ref::<deltalake::DeltaTableError>()
+        && matches!(
+            dte,
+            deltalake::DeltaTableError::NotATable(_)
+                | deltalake::DeltaTableError::InvalidTableLocation(_)
+        )
+    {
+        return true;
+    }
+    let err_str = e.to_string();
+    err_str.contains("does not exist") || err_str.contains("Invalid table location")
+}
+
 #[derive(Debug, Clone)]
 pub struct Hwm {
     pub updated_at: String,
@@ -221,9 +239,14 @@ impl DeltaWriter {
     pub async fn read_hwm(&self, table_name: &str) -> Result<Option<Hwm>> {
         let table = match self.open_table(table_name).await {
             Ok(t) => t,
-            Err(_) => {
-                info!(table = table_name, "Delta table does not exist, no HWM");
-                return Ok(None);
+            Err(e) => {
+                if is_missing_table_error(&e) {
+                    info!(table = table_name, "Delta table does not exist, no HWM");
+                    return Ok(None);
+                }
+                return Err(e).context(format!(
+                    "read HWM: could not open Delta table `{table_name}` (not treating a transient error as no-HWM, to avoid a from-scratch re-extract)"
+                ));
             }
         };
 
@@ -690,7 +713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_hwm_s3_error_returns_none() {
+    async fn read_hwm_s3_error_propagates() {
         let writer = DeltaWriter::new(
             "nonexistent-bucket",
             "prefix",
@@ -700,7 +723,7 @@ mod tests {
             "fake",
         );
 
-        let hwm = writer.read_hwm("nonexistent").await.unwrap();
-        assert!(hwm.is_none());
+        let result = writer.read_hwm("nonexistent").await;
+        assert!(result.is_err());
     }
 }
