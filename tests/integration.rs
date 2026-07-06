@@ -9,6 +9,9 @@ use parket::orchestrator::{
     DeltaWriterAdapter, ExitCode, ExtractorAdapter, Orchestrator, SchemaInspectorAdapter,
     SignalHandler, StateManageAdapter,
 };
+use parket::verify::{
+    DeltaProbeAdapter, SourceProbeAdapter, TablePlan, VerifyCommand, VerifyMode, VerifyVerdict,
+};
 use parket::writer::DeltaWriter;
 use sqlx::MySqlPool;
 use tempfile::TempDir;
@@ -877,3 +880,246 @@ async fn schema_evolution_add_column_warns_and_skips() {
     );
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn verify_value_aggregates_real_basic_match_across_type_families() {
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let env = TestEnv::new(vec!["audit_values"]).await;
+
+    sqlx::query(
+        "CREATE TABLE audit_values (            id BIGINT PRIMARY KEY,             qty INT NOT NULL,             amount DECIMAL(18,2) NOT NULL,             happened_at DATETIME(6) NOT NULL,             due_date DATE,             note VARCHAR(255) CHARACTER SET utf8mb4        )",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create audit_values table");
+
+    sqlx::query(
+        "INSERT INTO audit_values (id, qty, amount, happened_at, due_date, note) VALUES             (1, 10, 12.34, '2026-01-01 10:00:00.123456', '2026-01-05', 'alpha'),             (2, 25, 99.99, '2026-01-02 11:30:15.654321', '2026-01-06', 'bravo'),             (3, 7,  5.50,  '2026-01-03 09:45:59.000001', '2026-01-07', 'charlie'),             (4, 3,  1.00,  '2026-01-04 00:00:00.000000', NULL, NULL),             (5, 42, 8.88,  '2026-01-05 06:06:06.000000', '2026-01-08', 'héllo 世界')",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert audit_values rows");
+
+    let mut orchestrator = env.make_orchestrator();
+    let exit_code = orchestrator.run().await;
+    assert!(
+        matches!(exit_code, ExitCode::Success),
+        "expected Success exit code, got {exit_code:?}"
+    );
+
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let verdict = VerifyCommand::new(source, delta, vec!["audit_values".to_string()])
+        .with_table_plans(vec![TablePlan {
+            table: "audit_values".to_string(),
+            mode: VerifyMode::Basic,
+        }])
+        .with_deep(true)
+        .run()
+        .await
+        .expect("verify basic value aggregates should succeed");
+
+    assert_eq!(verdict, VerifyVerdict::Clean);
+
+    // T2: corrupt the source directly, without re-running the pipeline, and prove verify
+    // detects the drift instead of always reporting Clean.
+    sqlx::query(
+        "UPDATE audit_values SET amount = amount + 0.01, note = CONCAT(note, 'x') WHERE id = 2",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to corrupt audit_values row directly");
+
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let verdict_after_corruption =
+        VerifyCommand::new(source, delta, vec!["audit_values".to_string()])
+            .with_table_plans(vec![TablePlan {
+                table: "audit_values".to_string(),
+                mode: VerifyMode::Basic,
+            }])
+            .with_deep(true)
+            .run()
+            .await
+            .expect("verify basic value aggregates should succeed after corruption");
+
+    assert_eq!(verdict_after_corruption, VerifyVerdict::Discrepancy);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn verify_value_aggregates_real_incremental_hwm_scope_matches_latest_rows() {
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let env = TestEnv::new(vec!["orders"]).await;
+
+    sqlx::query(
+        "CREATE TABLE orders (            id BIGINT AUTO_INCREMENT PRIMARY KEY,             qty INT NOT NULL,             amount DECIMAL(18,2) NOT NULL,             happened_at DATETIME(6) NOT NULL,             due_date DATE NOT NULL,             note VARCHAR(255) NOT NULL,             updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)        )",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create orders table for verify");
+
+    sqlx::query("CREATE INDEX idx_orders_updated_at ON orders (updated_at)")
+        .execute(&env.pool)
+        .await
+        .expect("failed to create orders updated_at index");
+
+    sqlx::query(
+        "INSERT INTO orders (qty, amount, happened_at, due_date, note, updated_at) VALUES             (10, 12.34, '2026-01-01 10:00:00.123456', '2026-01-05', 'alpha', '2026-01-01 10:00:00.123456'),             (20, 20.50, '2026-01-02 11:30:15.654321', '2026-01-06', 'bravo', '2026-01-02 11:30:15.654321')",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert initial orders rows");
+
+    let mut run1 = env.make_orchestrator();
+    let exit1 = run1.run().await;
+    assert!(matches!(exit1, ExitCode::Success), "run 1 expected Success, got {exit1:?}");
+
+    sqlx::query(
+        "UPDATE orders             SET qty = 11,                 amount = 13.44,                 happened_at = '2026-01-03 12:15:30.222222',                 due_date = '2026-01-08',                 note = 'alpha-2',                 updated_at = '2026-01-03 12:15:30.222222'           WHERE id = 1",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to update existing order row");
+
+    sqlx::query(
+        "INSERT INTO orders (qty, amount, happened_at, due_date, note, updated_at) VALUES             (30, 31.75, '2026-01-04 08:45:00.999999', '2026-01-09', 'charlie', '2026-01-04 08:45:00.999999')",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert new incremental order row");
+
+    let mut run2 = env.make_orchestrator();
+    let exit2 = run2.run().await;
+    assert!(matches!(exit2, ExitCode::Success), "run 2 expected Success, got {exit2:?}");
+
+    let writer = DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    );
+    let hwm = writer
+        .read_hwm("orders")
+        .await
+        .expect("read_hwm failed for verify orders")
+        .expect("incremental verify orders should have HWM");
+
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let verdict = VerifyCommand::new(source, delta, vec!["orders".to_string()])
+        .with_table_plans(vec![TablePlan {
+            table: "orders".to_string(),
+            mode: VerifyMode::Incremental {
+                cursor_col: "updated_at".to_string(),
+                hwm: Some(hwm.clone()),
+            },
+        }])
+        .with_deep(true)
+        .run()
+        .await
+        .expect("verify incremental value aggregates should succeed");
+
+    assert_eq!(verdict, VerifyVerdict::Clean);
+
+    // T3: insert a new source row with updated_at strictly AFTER the stored HWM, without
+    // re-running the pipeline. The scope predicate must exclude this row entirely — verify
+    // should still report Clean, proving the HWM scope is actually enforced.
+    sqlx::query(
+        "INSERT INTO orders (qty, amount, happened_at, due_date, note, updated_at) VALUES             (99, 50.00, '2026-01-05 00:00:00.000000', '2026-01-10', 'post-hwm', '2026-01-05 00:00:00.000000')",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert post-HWM order row");
+
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let verdict_after_post_hwm_insert =
+        VerifyCommand::new(source, delta, vec!["orders".to_string()])
+            .with_table_plans(vec![TablePlan {
+                table: "orders".to_string(),
+                mode: VerifyMode::Incremental {
+                    cursor_col: "updated_at".to_string(),
+                    hwm: Some(hwm.clone()),
+                },
+            }])
+            .with_deep(true)
+            .run()
+            .await
+            .expect("verify incremental value aggregates should succeed after post-HWM insert");
+
+    assert_eq!(verdict_after_post_hwm_insert, VerifyVerdict::Clean);
+
+    // T2: corrupt a row INSIDE the HWM window directly, without re-running the pipeline, and
+    // prove verify detects the drift. Re-assigning `updated_at` to its own current value keeps
+    // the automatic ON UPDATE CURRENT_TIMESTAMP(6) from bumping it past the HWM, so the row
+    // stays inside the already-scoped window.
+    sqlx::query(
+        "UPDATE orders             SET qty = qty + 1,                 amount = amount + 0.01,                 note = CONCAT(note, 'x'),                 updated_at = updated_at           WHERE id = 1",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to corrupt existing order row directly");
+
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let verdict_after_corruption = VerifyCommand::new(source, delta, vec!["orders".to_string()])
+        .with_table_plans(vec![TablePlan {
+            table: "orders".to_string(),
+            mode: VerifyMode::Incremental {
+                cursor_col: "updated_at".to_string(),
+                hwm: Some(hwm),
+            },
+        }])
+        .with_deep(true)
+        .run()
+        .await
+        .expect("verify incremental value aggregates should succeed after corruption");
+
+    assert_eq!(verdict_after_corruption, VerifyVerdict::Discrepancy);
+}
