@@ -24,10 +24,12 @@ snapshot branch (`snapshot/pre-<step>-<date>`) before starting each fix; small r
 weaken an existing test assertion to make it pass.
 
 **Branch state (2026-07-06):** active work on `test/verify-docker-integration` (C1 `8065c38`,
-R2 `4baa0f0`, docs, WIP Docker verify tests + uncommitted vendored `date→Utf8` edit in
-`vendor/connector_arrow` — see N4/T1). `audit/critical-fixes` is parked at R1 (`a600e77`);
-fast-forward it and prune the redundant `snapshot/*` / `fix/r2-hwm-progress` branches once the
-Docker tests land. Nothing is pushed to a remote; base `b59fd47` (= origin/master).
+R2 `4baa0f0`, docs, vendored pin bump `2cfcf59`; WIP Docker verify tests still uncommitted).
+`vendor/connector_arrow` is pinned to `e84c87f` on the oonid fork (`fix/mysql-type-coverage`,
+upstream PR #79) — repoint `.gitmodules` to aljazerzen once merged. `audit/critical-fixes` is
+parked at R1 (`a600e77`); fast-forward it and prune the redundant `snapshot/*` /
+`fix/r2-hwm-progress` branches once the Docker tests land. parket itself is not pushed to a
+remote; base `b59fd47` (= origin/master).
 
 **Standing caveat:** the verify value-aggregate SQL is review-verified plus MemTable-measured
 (see audit-2026-07-06 §4a), but full cross-engine equality is only proven by the Docker integration
@@ -47,14 +49,15 @@ proven.
 | C1 | `8065c38` | full-refresh keyset pagination (integer single-col PK) + deterministic OFFSET fallback — residuals: N8, T-gap |
 | R2 | `4baa0f0` | HWM no-progress guard (incremental + two-stream update) — residuals: N2, N3, N6, N7 |
 | V7 (value path) | `2d8da09` | Delta value aggregates HWM-scoped symmetric with source — key path still open (VA6) |
+| N4 (+N1 mappings) | `2cfcf59` | vendored connector_arrow pinned to `e84c87f` (fork): DATE/MEDIUMINT/VARBINARY/JSON mapped instead of `todo!()` panic; upstreamed as [connector_arrow#79](https://github.com/aljazerzen/connector_arrow/pull/79) — switch `.gitmodules` back to upstream once merged |
 
 ## 2. Open — Critical
-- **N1 — extraction panics the process on parket-accepted types.** `MEDIUMINT`, `VARBINARY` (and `JSON` on MySQL-proper wire) pass discovery/mapping, then hit `todo!()` in vendored connector_arrow (`vendor/.../mysql/types.rs`, `create_field`) → abort exit 101, exit-code contract violated, remaining tables skipped. Fix: extend the fork's `type_db_into_arrow` (+ commit & bump pin — same delivery as N4/T1) and add a preflight allowlist so unmapped types are per-table errors. *(Detail: audit-2026-07-06 §1.)*
+- **N1 — extraction panics the process on unmapped column types.** *Largely mitigated by `2cfcf59`* (DATE/MEDIUMINT/VARBINARY/JSON now mapped; upstream PR #79). **Still open:** (a) the `todo!()` in `create_field` remains for any *other* unmapped type (`time`, `year`, `bit`-variants, geometry passed through, future types) → still a process abort; add a parket **preflight allowlist** so unmapped types are per-table errors, and/or upstream a follow-up turning the `todo!()` into a `ConnectorError`. (b) O8 remains: `time`/`year` fail the whole table instead of being skipped like geometry. *(Detail: audit-2026-07-06 §1.)*
 
 ## 3. Open — High
 - **N2** — two-stream **insert** loop has no progress guard; `SMALLINT`/`TINYINT` cursor → `extract_max_id` None on a full chunk → infinite duplicate appends. Fix: mirror R2 bail; widen `extract_id_as_i64` to Int8/16/UInt8/16 (`writer/hwm.rs`).
 - **N3** — `incremental.rs:54,73` still hardcodes `"id"`; with the schema-evolution column filter, R2's guard becomes a permanent hard failure. Fix: thread the discovered key; force key+cursor into `select_columns`.
-- **N4/T1** — the vendored `date→Utf8` fix and the WIP Docker verify tests are separable today; a fresh clone panics. Commit fork fix + submodule bump + tests atomically.
+- **N4/T1** — ~~vendored fix separable from the tests~~ **done** (`2cfcf59`, PR #79): fresh clones now fetch the fixed commit from the fork. Remaining T1 work: commit the WIP Docker verify tests themselves (plus T2–T5 additions).
 - **N5** — unsigned ints: Delta schema created signed (`mariadb_type_to_arrow` ignores ` unsigned`), batches arrive `UInt*`; evolution check structurally blind (O10). Verify live in Docker, then map/cast. Related: `extract_id_as_i64` `as i64` wraps past 2⁶³; full-refresh keyset bails only after chunk-0 overwrite.
 - **VA1** — DataFusion `sum(decimal(38,10))` silently wrong on precision overflow (measured) vs MySQL saturation → false Discrepancy on huge decimal sums. Guard by magnitude or skip SUM for at-risk columns.
 - **VA3** — verify memory on 8 GB: `latest_key_stats` full-log window sort runs **before** the row-cap guard; cap measures source not Delta log; per-column CTE re-scans; unbounded SessionContext. Fix: cap first, one multi-column aggregate query, bounded RuntimeEnv.
