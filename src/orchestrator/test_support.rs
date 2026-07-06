@@ -1,6 +1,6 @@
 use crate::orchestrator::*;
 use crate::config::Config;
-use crate::discovery::ColumnInfo;
+use crate::discovery::{ColumnInfo, IndexInfo};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::sync::watch;
@@ -105,6 +105,26 @@ pub(crate) fn setup_incremental_mocks(
     state_mock
         .expect_update_table()
         .returning(|_, _, _| Ok(()));
+}
+
+pub(crate) fn make_full_refresh_indexes() -> Vec<IndexInfo> {
+    vec![]
+}
+
+pub(crate) fn make_full_refresh_primary_key(key_col: &str) -> Vec<IndexInfo> {
+    vec![IndexInfo {
+        name: "PRIMARY".to_string(),
+        unique: true,
+        columns: vec![key_col.to_string()],
+    }]
+}
+
+pub(crate) fn make_full_refresh_unique_key(key_col: &str) -> Vec<IndexInfo> {
+    vec![IndexInfo {
+        name: format!("{key_col}_uniq"),
+        unique: true,
+        columns: vec![key_col.to_string()],
+    }]
 }
 
 pub(crate) fn make_full_refresh_columns() -> Vec<ColumnInfo> {

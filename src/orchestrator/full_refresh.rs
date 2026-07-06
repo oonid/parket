@@ -1,12 +1,96 @@
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
+use deltalake::arrow::array::{Array, Int16Array, Int32Array, Int64Array, Int8Array, UInt16Array, UInt32Array, UInt64Array, UInt8Array};
+use deltalake::arrow::record_batch::RecordBatch;
 use tracing::info;
 
+use crate::discovery::{ColumnInfo, IndexInfo};
 use crate::query::QueryBuilder;
 
 use super::Orchestrator;
 use super::{DeltaWrite, Extract, SchemaInspect, StateManage};
+
+fn is_integer_key_column(columns: &[ColumnInfo], key_col: &str) -> bool {
+    columns.iter().any(|column| {
+        column.name == key_col
+            && matches!(
+                column.data_type.as_str(),
+                "tinyint" | "smallint" | "mediumint" | "int" | "bigint"
+            )
+    })
+}
+
+fn select_full_refresh_key(columns: &[ColumnInfo], indexes: &[IndexInfo]) -> Option<String> {
+    indexes
+        .iter()
+        .find(|index| index.name == "PRIMARY" && index.columns.len() == 1)
+        .and_then(|index| index.columns.first())
+        .filter(|key_col| is_integer_key_column(columns, key_col))
+        .cloned()
+}
+
+fn extract_batch_max_key(batch: &RecordBatch, key_col: &str) -> Result<Option<i64>> {
+    let column = batch
+        .column_by_name(key_col)
+        .ok_or_else(|| anyhow!("full refresh keyset paging expected key column `{key_col}` in batch"))?;
+
+    if let Some(array) = column.as_any().downcast_ref::<Int64Array>() {
+        return Ok((0..array.len()).filter(|&i| !array.is_null(i)).map(|i| array.value(i)).max());
+    }
+    if let Some(array) = column.as_any().downcast_ref::<Int32Array>() {
+        return Ok((0..array.len()).filter(|&i| !array.is_null(i)).map(|i| i64::from(array.value(i))).max());
+    }
+    if let Some(array) = column.as_any().downcast_ref::<Int16Array>() {
+        return Ok((0..array.len()).filter(|&i| !array.is_null(i)).map(|i| i64::from(array.value(i))).max());
+    }
+    if let Some(array) = column.as_any().downcast_ref::<Int8Array>() {
+        return Ok((0..array.len()).filter(|&i| !array.is_null(i)).map(|i| i64::from(array.value(i))).max());
+    }
+    if let Some(array) = column.as_any().downcast_ref::<UInt32Array>() {
+        return Ok((0..array.len()).filter(|&i| !array.is_null(i)).map(|i| i64::from(array.value(i))).max());
+    }
+    if let Some(array) = column.as_any().downcast_ref::<UInt16Array>() {
+        return Ok((0..array.len()).filter(|&i| !array.is_null(i)).map(|i| i64::from(array.value(i))).max());
+    }
+    if let Some(array) = column.as_any().downcast_ref::<UInt8Array>() {
+        return Ok((0..array.len()).filter(|&i| !array.is_null(i)).map(|i| i64::from(array.value(i))).max());
+    }
+    if let Some(array) = column.as_any().downcast_ref::<UInt64Array>() {
+        let mut max_value: Option<i64> = None;
+        for i in 0..array.len() {
+            if array.is_null(i) {
+                continue;
+            }
+            let value = array.value(i);
+            let value = i64::try_from(value).map_err(|_| {
+                anyhow!(
+                    "full refresh keyset paging cannot represent key `{key_col}` larger than i64"
+                )
+            })?;
+            max_value = Some(match max_value {
+                Some(current) => current.max(value),
+                None => value,
+            });
+        }
+        return Ok(max_value);
+    }
+
+    bail!("full refresh keyset paging requires integer Arrow data for key column `{key_col}`")
+}
+
+fn extract_max_key(batches: &[RecordBatch], key_col: &str) -> Result<Option<i64>> {
+    let mut max_key: Option<i64> = None;
+    for batch in batches {
+        if let Some(batch_max) = extract_batch_max_key(batch, key_col)? {
+            max_key = Some(match max_key {
+                Some(current) => current.max(batch_max),
+                None => batch_max,
+            });
+        }
+    }
+    Ok(max_key)
+}
 
 impl<S, E, W, M> Orchestrator<S, E, W, M>
 where
@@ -19,10 +103,20 @@ where
         &mut self,
         table_name: &str,
         columns: &[String],
+        source_columns: &[ColumnInfo],
+        indexes: &[IndexInfo],
     ) -> Result<u64> {
         let batch_size = self.extractor.batch_size();
         let mut total_rows = 0u64;
         let mut chunk_index: u64 = 0;
+        let key_col = select_full_refresh_key(source_columns, indexes);
+        let mut last_key = None;
+
+        if let Some(key_col) = key_col.as_deref() {
+            info!(table = table_name, key_col, "full refresh using keyset pagination");
+        } else {
+            info!(table = table_name, "full refresh using deterministic offset pagination");
+        }
 
         loop {
             if self.check_shutdown() {
@@ -32,9 +126,17 @@ where
 
             let chunk_start = Instant::now();
             let offset = chunk_index * batch_size;
-            let sql = QueryBuilder::build_full_refresh_query_paged(
-                table_name, columns, batch_size, offset,
-            );
+            let sql = if let Some(key_col) = key_col.as_deref() {
+                QueryBuilder::build_full_refresh_query_keyset(
+                    table_name,
+                    columns,
+                    key_col,
+                    last_key,
+                    batch_size,
+                )
+            } else {
+                QueryBuilder::build_full_refresh_query_paged(table_name, columns, batch_size, offset)
+            };
 
             let batches = self.extractor.extract(&sql)?;
 
@@ -44,6 +146,11 @@ where
 
             let chunk_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
             let arrow_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+            let next_key = if let Some(key_col) = key_col.as_deref() {
+                extract_max_key(&batches, key_col)?
+            } else {
+                None
+            };
 
             if chunk_index == 0 {
                 self.writer
@@ -81,6 +188,20 @@ where
             if chunk_rows < batch_size {
                 break;
             }
+
+            if let Some(key_col) = key_col.as_deref() {
+                let next_key = next_key.ok_or_else(|| {
+                    anyhow!(
+                        "full refresh keyset paging could not extract key `{key_col}` from a full batch for table `{table_name}`"
+                    )
+                })?;
+                if Some(next_key) == last_key {
+                    bail!(
+                        "full refresh keyset paging did not advance key `{key_col}` for table `{table_name}`"
+                    );
+                }
+                last_key = Some(next_key);
+            }
         }
 
         Ok(total_rows)
@@ -112,6 +233,9 @@ mod tests {
         schema_mock
             .expect_discover_columns()
             .returning(move |_| Ok(make_full_refresh_columns()));
+        schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(make_full_refresh_indexes()));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -171,6 +295,7 @@ mod tests {
 
         state_mock.expect_load_or_default().returning(|_| crate::state::AppState::default());
         schema_mock.expect_discover_columns().returning(move |_| Ok(make_full_refresh_columns()));
+        schema_mock.expect_discover_indexes().returning(|_| Ok(make_full_refresh_indexes()));
         schema_mock.expect_get_avg_row_length().returning(|_| Ok(Some(100)));
         extract_mock.expect_calculate_batch_size().returning(|_| 2);
         extract_mock.expect_batch_size().returning(|| 2);
@@ -211,6 +336,176 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_refresh_keyset_pagination_uses_last_key() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config_with_full_refresh(vec!["products".to_string()]);
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock.expect_load_or_default().returning(|_| crate::state::AppState::default());
+        schema_mock.expect_discover_columns().returning(move |_| Ok(make_full_refresh_columns()));
+        schema_mock.expect_discover_indexes().returning(|_| Ok(make_full_refresh_primary_key("id")));
+        schema_mock.expect_get_avg_row_length().returning(|_| Ok(Some(100)));
+        extract_mock.expect_calculate_batch_size().returning(|_| 2);
+        extract_mock.expect_batch_size().returning(|| 2);
+        writer_mock.expect_ensure_table().returning(|_, _| Ok(()));
+        writer_mock.expect_get_schema().returning(|_| Ok(None));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        extract_mock.expect_extract().returning(move |sql| {
+            let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+            let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+            ]));
+            match count {
+                0 => {
+                    assert!(sql.contains("ORDER BY `id` ASC LIMIT 2"));
+                    assert!(!sql.contains("OFFSET"));
+                    let batch = RecordBatch::try_new(
+                        schema,
+                        vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![1, 2]))],
+                    ).unwrap();
+                    Ok(vec![batch])
+                }
+                1 => {
+                    assert!(sql.contains("WHERE `id` > 2 ORDER BY `id` ASC LIMIT 2"));
+                    let batch = RecordBatch::try_new(
+                        schema,
+                        vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![3]))],
+                    ).unwrap();
+                    Ok(vec![batch])
+                }
+                _ => Ok(vec![]),
+            }
+        });
+
+        writer_mock.expect_overwrite_table().times(1).returning(|_, _, _| Ok(()));
+        writer_mock.expect_append_batch().times(1).returning(|_, _, _| Ok(()));
+        state_mock.expect_update_table().returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success));
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn full_refresh_unique_index_falls_back_to_offset_pagination() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config_with_full_refresh(vec!["products".to_string()]);
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock.expect_load_or_default().returning(|_| crate::state::AppState::default());
+        schema_mock.expect_discover_columns().returning(move |_| Ok(make_full_refresh_columns()));
+        schema_mock.expect_discover_indexes().returning(|_| Ok(make_full_refresh_unique_key("id")));
+        schema_mock.expect_get_avg_row_length().returning(|_| Ok(Some(100)));
+        extract_mock.expect_calculate_batch_size().returning(|_| 2);
+        extract_mock.expect_batch_size().returning(|| 2);
+        writer_mock.expect_ensure_table().returning(|_, _| Ok(()));
+        writer_mock.expect_get_schema().returning(|_| Ok(None));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        extract_mock.expect_extract().returning(move |sql| {
+            let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+            let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+            ]));
+            match count {
+                0 => {
+                    assert!(sql.contains("ORDER BY `id`, `name` LIMIT 2 OFFSET 0"));
+                    assert!(!sql.contains("WHERE `id` >"));
+                    let batch = RecordBatch::try_new(
+                        schema,
+                        vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![1, 2]))],
+                    ).unwrap();
+                    Ok(vec![batch])
+                }
+                1 => {
+                    assert!(sql.contains("ORDER BY `id`, `name` LIMIT 2 OFFSET 2"));
+                    let batch = RecordBatch::try_new(
+                        schema,
+                        vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![3]))],
+                    ).unwrap();
+                    Ok(vec![batch])
+                }
+                _ => Ok(vec![]),
+            }
+        });
+
+        writer_mock.expect_overwrite_table().times(1).returning(|_, _, _| Ok(()));
+        writer_mock.expect_append_batch().times(1).returning(|_, _, _| Ok(()));
+        state_mock.expect_update_table().returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success));
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn full_refresh_keyless_pagination_uses_stable_offset_order() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config_with_full_refresh(vec!["products".to_string()]);
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock.expect_load_or_default().returning(|_| crate::state::AppState::default());
+        schema_mock.expect_discover_columns().returning(move |_| Ok(make_full_refresh_columns()));
+        schema_mock.expect_discover_indexes().returning(|_| Ok(make_full_refresh_indexes()));
+        schema_mock.expect_get_avg_row_length().returning(|_| Ok(Some(100)));
+        extract_mock.expect_calculate_batch_size().returning(|_| 2);
+        extract_mock.expect_batch_size().returning(|| 2);
+        writer_mock.expect_ensure_table().returning(|_, _| Ok(()));
+        writer_mock.expect_get_schema().returning(|_| Ok(None));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        extract_mock.expect_extract().returning(move |sql| {
+            let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+            let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+            ]));
+            match count {
+                0 => {
+                    assert!(sql.contains("ORDER BY `id`, `name` LIMIT 2 OFFSET 0"));
+                    let batch = RecordBatch::try_new(
+                        schema,
+                        vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![1, 2]))],
+                    ).unwrap();
+                    Ok(vec![batch])
+                }
+                1 => {
+                    assert!(sql.contains("ORDER BY `id`, `name` LIMIT 2 OFFSET 2"));
+                    let batch = RecordBatch::try_new(
+                        schema,
+                        vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![3]))],
+                    ).unwrap();
+                    Ok(vec![batch])
+                }
+                _ => Ok(vec![]),
+            }
+        });
+
+        writer_mock.expect_overwrite_table().times(1).returning(|_, _, _| Ok(()));
+        writer_mock.expect_append_batch().times(1).returning(|_, _, _| Ok(()));
+        state_mock.expect_update_table().returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success));
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn full_refresh_empty_table_writes_nothing() {
         let dir = TempDir::new().unwrap();
         let config = make_config_with_full_refresh(vec!["products".to_string()]);
@@ -221,6 +516,7 @@ mod tests {
 
         state_mock.expect_load_or_default().returning(|_| crate::state::AppState::default());
         schema_mock.expect_discover_columns().returning(move |_| Ok(make_full_refresh_columns()));
+        schema_mock.expect_discover_indexes().returning(|_| Ok(make_full_refresh_indexes()));
         schema_mock.expect_get_avg_row_length().returning(|_| Ok(Some(100)));
         extract_mock.expect_calculate_batch_size().returning(|_| 10000);
         extract_mock.expect_batch_size().returning(|| 10000);
@@ -250,6 +546,7 @@ mod tests {
 
         state_mock.expect_load_or_default().returning(|_| crate::state::AppState::default());
         schema_mock.expect_discover_columns().returning(move |_| Ok(make_full_refresh_columns()));
+        schema_mock.expect_discover_indexes().returning(|_| Ok(make_full_refresh_indexes()));
         schema_mock.expect_get_avg_row_length().returning(|_| Ok(Some(100)));
         extract_mock.expect_calculate_batch_size().returning(|_| 1);
         extract_mock.expect_batch_size().returning(|| 1);

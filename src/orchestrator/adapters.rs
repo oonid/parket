@@ -5,7 +5,7 @@ use anyhow::Result;
 use deltalake::arrow::datatypes::SchemaRef;
 
 use crate::config::Config;
-use crate::discovery::ColumnInfo;
+use crate::discovery::{ColumnInfo, IndexInfo};
 use crate::extractor::BatchExtractor;
 use crate::state::{AppState, TableState};
 use crate::writer::{DeltaWriter, Hwm};
@@ -27,6 +27,12 @@ impl SchemaInspect for SchemaInspectorAdapter {
     async fn discover_columns(&self, table: &str) -> Result<Vec<ColumnInfo>> {
         crate::discovery::SchemaInspector::new(self.pool.clone(), self.database.clone())
             .discover_columns(table)
+            .await
+    }
+
+    async fn discover_indexes(&self, table: &str) -> Result<Vec<IndexInfo>> {
+        crate::discovery::SchemaInspector::new(self.pool.clone(), self.database.clone())
+            .discover_indexes(table)
             .await
     }
 

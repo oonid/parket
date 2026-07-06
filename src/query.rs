@@ -10,6 +10,14 @@ fn format_columns(columns: &[String]) -> String {
         .join(", ")
 }
 
+fn format_order_by(columns: &[String]) -> String {
+    columns
+        .iter()
+        .map(|c| backtick(c))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub struct QueryBuilder;
 
 impl QueryBuilder {
@@ -53,7 +61,31 @@ impl QueryBuilder {
     ) -> String {
         let col_list = format_columns(columns);
         let quoted_table = backtick(table);
-        format!("SELECT {col_list} FROM {quoted_table} LIMIT {batch_size} OFFSET {offset}")
+        let order_by = format_order_by(columns);
+        format!(
+            "SELECT {col_list} FROM {quoted_table} ORDER BY {order_by} LIMIT {batch_size} OFFSET {offset}"
+        )
+    }
+
+    pub fn build_full_refresh_query_keyset(
+        table: &str,
+        columns: &[String],
+        key_col: &str,
+        last_key: Option<i64>,
+        batch_size: u64,
+    ) -> String {
+        let col_list = format_columns(columns);
+        let quoted_table = backtick(table);
+        let key = backtick(key_col);
+
+        match last_key {
+            Some(last_key) => format!(
+                "SELECT {col_list} FROM {quoted_table} WHERE {key} > {last_key} ORDER BY {key} ASC LIMIT {batch_size}"
+            ),
+            None => format!(
+                "SELECT {col_list} FROM {quoted_table} ORDER BY {key} ASC LIMIT {batch_size}"
+            ),
+        }
     }
 
     /// Insert-stream query: rows with key greater than the watermark, ordered by key.
@@ -147,6 +179,53 @@ mod tests {
         assert!(!sql.contains("WHERE"));
         assert!(!sql.contains("LIMIT"));
         assert!(!sql.contains("ORDER BY"));
+    }
+
+    #[test]
+    fn full_refresh_paged_query_uses_stable_order() {
+        let sql = QueryBuilder::build_full_refresh_query_paged(
+            "products",
+            &["id".to_string(), "name".to_string()],
+            100,
+            200,
+        );
+
+        assert_eq!(
+            sql,
+            "SELECT `id`, `name` FROM `products` ORDER BY `id`, `name` LIMIT 100 OFFSET 200"
+        );
+    }
+
+    #[test]
+    fn full_refresh_keyset_first_page() {
+        let sql = QueryBuilder::build_full_refresh_query_keyset(
+            "products",
+            &["id".to_string(), "name".to_string()],
+            "id",
+            None,
+            100,
+        );
+
+        assert_eq!(
+            sql,
+            "SELECT `id`, `name` FROM `products` ORDER BY `id` ASC LIMIT 100"
+        );
+    }
+
+    #[test]
+    fn full_refresh_keyset_next_page() {
+        let sql = QueryBuilder::build_full_refresh_query_keyset(
+            "products",
+            &["id".to_string(), "name".to_string()],
+            "id",
+            Some(42),
+            100,
+        );
+
+        assert_eq!(
+            sql,
+            "SELECT `id`, `name` FROM `products` WHERE `id` > 42 ORDER BY `id` ASC LIMIT 100"
+        );
     }
 
     #[test]
@@ -303,7 +382,7 @@ mod tests {
         assert!(sql.contains("LIMIT 5000"));
         assert!(sql.contains("OFFSET 0"));
         assert!(!sql.contains("WHERE"));
-        assert!(!sql.contains("ORDER BY"));
+        assert!(sql.contains("ORDER BY `id`, `name`"));
     }
 
     #[test]
@@ -320,7 +399,10 @@ mod tests {
         let sql = QueryBuilder::build_full_refresh_query_paged(
             "customers", &["id".to_string(), "email".to_string()], 1000, 2000,
         );
-        assert_eq!(sql, "SELECT `id`, `email` FROM `customers` LIMIT 1000 OFFSET 2000");
+        assert_eq!(
+            sql,
+            "SELECT `id`, `email` FROM `customers` ORDER BY `id`, `email` LIMIT 1000 OFFSET 2000"
+        );
     }
 
     #[test]

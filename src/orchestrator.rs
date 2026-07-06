@@ -9,7 +9,7 @@ use tracing::{error, info};
 
 use crate::config::{Config, ExtractionMode};
 use crate::discovery::{
-    ColumnInfo, compute_schema_hash, detect_mode, filter_unsupported_columns,
+    ColumnInfo, IndexInfo, compute_schema_hash, detect_mode, filter_unsupported_columns,
 };
 use crate::state::{AppState, TableState};
 use crate::writer::Hwm;
@@ -30,6 +30,7 @@ use datetime::format_timestamp_now;
 #[allow(async_fn_in_trait)]
 pub trait SchemaInspect: Send + Sync {
     async fn discover_columns(&self, table: &str) -> Result<Vec<ColumnInfo>>;
+    async fn discover_indexes(&self, table: &str) -> Result<Vec<IndexInfo>>;
     async fn get_avg_row_length(&self, table: &str) -> Result<Option<u64>>;
     async fn max_timestamp(&self, table: &str, col: &str) -> Result<Option<String>>;
 }
@@ -281,7 +282,9 @@ where
                 self.process_incremental(table_name, &select_columns, &ts_col).await?
             }
             ExtractionMode::FullRefresh => {
-                self.process_full_refresh(table_name, &select_columns).await?
+                let indexes = self.schema_inspect.discover_indexes(table_name).await?;
+                self.process_full_refresh(table_name, &select_columns, &columns, &indexes)
+                    .await?
             }
             ExtractionMode::TwoStream => {
                 let (insert_col, update_col) = self.config.two_stream(table_name)
@@ -908,6 +911,9 @@ mod tests {
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
+        schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(make_full_refresh_indexes()));
         extract_mock
             .expect_calculate_batch_size()
             .returning(|_| 10000);
