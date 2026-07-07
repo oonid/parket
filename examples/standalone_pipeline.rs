@@ -200,7 +200,7 @@ async fn main() -> Result<()> {
 
     writer.ensure_table("orders", orders_schema()).await?;
 
-    let hwm1 = parket::writer::extract_hwm_from_batch(&orders_batch1, "updated_at")
+    let hwm1 = parket::writer::extract_hwm_from_batch(&orders_batch1, "updated_at", "id")
         .expect("should extract HWM from orders batch");
     println!(
         "[run 1] Extracted HWM: updated_at={}, last_id={}",
@@ -237,7 +237,7 @@ async fn main() -> Result<()> {
         orders_batch2.num_rows(),
     );
 
-    let hwm2 = parket::writer::extract_hwm_from_batch(&orders_batch2, "updated_at").unwrap();
+    let hwm2 = parket::writer::extract_hwm_from_batch(&orders_batch2, "updated_at", "id").unwrap();
     println!(
         "[run 2] Extracted new HWM: updated_at={}, last_id={}",
         hwm2.updated_at, hwm2.last_id,
