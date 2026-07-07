@@ -21,7 +21,10 @@ fn is_integer_key_column(columns: &[ColumnInfo], key_col: &str) -> bool {
     })
 }
 
-fn select_full_refresh_key(columns: &[ColumnInfo], indexes: &[IndexInfo]) -> Option<String> {
+/// Find the table's single-column integer PRIMARY key, if any — used both for
+/// full-refresh keyset pagination and (via the incremental/two-stream paths) as
+/// the default tiebreak/cursor key when no `id` column exists.
+pub(super) fn select_integer_pk(columns: &[ColumnInfo], indexes: &[IndexInfo]) -> Option<String> {
     indexes
         .iter()
         .find(|index| index.name == "PRIMARY" && index.columns.len() == 1)
@@ -109,7 +112,7 @@ where
         let batch_size = self.extractor.batch_size();
         let mut total_rows = 0u64;
         let mut chunk_index: u64 = 0;
-        let key_col = select_full_refresh_key(source_columns, indexes);
+        let key_col = select_integer_pk(source_columns, indexes);
         let mut last_key = None;
 
         if let Some(key_col) = key_col.as_deref() {

@@ -24,6 +24,7 @@ mod datetime;
 mod test_support;
 pub use adapters::{DeltaWriterAdapter, ExtractorAdapter, LocalDeltaWriterAdapter, SchemaInspectorAdapter, StateManageAdapter};
 use schema::{mariadb_type_to_arrow, schema_evolution_check};
+use full_refresh::select_integer_pk;
 use datetime::format_timestamp_now;
 
 #[cfg_attr(test, mockall::automock)]
@@ -279,7 +280,19 @@ where
 
         let rows = match mode {
             ExtractionMode::Incremental => {
-                self.process_incremental(table_name, &select_columns, &ts_col).await?
+                let indexes = self.schema_inspect.discover_indexes(table_name).await?;
+                let key_col = select_integer_pk(&columns, &indexes).unwrap_or_else(|| "id".to_string());
+                if !select_columns.iter().any(|c| c == &ts_col) {
+                    anyhow::bail!(
+                        "incremental table '{table_name}' cursor column `{ts_col}` is missing from the Delta table schema (the schema-evolution filter dropped it because the Delta schema lacks it); evolve the Delta schema to add `{ts_col}` or run a full refresh for this table"
+                    );
+                }
+                if !select_columns.iter().any(|c| c == &key_col) {
+                    anyhow::bail!(
+                        "incremental table '{table_name}' key column `{key_col}` is missing from the Delta table schema (the schema-evolution filter dropped it because the Delta schema lacks it); evolve the Delta schema to add `{key_col}` or run a full refresh for this table"
+                    );
+                }
+                self.process_incremental(table_name, &select_columns, &ts_col, &key_col).await?
             }
             ExtractionMode::FullRefresh => {
                 let indexes = self.schema_inspect.discover_indexes(table_name).await?;
@@ -289,6 +302,16 @@ where
             ExtractionMode::TwoStream => {
                 let (insert_col, update_col) = self.config.two_stream(table_name)
                     .expect("two_stream config present for TwoStream mode");
+                if !select_columns.iter().any(|c| c == &insert_col) {
+                    anyhow::bail!(
+                        "two-stream table '{table_name}' insert cursor column `{insert_col}` is missing from the Delta table schema (the schema-evolution filter dropped it because the Delta schema lacks it); evolve the Delta schema to add `{insert_col}` or run a full refresh for this table"
+                    );
+                }
+                if !select_columns.iter().any(|c| c == &update_col) {
+                    anyhow::bail!(
+                        "two-stream table '{table_name}' update cursor column `{update_col}` is missing from the Delta table schema (the schema-evolution filter dropped it because the Delta schema lacks it); evolve the Delta schema to add `{update_col}` or run a full refresh for this table"
+                    );
+                }
                 self.process_two_stream(table_name, &select_columns, &insert_col, &update_col).await?
             }
             ExtractionMode::Auto => unreachable!(),
@@ -429,6 +452,10 @@ mod tests {
             .withf(|t| t == "good_table")
             .returning(move |_| Ok(make_columns()));
         schema_mock
+            .expect_discover_indexes()
+            .withf(|t| t == "good_table")
+            .returning(|_| Ok(make_full_refresh_indexes()));
+        schema_mock
             .expect_get_avg_row_length()
             .withf(|t| t == "good_table")
             .returning(|_| Ok(Some(100)));
@@ -553,6 +580,9 @@ mod tests {
             .expect_discover_columns()
             .returning(move |_| Ok(make_columns()));
         schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(make_full_refresh_indexes()));
+        schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
         extract_mock
@@ -660,6 +690,9 @@ mod tests {
             .expect_discover_columns()
             .returning(move |_| Ok(make_columns()));
         schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(make_full_refresh_indexes()));
+        schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
         extract_mock
@@ -755,6 +788,9 @@ mod tests {
             .expect_discover_columns()
             .returning(move |_| Ok(make_columns()));
         schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(make_full_refresh_indexes()));
+        schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
         extract_mock
@@ -788,6 +824,9 @@ mod tests {
         schema_mock
             .expect_discover_columns()
             .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(make_full_refresh_indexes()));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -834,6 +873,9 @@ mod tests {
         schema_mock
             .expect_discover_columns()
             .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(make_full_refresh_indexes()));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -1001,6 +1043,9 @@ mod tests {
             .expect_discover_columns()
             .returning(move |_| Ok(make_columns()));
         schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(make_full_refresh_indexes()));
+        schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
         extract_mock
@@ -1083,6 +1128,9 @@ mod tests {
         schema_mock
             .expect_discover_columns()
             .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(make_full_refresh_indexes()));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -1195,6 +1243,9 @@ mod tests {
         schema_mock
             .expect_discover_columns()
             .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(make_full_refresh_indexes()));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));

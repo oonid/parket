@@ -79,6 +79,9 @@ pub(crate) fn setup_incremental_mocks(
         .expect_discover_columns()
         .returning(move |_| Ok(make_columns()));
     schema_mock
+        .expect_discover_indexes()
+        .returning(|_| Ok(make_full_refresh_indexes()));
+    schema_mock
         .expect_get_avg_row_length()
         .returning(|_| Ok(Some(100)));
     extract_mock

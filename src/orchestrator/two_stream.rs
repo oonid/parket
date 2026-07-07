@@ -56,6 +56,17 @@ where
             let chunk_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
             let arrow_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
             let new_max = batches.iter().filter_map(|b| extract_max_id(b, insert_col)).max();
+            if chunk_rows == batch_size {
+                match new_max {
+                    None => bail!(
+                        "two-stream insert batch for table `{table_name}` could not extract max `{insert_col}` from a full chunk; `{insert_col}` must be a supported integer type (check for an unsupported column type or a missing column)"
+                    ),
+                    Some(m) if hwm_id.is_some_and(|current| m <= current) => bail!(
+                        "two-stream insert batch for table `{table_name}` did not advance insert cursor `{insert_col}` on a full chunk"
+                    ),
+                    Some(_) => {}
+                }
+            }
             if self.progress { info!(table = table_name, rows = chunk_rows, extract_ms, "two-stream insert: extracted, appending"); }
             let t_write = Instant::now();
             self.writer.append_two_stream(table_name, batches, new_max.or(hwm_id), update_hwm.clone()).await?;
@@ -258,6 +269,90 @@ mod tests {
         let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
         let result = orch.run().await;
         assert!(matches!(result, ExitCode::Success));
+    }
+
+    #[tokio::test]
+    async fn two_stream_insert_full_chunk_without_extractable_max_fails() {
+        // N2: a full insert chunk whose batches don't carry a usable insert_col (missing
+        // column, or an unsupported/unmapped Arrow type) must bail instead of silently
+        // looping forever re-appending the same rows.
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_insert_cursor.insert("orders".to_string(), "id".to_string());
+        config.table_update_cursor.insert("orders".to_string(), "updated_at".to_string());
+
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| crate::state::AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        schema_mock
+            .expect_max_timestamp()
+            .returning(|_, _| Ok(None));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        extract_mock
+            .expect_batch_size()
+            .returning(|| 1);
+        writer_mock
+            .expect_ensure_table()
+            .returning(|_, _| Ok(()));
+        writer_mock
+            .expect_get_schema()
+            .returning(|_| Ok(None));
+        writer_mock
+            .expect_read_insert_hwm()
+            .returning(|_| Ok(None));
+        writer_mock
+            .expect_read_hwm()
+            .returning(|_| Ok(None));
+
+        extract_mock
+            .expect_extract()
+            .returning(move |_| {
+                // Full chunk (1 row == batch_size 1) but the batch does not carry the
+                // `id` insert cursor column at all — extract_max_id must return None.
+                let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                    deltalake::arrow::datatypes::Field::new("name", deltalake::arrow::datatypes::DataType::Utf8, false),
+                    deltalake::arrow::datatypes::Field::new(
+                        "updated_at",
+                        deltalake::arrow::datatypes::DataType::Timestamp(deltalake::arrow::datatypes::TimeUnit::Microsecond, None),
+                        false,
+                    ),
+                ]));
+                let batch = RecordBatch::try_new(
+                    schema,
+                    vec![
+                        Arc::new(deltalake::arrow::array::StringArray::from(vec!["a"])),
+                        Arc::new(deltalake::arrow::array::TimestampMicrosecondArray::from(vec![1743158400000000i64])),
+                    ],
+                )
+                .unwrap();
+                Ok(vec![batch])
+            });
+
+        writer_mock
+            .expect_append_two_stream()
+            .times(0)
+            .returning(|_, _, _, _| Ok(()));
+        state_mock
+            .expect_update_table()
+            .withf(|_, state, _| state.last_run_status.as_deref() == Some("failed"))
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Fatal));
     }
 
     #[tokio::test]

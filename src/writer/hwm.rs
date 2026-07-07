@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use deltalake::arrow::array::{Array, Int32Array, Int64Array, UInt32Array, UInt64Array};
+use deltalake::arrow::array::{
+    Array, Int8Array, Int16Array, Int32Array, Int64Array, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
+};
 use deltalake::arrow::record_batch::RecordBatch;
 
 use super::datetime::extract_timestamp_as_strings;
@@ -62,8 +65,10 @@ pub fn extract_max_id(batch: &RecordBatch, key_col: &str) -> Option<i64> {
     ids.into_iter().max()
 }
 
-// connector_arrow maps INT → Int32, BIGINT → Int64, INT UNSIGNED → UInt32,
-// BIGINT UNSIGNED → UInt64. All fit safely in i64 for typical auto-increment ids.
+// connector_arrow maps TINYINT → Int8, SMALLINT → Int16, INT/MEDIUMINT → Int32,
+// BIGINT → Int64, and the UNSIGNED variants to the matching UInt* type. All but
+// BIGINT UNSIGNED fit safely in i64; BIGINT UNSIGNED is checked and returns None
+// on overflow past i64::MAX rather than silently wrapping negative.
 pub(crate) fn extract_id_as_i64(col: &std::sync::Arc<dyn Array>) -> Option<Vec<i64>> {
     if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
         return Some((0..a.len()).map(|i| a.value(i)).collect());
@@ -71,11 +76,27 @@ pub(crate) fn extract_id_as_i64(col: &std::sync::Arc<dyn Array>) -> Option<Vec<i
     if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
         return Some((0..a.len()).map(|i| a.value(i) as i64).collect());
     }
+    if let Some(a) = col.as_any().downcast_ref::<Int16Array>() {
+        return Some((0..a.len()).map(|i| i64::from(a.value(i))).collect());
+    }
+    if let Some(a) = col.as_any().downcast_ref::<Int8Array>() {
+        return Some((0..a.len()).map(|i| i64::from(a.value(i))).collect());
+    }
     if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
-        return Some((0..a.len()).map(|i| a.value(i) as i64).collect());
+        let mut out = Vec::with_capacity(a.len());
+        for i in 0..a.len() {
+            out.push(i64::try_from(a.value(i)).ok()?);
+        }
+        return Some(out);
     }
     if let Some(a) = col.as_any().downcast_ref::<UInt32Array>() {
-        return Some((0..a.len()).map(|i| a.value(i) as i64).collect());
+        return Some((0..a.len()).map(|i| i64::from(a.value(i))).collect());
+    }
+    if let Some(a) = col.as_any().downcast_ref::<UInt16Array>() {
+        return Some((0..a.len()).map(|i| i64::from(a.value(i))).collect());
+    }
+    if let Some(a) = col.as_any().downcast_ref::<UInt8Array>() {
+        return Some((0..a.len()).map(|i| i64::from(a.value(i))).collect());
     }
     None
 }
@@ -573,6 +594,78 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr)]).unwrap();
         let max_id = extract_max_id(&batch, "nonexistent");
         assert!(max_id.is_none());
+    }
+
+    #[test]
+    fn extract_max_id_int16_column() {
+        // SMALLINT cursor — connector_arrow maps it to Int16Array (N2)
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int16, false),
+        ]));
+        let id_arr = deltalake::arrow::array::Int16Array::from(vec![3i16, 1i16, 2i16]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr)]).unwrap();
+        let max_id = extract_max_id(&batch, "id");
+        assert_eq!(max_id, Some(3));
+    }
+
+    #[test]
+    fn extract_max_id_int8_column() {
+        // TINYINT cursor — connector_arrow maps it to Int8Array (N2)
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int8, false),
+        ]));
+        let id_arr = deltalake::arrow::array::Int8Array::from(vec![3i8, 1i8, 2i8]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr)]).unwrap();
+        let max_id = extract_max_id(&batch, "id");
+        assert_eq!(max_id, Some(3));
+    }
+
+    #[test]
+    fn extract_max_id_uint16_column() {
+        // SMALLINT UNSIGNED cursor — UInt16Array (N2)
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::UInt16, false),
+        ]));
+        let id_arr = deltalake::arrow::array::UInt16Array::from(vec![3u16, 1u16, 2u16]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr)]).unwrap();
+        let max_id = extract_max_id(&batch, "id");
+        assert_eq!(max_id, Some(3));
+    }
+
+    #[test]
+    fn extract_max_id_uint8_column() {
+        // TINYINT UNSIGNED cursor — UInt8Array (N2)
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::UInt8, false),
+        ]));
+        let id_arr = deltalake::arrow::array::UInt8Array::from(vec![3u8, 1u8, 2u8]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr)]).unwrap();
+        let max_id = extract_max_id(&batch, "id");
+        assert_eq!(max_id, Some(3));
+    }
+
+    #[test]
+    fn extract_id_as_i64_uint64_over_i64_max_returns_none() {
+        // BIGINT UNSIGNED value past i64::MAX must not silently wrap negative (N5/N2);
+        // extract_id_as_i64 must return None so callers hit the progress-guard bail
+        // instead of corrupting the HWM.
+        let huge = (i64::MAX as u64) + 1;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+        ]));
+        let id_arr = UInt64Array::from(vec![huge]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr)]).unwrap();
+        assert!(extract_max_id(&batch, "id").is_none());
+    }
+
+    #[test]
+    fn extract_id_as_i64_uint64_within_range_ok() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+        ]));
+        let id_arr = UInt64Array::from(vec![10u64, 5u64, 15u64]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr)]).unwrap();
+        assert_eq!(extract_max_id(&batch, "id"), Some(15));
     }
 
     #[test]
