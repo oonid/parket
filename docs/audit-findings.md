@@ -50,8 +50,10 @@ isolation, and exact set-equality beyond the aggregate fingerprints.
 | V1 | `11fcfee`, `2d8da09` | per-column value verification, mismatch → Discrepancy; HWM-scoped for incremental |
 | R1 | `a600e77` | `read_hwm`/`read_insert_hwm` propagate transient errors (no more silent full re-extract) |
 | C1 | `8065c38` | full-refresh keyset pagination (integer single-col PK) + deterministic OFFSET fallback — residuals: N8, T-gap |
-| R2 | `4baa0f0` | HWM no-progress guard (incremental + two-stream update) — residuals: N2, N3, N6, N7 |
+| R2 | `4baa0f0` | HWM no-progress guard (incremental + two-stream update) — residual: N7 |
 | V7 (value path) | `2d8da09` | Delta value aggregates HWM-scoped symmetric with source — key path still open (VA6) |
+| N2+N3 | `b96e30f` | insert-stream progress guard (bail before append); extract_id_as_i64 widened to Int8/16 + UInt8/16, UInt64 overflow → None; real integer-PK threaded through incremental (fallback `id`); early actionable bail when cursor/key dropped from select_columns (both modes) |
+| N6 | `1aee877` | examples call sites fixed; `cargo clippy --all-targets -- -D warnings` green — gate widened |
 | T1–T5 | `342e6f5` | Docker verify tests committed + strengthened: corruption→Discrepancy (both paths), post-HWM scope exclusion, NULL + multibyte rows; ran green under real MariaDB+MinIO (Opus-reviewed) |
 | N4 (+N1 mappings) | `2cfcf59` | vendored connector_arrow pinned to `e84c87f` (fork): DATE/MEDIUMINT/VARBINARY/JSON mapped instead of `todo!()` panic; upstreamed as [connector_arrow#79](https://github.com/aljazerzen/connector_arrow/pull/79) — switch `.gitmodules` back to upstream once merged |
 
@@ -59,8 +61,7 @@ isolation, and exact set-equality beyond the aggregate fingerprints.
 - **N1 — extraction panics the process on unmapped column types.** *Largely mitigated by `2cfcf59`* (DATE/MEDIUMINT/VARBINARY/JSON now mapped; upstream PR #79). **Still open:** (a) the `todo!()` in `create_field` remains for any *other* unmapped type (`time`, `year`, `bit`-variants, geometry passed through, future types) → still a process abort; add a parket **preflight allowlist** so unmapped types are per-table errors, and/or upstream a follow-up turning the `todo!()` into a `ConnectorError`. (b) O8 remains: `time`/`year` fail the whole table instead of being skipped like geometry. *(Detail: audit-2026-07-06 §1.)*
 
 ## 3. Open — High
-- **N2** — two-stream **insert** loop has no progress guard; `SMALLINT`/`TINYINT` cursor → `extract_max_id` None on a full chunk → infinite duplicate appends. Fix: mirror R2 bail; widen `extract_id_as_i64` to Int8/16/UInt8/16 (`writer/hwm.rs`).
-- **N3** — `incremental.rs:54,73` still hardcodes `"id"`; with the schema-evolution column filter, R2's guard becomes a permanent hard failure. Fix: thread the discovered key; force key+cursor into `select_columns`.
+- **N2, N3** — **done** (`b96e30f`, Opus-reviewed). Residuals registered below: N2-r (partial-chunk cross-run duplicates), N3-r (detect_mode literal-`id`).
 - **N4/T1** — ~~vendored fix separable from the tests~~ **done** (`2cfcf59`, PR #79): fresh clones now fetch the fixed commit from the fork. T1 completed in full by `342e6f5` (tests committed with T2–T5 strengthening).
 - **N5** — unsigned ints: Delta schema created signed (`mariadb_type_to_arrow` ignores ` unsigned`), batches arrive `UInt*`; evolution check structurally blind (O10). Verify live in Docker, then map/cast. Related: `extract_id_as_i64` `as i64` wraps past 2⁶³; full-refresh keyset bails only after chunk-0 overwrite.
 - **VA1** — DataFusion `sum(decimal(38,10))` silently wrong on precision overflow (measured) vs MySQL saturation → false Discrepancy on huge decimal sums. Guard by magnitude or skip SUM for at-risk columns.
@@ -74,7 +75,8 @@ isolation, and exact set-equality beyond the aggregate fingerprints.
 - **V4 / VA3(a)** — pre-guard full-log scan (same fix batch as VA3).
 
 ## 4. Open — Medium
-- **N6** — R2 broke `cargo build --examples` (`examples/standalone_pipeline.rs:203,240`, E0061); widen the gate to `--all-targets`.
+- **N2-r** — progress guards fire only on FULL chunks (by design, matching R2): a stream that fits one *partial* chunk whose cursor is present-by-name but unextractable (non-integer Arrow type) still appends without advancing the HWM → duplicates accumulate **across runs**. Consider a type-check in the early guard or a warn+skip.
+- **N3-r** — `detect_mode` (discovery.rs:247-250) still requires a literal `id` column, so auto-detection never reaches Incremental for non-`id`-PK tables; N3's key threading only benefits explicit `TABLE_MODE=incremental`. Generalize detect_mode to the discovered integer PK (currently blocked on the CF WIP in discovery.rs; pairs with O3/O12 shared-resolver work).
 - **N7** — `hwm_has_advanced` string compare is format-coincident: safe on the production T-format path; hazard for space-format config seeds and any true-Timestamp batch path. Normalize at entry points or compare parsed values.
 - **N8** — `ORDER BY <all columns>` OFFSET fallback: ci-collation and TEXT-prefix ties break total order (skip/dup on PK-less tables) + per-page full filesort. Prefer any UNIQUE index; BINARY-strengthen ordering.
 - **VA2** — decimal scale>10: round-then-sum vs sum-then-round → deterministic false Discrepancy (measured). Skip or mirror per-row rounding on source.
