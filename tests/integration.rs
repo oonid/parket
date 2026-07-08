@@ -385,9 +385,11 @@ async fn graceful_shutdown_signal_skips_all_tables() {
     let mut orchestrator = env.make_orchestrator_with_shutdown(shutdown_rx);
     let exit_code = orchestrator.run().await;
 
+    // O2/R4: a run cut off by shutdown must not report clean success — it exits
+    // PartialFailure so schedulers can tell it was interrupted.
     assert!(
-        matches!(exit_code, ExitCode::Success),
-        "expected Success exit code, got {exit_code:?}"
+        matches!(exit_code, ExitCode::PartialFailure),
+        "expected PartialFailure exit code for an interrupted run, got {exit_code:?}"
     );
 
     let writer = DeltaWriter::new(
