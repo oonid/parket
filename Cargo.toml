@@ -9,7 +9,7 @@ description = "Universal MariaDB to Delta Lake Extractor"
 
 [dependencies]
 connector_arrow = { path = "vendor/connector_arrow/connector_arrow", features = ["src_mysql"] }
-deltalake = { version = "0.32", features = ["s3", "datafusion"] }
+deltalake = { version = "0.32.4", features = ["s3", "datafusion"] }
 mysql = "28"
 sqlx = { version = "0.8", features = ["mysql", "runtime-tokio", "macros"], default-features = false }
 tokio = { version = "1", features = ["full"] }
