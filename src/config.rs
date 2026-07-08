@@ -120,6 +120,9 @@ impl Config {
             .transpose()
             .context("DEFAULT_BATCH_SIZE must be a positive integer")?
             .unwrap_or(10000);
+        if default_batch_size == 0 {
+            bail!("DEFAULT_BATCH_SIZE must be greater than 0");
+        }
         let rust_log = std::env::var("RUST_LOG")
             .ok()
             .filter(|s| !s.is_empty())
@@ -207,6 +210,9 @@ impl Config {
             .transpose()
             .context("DEFAULT_BATCH_SIZE must be a positive integer")?
             .unwrap_or(10000);
+        if default_batch_size == 0 {
+            bail!("DEFAULT_BATCH_SIZE must be greater than 0");
+        }
         let rust_log = std::env::var("RUST_LOG")
             .ok()
             .filter(|s| !s.is_empty())
@@ -648,6 +654,19 @@ mod tests {
 
     #[test]
     #[serial]
+    fn load_fails_when_default_batch_size_zero() {
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("DEFAULT_BATCH_SIZE", "0");
+        }
+
+        let result = Config::load();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[serial]
     fn load_uses_defaults_for_optional_vars() {
         clear_config_env();
         set_required_vars();
@@ -1016,6 +1035,21 @@ mod tests {
 
         let config = Config::load_local().expect("load_local should succeed");
         assert!(config.s3_bucket.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn load_local_fails_when_default_batch_size_zero() {
+        clear_config_env();
+        unsafe {
+            env::set_var("DATABASE_URL", "mysql://user:pass@host:3306/dbname");
+            env::set_var("TABLES", "orders");
+            env::set_var("TARGET_MEMORY_MB", "128");
+            env::set_var("DEFAULT_BATCH_SIZE", "0");
+        }
+
+        let result = Config::load_local();
+        assert!(result.is_err());
     }
 
     #[test]

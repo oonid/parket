@@ -99,10 +99,7 @@ impl SchemaInspector {
         .with_context(|| format!("failed to query AVG_ROW_LENGTH for table {table}"))?;
 
         match row {
-            Some(r) => match r.avg_row_length {
-                0 => Ok(None),
-                v => Ok(Some(v)),
-            },
+            Some(r) => Ok(normalize_avg_row_length(r.avg_row_length)),
             None => Ok(None),
         }
     }
@@ -282,6 +279,10 @@ pub fn validate_two_stream_cursors(
     Ok(())
 }
 
+fn normalize_avg_row_length(avg_row_length: Option<u64>) -> Option<u64> {
+    avg_row_length.filter(|v| *v > 0)
+}
+
 pub fn compute_schema_hash(columns: &[ColumnInfo]) -> String {
     let mut hasher = Sha256::new();
     for col in columns {
@@ -302,7 +303,7 @@ struct MySqlColumnRow {
 
 #[derive(Debug, sqlx::FromRow)]
 struct MySqlAvgRowRow {
-    avg_row_length: u64,
+    avg_row_length: Option<u64>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -426,6 +427,21 @@ mod tests {
         let filtered = filter_unsupported_columns(&columns);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "id");
+    }
+
+    #[test]
+    fn normalize_avg_row_length_handles_null() {
+        assert_eq!(normalize_avg_row_length(None), None);
+    }
+
+    #[test]
+    fn normalize_avg_row_length_handles_zero() {
+        assert_eq!(normalize_avg_row_length(Some(0)), None);
+    }
+
+    #[test]
+    fn normalize_avg_row_length_keeps_positive_values() {
+        assert_eq!(normalize_avg_row_length(Some(512)), Some(512));
     }
 
     #[test]
