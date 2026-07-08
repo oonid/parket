@@ -29,20 +29,68 @@ pub(crate) fn parse_tables(raw: &str) -> Result<Vec<String>> {
     Ok(tables)
 }
 
-pub(crate) fn parse_table_modes(tables: &[String]) -> HashMap<String, ExtractionMode> {
+pub(crate) fn parse_table_modes(tables: &[String]) -> Result<HashMap<String, ExtractionMode>> {
     let mut modes = HashMap::new();
     for table in tables {
         let key = format!("TABLE_MODE_{table}");
         if let Ok(val) = std::env::var(&key) {
-            let mode = match val.to_lowercase().as_str() {
+            let normalized = val.trim().to_lowercase();
+            let mode = match normalized.as_str() {
+                "auto" => ExtractionMode::Auto,
                 "incremental" => ExtractionMode::Incremental,
                 "full_refresh" => ExtractionMode::FullRefresh,
-                _ => ExtractionMode::Auto,
+                "two_stream" => bail!(
+                    "{key}={val}: two-stream mode is not selected via {key}; set \
+                     TABLE_INSERT_CURSOR_{table} and TABLE_UPDATE_CURSOR_{table} instead \
+                     (remove {key})"
+                ),
+                _ => bail!(
+                    "{key}={val}: invalid extraction mode '{val}'; accepted values are \
+                     auto, incremental, full_refresh (two-stream is selected via \
+                     TABLE_INSERT_CURSOR_{table}/TABLE_UPDATE_CURSOR_{table}, not {key})"
+                ),
             };
             modes.insert(table.clone(), mode);
         }
     }
-    modes
+    Ok(modes)
+}
+
+/// O5: two-stream cursor config (`TABLE_INSERT_CURSOR_<t>` + `TABLE_UPDATE_CURSOR_<t>`) and an
+/// explicit, non-Auto `TABLE_MODE_<t>` are mutually exclusive ways of picking a table's
+/// extraction mode. Without this check the orchestrator resolves the two-stream branch first
+/// (see `orchestrator.rs`/`preflight.rs`) and silently discards the operator's explicit
+/// `TABLE_MODE`. Called from both `Config::load` and `Config::load_local` so `--check` and a
+/// real run agree.
+pub(crate) fn validate_mode_conflicts(
+    tables: &[String],
+    table_modes: &HashMap<String, ExtractionMode>,
+    table_insert_cursor: &HashMap<String, String>,
+    table_update_cursor: &HashMap<String, String>,
+) -> Result<()> {
+    for table in tables {
+        let has_cursors = table_insert_cursor.contains_key(table) && table_update_cursor.contains_key(table);
+        if !has_cursors {
+            continue;
+        }
+        if let Some(mode) = table_modes.get(table)
+            && *mode != ExtractionMode::Auto
+        {
+            let mode_str = match mode {
+                ExtractionMode::Auto => "auto",
+                ExtractionMode::Incremental => "incremental",
+                ExtractionMode::FullRefresh => "full_refresh",
+                ExtractionMode::TwoStream => "two_stream",
+            };
+            bail!(
+                "table '{table}' has both TABLE_INSERT_CURSOR_{table}/TABLE_UPDATE_CURSOR_{table} \
+                 set AND TABLE_MODE_{table}={mode_str}; these conflict — remove \
+                 TABLE_MODE_{table} to run '{table}' as two-stream, or remove the cursor \
+                 vars to run it as {mode_str}"
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_table_initial_hwm(tables: &[String]) -> Result<HashMap<String, (String, i64)>> {

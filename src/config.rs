@@ -128,11 +128,12 @@ impl Config {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "info".to_string());
 
-        let table_modes = parse_table_modes(&tables);
+        let table_modes = parse_table_modes(&tables)?;
         let table_initial_hwm = parse_table_initial_hwm(&tables)?;
         let table_timestamp_col = parse_table_timestamp_col(&tables);
         let table_insert_cursor = parse_table_insert_cursor(&tables);
         let table_update_cursor = parse_table_update_cursor(&tables);
+        validate_mode_conflicts(&tables, &table_modes, &table_insert_cursor, &table_update_cursor)?;
 
         Ok(Self {
             database_url,
@@ -218,11 +219,12 @@ impl Config {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "info".to_string());
 
-        let table_modes = parse_table_modes(&tables);
+        let table_modes = parse_table_modes(&tables)?;
         let table_initial_hwm = parse_table_initial_hwm(&tables)?;
         let table_timestamp_col = parse_table_timestamp_col(&tables);
         let table_insert_cursor = parse_table_insert_cursor(&tables);
         let table_update_cursor = parse_table_update_cursor(&tables);
+        validate_mode_conflicts(&tables, &table_modes, &table_insert_cursor, &table_update_cursor)?;
 
         Ok(Self {
             database_url,
@@ -814,6 +816,140 @@ mod tests {
             Some(&ExtractionMode::FullRefresh)
         );
         assert_eq!(config.table_modes.get("products"), None);
+    }
+
+    // O4: unknown TABLE_MODE_<t> values (typos, hyphenated variants, `two_stream`) used to
+    // silently degrade to Auto, discarding operator intent. They must bail with an
+    // actionable error instead.
+
+    #[test]
+    #[serial]
+    fn table_mode_invalid_value_bails() {
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("TABLE_MODE_orders", "full-refresh");
+        }
+
+        let result = Config::load();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("TABLE_MODE_orders"),
+            "error should name the offending var, got: {err}"
+        );
+        assert!(
+            err.contains("full-refresh"),
+            "error should echo the invalid value, got: {err}"
+        );
+        assert!(
+            err.contains("auto") && err.contains("incremental") && err.contains("full_refresh"),
+            "error should list accepted values, got: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn table_mode_fullrefresh_typo_bails() {
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("TABLE_MODE_orders", "fullrefresh");
+        }
+
+        let result = Config::load();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn table_mode_two_stream_value_bails_with_cursor_hint() {
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("TABLE_MODE_orders", "two_stream");
+        }
+
+        let result = Config::load();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("TABLE_INSERT_CURSOR_orders"),
+            "error should point at the insert cursor var, got: {err}"
+        );
+        assert!(
+            err.contains("TABLE_UPDATE_CURSOR_orders"),
+            "error should point at the update cursor var, got: {err}"
+        );
+    }
+
+    // O5: TABLE_INSERT_CURSOR_<t> + TABLE_UPDATE_CURSOR_<t> silently override an explicit,
+    // non-Auto TABLE_MODE_<t> at resolution time. This must instead be rejected at config
+    // load, so both a real run and `--check` see the same actionable conflict error.
+
+    #[test]
+    #[serial]
+    fn cursor_and_explicit_mode_conflict_bails() {
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("TABLE_MODE_orders", "full_refresh");
+            env::set_var("TABLE_INSERT_CURSOR_orders", "id");
+            env::set_var("TABLE_UPDATE_CURSOR_orders", "updated_at");
+        }
+
+        let result = Config::load();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("orders"), "error should name the table, got: {err}");
+    }
+
+    #[test]
+    #[serial]
+    fn cursors_without_table_mode_ok() {
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("TABLE_INSERT_CURSOR_orders", "id");
+            env::set_var("TABLE_UPDATE_CURSOR_orders", "updated_at");
+        }
+
+        let result = Config::load();
+        assert!(result.is_ok(), "cursors alone (no TABLE_MODE) should not conflict");
+    }
+
+    #[test]
+    #[serial]
+    fn cursors_with_auto_mode_ok() {
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("TABLE_MODE_orders", "auto");
+            env::set_var("TABLE_INSERT_CURSOR_orders", "id");
+            env::set_var("TABLE_UPDATE_CURSOR_orders", "updated_at");
+        }
+
+        let result = Config::load();
+        assert!(result.is_ok(), "cursors + explicit TABLE_MODE=auto should not conflict");
+    }
+
+    #[test]
+    #[serial]
+    fn load_local_cursor_and_mode_conflict_bails() {
+        clear_config_env();
+        unsafe {
+            env::set_var("DATABASE_URL", "mysql://user:pass@host:3306/dbname");
+            env::set_var("TABLES", "orders");
+            env::set_var("TARGET_MEMORY_MB", "512");
+            env::set_var("TABLE_MODE_orders", "incremental");
+            env::set_var("TABLE_INSERT_CURSOR_orders", "id");
+            env::set_var("TABLE_UPDATE_CURSOR_orders", "updated_at");
+        }
+
+        let result = Config::load_local();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("orders"), "error should name the table, got: {err}");
     }
 
     #[test]

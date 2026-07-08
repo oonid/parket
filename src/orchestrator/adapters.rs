@@ -1,16 +1,38 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use deltalake::arrow::datatypes::SchemaRef;
 
 use crate::config::Config;
 use crate::discovery::{ColumnInfo, IndexInfo};
 use crate::extractor::BatchExtractor;
 use crate::state::{AppState, TableState};
-use crate::writer::{DeltaWriter, Hwm};
+use crate::writer::{is_missing_table_error, DeltaWriter, Hwm};
 
 use super::{DeltaWrite, Extract, SchemaInspect, StateManage};
+
+/// O6: shared `get_schema` body for both the S3 and local Delta writer adapters (both wrap
+/// the same `DeltaWriter`). `open_table` failing must NOT be blanket-collapsed to "no schema
+/// yet" — a transient error (S3 hiccup, auth blip) silently disables the schema-evolution
+/// guard (an R1-class recurrence). Only a genuinely missing table is `Ok(None)`; anything
+/// else propagates with context.
+async fn get_schema_impl(inner: &DeltaWriter, table_name: &str) -> Result<Option<SchemaRef>> {
+    match inner.open_table(table_name).await {
+        Ok(table) => {
+            let kernel_schema = table.snapshot()?.schema();
+            let arrow_schema: deltalake::arrow::datatypes::Schema =
+                deltalake::kernel::engine::arrow_conversion::TryIntoArrow::try_into_arrow(
+                    kernel_schema.as_ref(),
+                )?;
+            Ok(Some(Arc::new(arrow_schema)))
+        }
+        Err(e) if is_missing_table_error(&e) => Ok(None),
+        Err(e) => Err(e).context(format!(
+            "get_schema: could not open Delta table `{table_name}` (not treating a transient error as missing)"
+        )),
+    }
+}
 
 pub struct SchemaInspectorAdapter {
     pool: sqlx::MySqlPool,
@@ -154,17 +176,7 @@ impl DeltaWrite for DeltaWriterAdapter {
     }
 
     async fn get_schema(&self, table_name: &str) -> Result<Option<SchemaRef>> {
-        match self.inner.open_table(table_name).await {
-            Ok(table) => {
-                let kernel_schema = table.snapshot()?.schema();
-                let arrow_schema: deltalake::arrow::datatypes::Schema =
-                    deltalake::kernel::engine::arrow_conversion::TryIntoArrow::try_into_arrow(
-                        kernel_schema.as_ref(),
-                    )?;
-                Ok(Some(Arc::new(arrow_schema)))
-            }
-            Err(_) => Ok(None),
-        }
+        get_schema_impl(&self.inner, table_name).await
     }
 
     async fn merge_batch(
@@ -256,17 +268,7 @@ impl DeltaWrite for LocalDeltaWriterAdapter {
     }
 
     async fn get_schema(&self, table_name: &str) -> Result<Option<SchemaRef>> {
-        match self.inner.open_table(table_name).await {
-            Ok(table) => {
-                let kernel_schema = table.snapshot()?.schema();
-                let arrow_schema: deltalake::arrow::datatypes::Schema =
-                    deltalake::kernel::engine::arrow_conversion::TryIntoArrow::try_into_arrow(
-                        kernel_schema.as_ref(),
-                    )?;
-                Ok(Some(Arc::new(arrow_schema)))
-            }
-            Err(_) => Ok(None),
-        }
+        get_schema_impl(&self.inner, table_name).await
     }
 
     async fn merge_batch(
