@@ -57,8 +57,32 @@ impl AppState {
             let mut tmp = fs::File::create(&tmp_path)?;
             tmp.write_all(json.as_bytes())?;
             tmp.flush()?;
+            // R5: flush() only pushes bytes to the OS page cache; without fsync a power
+            // loss before the OS writes it back can leave the rename swapping in a
+            // truncated/empty file. sync_all() forces the tmp file's contents to disk
+            // before it becomes the visible state.json.
+            tmp.sync_all()?;
         }
         fs::rename(&tmp_path, path)?;
+
+        // Best-effort: fsync the parent directory too, so the rename (the directory
+        // entry update) itself survives a power loss. This is standard practice for
+        // durable atomic-rename patterns; if it fails (or isn't supported, e.g. on
+        // non-unix platforms that can't open a directory as a file) we log and move on
+        // — the file content is already durable, only the rename's own durability is
+        // best-effort.
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            match fs::File::open(parent) {
+                Ok(dir) => {
+                    if let Err(e) = dir.sync_all() {
+                        warn!("failed to fsync state directory {}: {e}", parent.display());
+                    }
+                }
+                Err(e) => {
+                    warn!("failed to open state directory {} for fsync: {e}", parent.display());
+                }
+            }
+        }
 
         Ok(())
     }
@@ -251,6 +275,35 @@ mod tests {
 
         let result = AppState::load(&path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn write_then_read_round_trip_survives_durable_write() {
+        // R5: write_atomic now fsyncs the tmp file (and best-effort fsyncs the parent
+        // directory) before/after the rename. The fsync calls themselves aren't
+        // directly observable from a test, but the write-then-read round trip must
+        // still work across repeated writes (each one exercising the new sync_all()
+        // calls) and must still leave no stray .tmp file behind.
+        let dir = TempDir::new().unwrap();
+        let path = state_path(&dir);
+
+        let mut state = AppState::default();
+        state
+            .update_table("orders", sample_table_state(), &path)
+            .unwrap();
+
+        let mut second = sample_table_state();
+        second.last_run_rows = Some(99999);
+        second.last_run_status = Some("failed".to_string());
+        state.update_table("orders", second, &path).unwrap();
+
+        let loaded = AppState::load(&path).unwrap();
+        assert_eq!(loaded.tables.len(), 1);
+        let ts = loaded.tables.get("orders").unwrap();
+        assert_eq!(ts.last_run_rows, Some(99999));
+        assert_eq!(ts.last_run_status, Some("failed".to_string()));
+        assert!(path.exists());
+        assert!(!path.with_extension("tmp").exists());
     }
 
     #[test]

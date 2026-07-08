@@ -163,11 +163,18 @@ where
 
         let mut succeeded = 0u32;
         let mut failed = 0u32;
+        // O2/R4: a shutdown mid-run must be visible on the wire (exit code) instead of
+        // looking identical to a fully completed run. `interrupted` is set whenever the
+        // shutdown signal was observed anywhere during this run — either between tables
+        // (the outer break below) or inside a table's own processing (surfaced back up
+        // once process_table returns).
+        let mut interrupted = false;
 
         let tables = self.config.tables.clone();
         for table_name in &tables {
             if self.check_shutdown() {
                 info!("shutdown signal received, stopping table processing");
+                interrupted = true;
                 break;
             }
 
@@ -198,12 +205,17 @@ where
                     }
                 }
             }
+
+            if self.check_shutdown() {
+                interrupted = true;
+            }
         }
 
         let duration_ms = run_start.elapsed().as_millis() as u64;
         info!(
             succeeded,
             failed,
+            interrupted,
             duration_ms,
             "run complete"
         );
@@ -212,6 +224,8 @@ where
             ExitCode::PartialFailure
         } else if failed > 0 {
             ExitCode::Fatal
+        } else if interrupted {
+            ExitCode::PartialFailure
         } else {
             ExitCode::Success
         }
@@ -319,11 +333,19 @@ where
 
         let elapsed = start.elapsed();
         let hash = compute_schema_hash(&columns);
+        // O2/R4: process_incremental/process_two_stream break their internal batch
+        // loops silently on shutdown, so `rows` alone can't distinguish "genuinely
+        // finished" from "cut short by the signal". Conservatively treat any shutdown
+        // observed right after processing as "interrupted" rather than "success" — a
+        // table that in fact finished just before the signal arrived gets marked
+        // interrupted too, but a rerun is cheap and safe, whereas mislabeling a
+        // truncated run as "success" (the bug this fixes) is not.
+        let status = if self.check_shutdown() { "interrupted" } else { "success" };
         self.state_mgr.update_table(
             table_name,
             TableState {
                 last_run_at: Some(format_timestamp_now()),
-                last_run_status: Some("success".to_string()),
+                last_run_status: Some(status.to_string()),
                 last_run_rows: Some(rows),
                 last_run_duration_ms: Some(elapsed.as_millis() as u64),
                 extraction_mode: Some(mode_str.to_string()),
@@ -349,12 +371,44 @@ impl SignalHandler {
 
     pub async fn install(self) {
         tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.ok();
-            info!("received first signal, initiating graceful shutdown");
-            let _ = self.tx.send(true);
-            tokio::signal::ctrl_c().await.ok();
-            info!("received second signal, forcing immediate exit");
-            std::process::exit(130);
+            // R3: containers/systemd send SIGTERM, not SIGINT, on shutdown — listening
+            // only for ctrl_c (SIGINT) meant a SIGTERM hard-killed the process with no
+            // chance for the graceful shutdown path (and no chance to record honest
+            // "interrupted" state, see run()/process_table). Race both signals; whichever
+            // arrives first starts the graceful path, the second (of either kind) forces
+            // an immediate exit exactly as before.
+            #[cfg(unix)]
+            {
+                let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to install SIGTERM handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        info!("received first signal (SIGINT), initiating graceful shutdown");
+                    }
+                    _ = sigterm.recv() => {
+                        info!("received first signal (SIGTERM), initiating graceful shutdown");
+                    }
+                }
+                let _ = self.tx.send(true);
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        info!("received second signal (SIGINT), forcing immediate exit");
+                    }
+                    _ = sigterm.recv() => {
+                        info!("received second signal (SIGTERM), forcing immediate exit");
+                    }
+                }
+                std::process::exit(130);
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c().await.ok();
+                info!("received first signal, initiating graceful shutdown");
+                let _ = self.tx.send(true);
+                tokio::signal::ctrl_c().await.ok();
+                info!("received second signal, forcing immediate exit");
+                std::process::exit(130);
+            }
         });
     }
 }
@@ -538,15 +592,21 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_signal_stops_processing() {
+        // O2/R4: shutdown observed before any table is even attempted must be honest
+        // about it — exit PartialFailure (not Success), and never touch any table's
+        // state (no "success" for work that never happened). Deliberately leave no
+        // expectations on schema/extract/writer: if process_table were called for
+        // either table, the mock would panic, proving no processing occurred.
         let dir = TempDir::new().unwrap();
         let config = make_config(vec!["table1".to_string(), "table2".to_string()]);
-        let mut schema_mock = MockSchemaInspect::new();
-        let mut extract_mock = MockExtract::new();
-        let mut writer_mock = MockDeltaWrite::new();
+        let schema_mock = MockSchemaInspect::new();
+        let extract_mock = MockExtract::new();
+        let writer_mock = MockDeltaWrite::new();
         let mut state_mock = MockStateManage::new();
         let (tx, rx) = watch::channel(false);
 
-        setup_incremental_mocks(&mut schema_mock, &mut extract_mock, &mut writer_mock, &mut state_mock);
+        state_mock.expect_load_or_default().returning(|_| AppState::default());
+        state_mock.expect_update_table().never();
 
         tx.send(true).unwrap();
 
@@ -561,7 +621,10 @@ mod tests {
             false,
         );
         let result = orch.run().await;
-        assert!(matches!(result, ExitCode::Success));
+        assert!(
+            matches!(result, ExitCode::PartialFailure),
+            "expected PartialFailure for a run interrupted before any table started, got {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -1086,6 +1149,12 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_signal_between_tables_skips_remaining() {
+        // O2/R4: table1 finishes its own processing right as the shutdown signal
+        // fires; process_table conservatively marks it "interrupted" (not "success")
+        // because it can't tell "genuinely done" from "cut short" from the outside.
+        // table2 must never be touched at all — only `.withf(|t| t == "table1")`
+        // expectations are registered on schema/writer, so any call for table2 would
+        // panic on an unmatched mock call.
         let dir = TempDir::new().unwrap();
         let config = make_config(vec!["table1".to_string(), "table2".to_string()]);
         let mut schema_mock = MockSchemaInspect::new();
@@ -1094,7 +1163,47 @@ mod tests {
         let mut state_mock = MockStateManage::new();
         let (tx, rx) = watch::channel(false);
 
-        setup_incremental_mocks(&mut schema_mock, &mut extract_mock, &mut writer_mock, &mut state_mock);
+        state_mock.expect_load_or_default().returning(|_| AppState::default());
+
+        schema_mock
+            .expect_discover_columns()
+            .withf(|t| t == "table1")
+            .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_discover_indexes()
+            .withf(|t| t == "table1")
+            .returning(|_| Ok(make_full_refresh_indexes()));
+        schema_mock
+            .expect_get_avg_row_length()
+            .withf(|t| t == "table1")
+            .returning(|_| Ok(Some(100)));
+        extract_mock.expect_calculate_batch_size().returning(|_| 10000);
+        extract_mock.expect_batch_size().returning(|| 10000);
+        writer_mock.expect_ensure_table().returning(|_, _| Ok(()));
+        writer_mock
+            .expect_get_schema()
+            .withf(|t| t == "table1")
+            .returning(|_| Ok(None));
+        writer_mock
+            .expect_read_hwm()
+            .withf(|t| t == "table1")
+            .returning(|_| Ok(None));
+
+        let tx_clone = tx.clone();
+        extract_mock.expect_extract().returning(move |_| {
+            // table1's (empty) batch completes, then the signal fires — observed only
+            // by process_table's post-processing check.
+            let _ = tx_clone.send(true);
+            Ok(vec![])
+        });
+
+        state_mock
+            .expect_update_table()
+            .withf(|name, state, _| {
+                name == "table1" && state.last_run_status.as_deref() == Some("interrupted")
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(()));
 
         let mut orch = Orchestrator::new(
             config,
@@ -1107,9 +1216,11 @@ mod tests {
             false,
         );
 
-        tx.send(true).unwrap();
         let result = orch.run().await;
-        assert!(matches!(result, ExitCode::Success));
+        assert!(
+            matches!(result, ExitCode::PartialFailure),
+            "expected PartialFailure (table1 interrupted, table2 skipped), got {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -1184,8 +1295,13 @@ mod tests {
         writer_mock
             .expect_append_batch()
             .returning(|_, _, _| Ok(()));
+        // O2/R4: the batch loop is cut short by the signal, so this must be recorded
+        // "interrupted", not "success" — and the run-level exit code must reflect it.
         state_mock
             .expect_update_table()
+            .withf(|name, state, _| {
+                name == "orders" && state.last_run_status.as_deref() == Some("interrupted")
+            })
             .returning(|_, _, _| Ok(()));
 
         let mut orch = Orchestrator::new(
@@ -1200,7 +1316,10 @@ mod tests {
         );
 
         let result = orch.run().await;
-        assert!(matches!(result, ExitCode::Success));
+        assert!(
+            matches!(result, ExitCode::PartialFailure),
+            "expected PartialFailure for a table interrupted mid-batch-loop, got {result:?}"
+        );
         let total_extracts = call_count.load(Ordering::SeqCst);
         assert!(
             total_extracts <= 2,
@@ -1210,6 +1329,63 @@ mod tests {
             total_extracts >= 1,
             "should have completed at least one batch, got {total_extracts}"
         );
+    }
+
+    #[tokio::test]
+    async fn full_refresh_process_table_marks_interrupted_when_shutdown_before_any_chunk() {
+        // O2/R4: shutdown arriving before any chunk was extracted must NOT bail (the
+        // full-refresh bail is only for a *partial rewrite* — see full_refresh.rs) but
+        // the table still must not be recorded "success": process_table observes the
+        // shutdown right after process_full_refresh returns and marks "interrupted".
+        let dir = TempDir::new().unwrap();
+        let config = make_config_with_full_refresh(vec!["products".to_string()]);
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+        let (tx, rx) = watch::channel(false);
+        tx.send(true).unwrap();
+
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| Ok(make_full_refresh_columns()));
+        schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(make_full_refresh_indexes()));
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        extract_mock.expect_batch_size().returning(|| 10000);
+        writer_mock.expect_ensure_table().returning(|_, _| Ok(()));
+        writer_mock.expect_get_schema().returning(|_| Ok(None));
+
+        state_mock
+            .expect_update_table()
+            .withf(|name, state, _| {
+                name == "products"
+                    && state.last_run_status.as_deref() == Some("interrupted")
+                    && state.last_run_rows == Some(0)
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = Orchestrator::new(
+            config,
+            schema_mock,
+            extract_mock,
+            writer_mock,
+            state_mock,
+            rx,
+            dir.path().to_path_buf(),
+            false,
+        );
+
+        orch.process_table("products")
+            .await
+            .expect("process_table should return Ok even though the table was interrupted");
     }
 
     #[test]
@@ -1225,7 +1401,32 @@ mod tests {
         assert!(!*rx.borrow());
     }
 
+    // R3: SIGTERM must trigger the same graceful-shutdown path as SIGINT (ctrl_c).
+    // `raise()` delivers the signal to the current process; tokio's signal handling
+    // is a process-wide sigaction registration, so it fires regardless of which
+    // thread raised it. #[serial] avoids racing with other tests in this binary that
+    // touch process-wide signal state.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn signal_handler_handles_sigterm() {
+        let (handler, mut rx) = SignalHandler::new();
+        handler.install().await;
+        // Give the spawned task a chance to actually register the signal handlers
+        // before we raise — install() itself only spawns and returns immediately.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
+        unsafe {
+            libc::raise(libc::SIGTERM);
+        }
+
+        let changed = tokio::time::timeout(std::time::Duration::from_secs(5), rx.changed()).await;
+        assert!(
+            changed.is_ok(),
+            "watch channel did not flip after SIGTERM within the timeout"
+        );
+        assert!(*rx.borrow(), "shutdown flag should be true after SIGTERM");
+    }
 
 
     #[tokio::test]

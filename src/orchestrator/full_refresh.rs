@@ -123,6 +123,26 @@ where
 
         loop {
             if self.check_shutdown() {
+                if chunk_index > 0 {
+                    // O2/R4: chunk 0 was already committed as an OVERWRITE, destroying
+                    // the previous complete snapshot; every chunk after that is a
+                    // partial rewrite sitting on top of it. Unlike incremental (whose
+                    // batches are safe, additive appends), breaking out here silently
+                    // used to record a truncated table as "success". Until full refresh
+                    // gets a proper stage-and-swap (write to a shadow location and
+                    // atomically publish only once the whole table is rebuilt —
+                    // registered as a follow-up), treat a shutdown mid-full-refresh as
+                    // a hard per-table failure so the truncation surfaces instead of
+                    // being silently accepted.
+                    bail!(
+                        "interrupted during full refresh: table `{table_name}` is partially \
+                         rewritten (chunk 0 overwrote the previous snapshot); rerun to rebuild \
+                         it completely"
+                    );
+                }
+                // Nothing was extracted or written yet — safe to stop cleanly. The
+                // caller (process_table) will mark this table "interrupted" rather
+                // than "success" once it observes the shutdown signal.
                 info!(table = table_name, "shutdown signal received during full refresh");
                 break;
             }
@@ -220,6 +240,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+    use tokio::sync::watch;
 
     #[tokio::test]
     async fn full_refresh_table_succeeds() {
@@ -632,5 +653,115 @@ mod tests {
         let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
         let result = orch.run().await;
         assert!(matches!(result, ExitCode::Fatal));
+    }
+
+    #[tokio::test]
+    async fn full_refresh_shutdown_after_first_chunk_bails_with_partial_rewrite_message() {
+        // O2/R4: chunk 0 already committed as an OVERWRITE (destroying the previous
+        // snapshot) before the shutdown is observed on the next loop iteration. This
+        // must now bail instead of silently breaking, because the table is left in a
+        // partially-rewritten state — not a safe, resumable one. Call
+        // process_full_refresh directly so the exact error text can be asserted (the
+        // orchestrator-level "table failed" / Fatal-exit-code behavior for any Err
+        // from process_full_refresh is already covered by
+        // `full_refresh_second_chunk_append_failure_propagates`).
+        let dir = TempDir::new().unwrap();
+        let config = make_config_with_full_refresh(vec!["products".to_string()]);
+        let schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let state_mock = MockStateManage::new();
+        let (tx, rx) = watch::channel(false);
+
+        extract_mock.expect_batch_size().returning(|| 2);
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        let tx_clone = tx.clone();
+        extract_mock.expect_extract().returning(move |_| {
+            let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+            let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+            ]));
+            if count == 0 {
+                // Full chunk (2 rows == batch_size 2): gets committed via
+                // overwrite_table, then the signal fires before the next iteration.
+                let _ = tx_clone.send(true);
+                let batch = RecordBatch::try_new(
+                    schema,
+                    vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![1i64, 2i64]))],
+                ).unwrap();
+                Ok(vec![batch])
+            } else {
+                Ok(vec![])
+            }
+        });
+
+        writer_mock.expect_overwrite_table().times(1).returning(|_, _, _| Ok(()));
+        writer_mock.expect_append_batch().times(0).returning(|_, _, _| Ok(()));
+
+        let mut orch = Orchestrator::new(
+            config,
+            schema_mock,
+            extract_mock,
+            writer_mock,
+            state_mock,
+            rx,
+            dir.path().to_path_buf(),
+            false,
+        );
+
+        let columns = make_full_refresh_columns();
+        let select_columns: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+        let indexes = make_full_refresh_indexes();
+        let result = orch
+            .process_full_refresh("products", &select_columns, &columns, &indexes)
+            .await;
+
+        let err = result.expect_err("shutdown after a chunk was already committed must bail");
+        assert!(
+            err.to_string().contains("partially rewritten"),
+            "expected the partial-rewrite message, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_refresh_shutdown_before_any_chunk_breaks_cleanly() {
+        // O2/R4 nuance: if the shutdown arrives before any chunk was extracted or
+        // written, nothing was destroyed yet, so this must NOT bail — it should break
+        // cleanly and let the caller (process_table) mark the table "interrupted".
+        // extract()/overwrite_table()/append_batch() have no expectations registered,
+        // so any call into them would panic — proving nothing was extracted or written.
+        let dir = TempDir::new().unwrap();
+        let config = make_config_with_full_refresh(vec!["products".to_string()]);
+        let schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let writer_mock = MockDeltaWrite::new();
+        let state_mock = MockStateManage::new();
+        let (tx, rx) = watch::channel(false);
+        tx.send(true).unwrap();
+
+        extract_mock.expect_batch_size().returning(|| 2);
+
+        let mut orch = Orchestrator::new(
+            config,
+            schema_mock,
+            extract_mock,
+            writer_mock,
+            state_mock,
+            rx,
+            dir.path().to_path_buf(),
+            false,
+        );
+
+        let columns = make_full_refresh_columns();
+        let select_columns: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+        let indexes = make_full_refresh_indexes();
+        let result = orch
+            .process_full_refresh("products", &select_columns, &columns, &indexes)
+            .await;
+
+        let rows = result.expect("shutdown before any chunk must not bail — nothing was destroyed yet");
+        assert_eq!(rows, 0);
     }
 }
