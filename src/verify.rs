@@ -143,16 +143,21 @@ pub struct ColumnMeta {
     pub name: String,
     pub type_str: String,
     pub nullable: bool,
+    /// NUMERIC_SCALE from information_schema (source only; None on the Delta side and for
+    /// non-decimal columns). Drives the native-scale DECIMAL(38,scale) used in value
+    /// aggregates so a source column declared at e.g. scale 12 isn't silently truncated to
+    /// the historical fixed scale of 10 (VA2).
+    pub numeric_scale: Option<u32>,
 }
 
 /// What kind of value-aggregate fingerprint to compute for a column.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AggKind {
-    Integer,       // exact SUM/MIN/MAX
-    Decimal,       // SUM/MIN/MAX at fixed scale 10 (exact for <=10 fractional digits)
-    DatetimeSec,   // MIN/MAX truncated to whole seconds
-    DateOnly,      // MIN/MAX date only
-    TextMass,      // SUM(CHAR_LENGTH) + non-null COUNT (collation-independent)
+    Integer,            // exact SUM/MIN/MAX
+    Decimal { scale: u32 }, // SUM/MIN/MAX at the column's native scale (VA2)
+    DatetimeSec,        // MIN/MAX truncated to whole seconds
+    DateOnly,           // MIN/MAX date only
+    TextMass,           // SUM(CHAR_LENGTH) + non-null COUNT (collation-independent)
 }
 
 #[derive(Debug, Clone)]
@@ -161,12 +166,27 @@ pub struct ColumnAgg {
     pub kind: AggKind,
 }
 
+/// The raw aggregate values a probe reads for one column, before fingerprint assembly.
+/// `sum` is None for DatetimeSec/DateOnly (no sum computed); for TextMass it carries
+/// SUM(CHAR_LENGTH) as a string. `non_null_count` closes the value->NULL-swap blind spot
+/// (VA5): every fingerprint now carries it, so a value overwritten with NULL (same sum/min/max
+/// otherwise) still shows up as a count mismatch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnAggValues {
+    pub sum: Option<String>,
+    pub min: Option<String>,
+    pub max: Option<String>,
+    pub non_null_count: i64,
+}
+
 /// Classify a MariaDB DATA_TYPE string into an AggKind, or None to skip
 /// (tinyint/bool, float/double, time, json/blob/binary/enum/set, and anything unknown).
+/// The `Decimal` scale here is a placeholder (0) — callers must override it from the
+/// column's `numeric_scale` before building the final `ColumnAgg` (see `run()`).
 pub(crate) fn agg_kind(type_str: &str) -> Option<AggKind> {
     match type_str.to_ascii_lowercase().as_str() {
         "smallint" | "mediumint" | "int" | "integer" | "bigint" => Some(AggKind::Integer),
-        "decimal" | "numeric" => Some(AggKind::Decimal),
+        "decimal" | "numeric" => Some(AggKind::Decimal { scale: 0 }),
         "datetime" | "timestamp" => Some(AggKind::DatetimeSec),
         "date" => Some(AggKind::DateOnly),
         "varchar" | "char" | "text" | "tinytext" | "mediumtext" | "longtext" => Some(AggKind::TextMass),
@@ -174,15 +194,106 @@ pub(crate) fn agg_kind(type_str: &str) -> Option<AggKind> {
     }
 }
 
-/// Canonical fingerprint builders — BOTH probes MUST use these so the strings match byte-for-byte.
-pub(crate) fn fp_num(sum: Option<&str>, min: Option<&str>, max: Option<&str>) -> String {
-    format!("sum={}|min={}|max={}", sum.unwrap_or("∅"), min.unwrap_or("∅"), max.unwrap_or("∅"))
+/// Max total decimal digits DataFusion/MariaDB DECIMAL(38,x) can hold.
+const DECIMAL_TOTAL_DIGITS: u32 = 38;
+
+/// Number of digits before the decimal point in a numeric string (ignoring a leading '-').
+/// Used by the VA1 overflow guard to bound how many digits a SUM could grow to.
+fn int_digit_count(s: &str) -> usize {
+    let s = s.strip_prefix('-').unwrap_or(s);
+    let int_part = s.split('.').next().unwrap_or(s);
+    int_part.len().max(1)
 }
-pub(crate) fn fp_minmax(min: Option<&str>, max: Option<&str>) -> String {
-    format!("min={}|max={}", min.unwrap_or("∅"), max.unwrap_or("∅"))
+
+/// The decimal capacity (total digits available for the integer part of a SUM) for a
+/// numeric AggKind: 38 for Integer (summed as DECIMAL(38,0)), 38-scale for Decimal.
+fn decimal_capacity(kind: &AggKind) -> u32 {
+    match kind {
+        AggKind::Integer => DECIMAL_TOTAL_DIGITS,
+        AggKind::Decimal { scale } => DECIMAL_TOTAL_DIGITS.saturating_sub(*scale),
+        _ => DECIMAL_TOTAL_DIGITS,
+    }
 }
-pub(crate) fn fp_textmass(len_sum: Option<&str>, count: i64) -> String {
-    format!("len={}|n={}", len_sum.unwrap_or("0"), count)
+
+/// VA1: would summing `non_null_count` values whose magnitude is bounded by `min`/`max`
+/// risk exceeding the DECIMAL(38,scale) capacity DataFusion sums into? DataFusion silently
+/// wraps/corrupts an overflowing decimal sum instead of erroring (unlike MariaDB, which
+/// saturates), so a false Discrepancy would otherwise fire on huge-but-healthy sums. An
+/// empty column (no min/max) never overflows.
+fn sum_would_overflow(kind: &AggKind, min: Option<&str>, max: Option<&str>, non_null_count: i64) -> bool {
+    if non_null_count <= 0 {
+        return false;
+    }
+    let int_digits = [min, max]
+        .into_iter()
+        .flatten()
+        .map(int_digit_count)
+        .max();
+    let Some(int_digits) = int_digits else {
+        return false;
+    };
+    let capacity = decimal_capacity(kind) as usize;
+    let count_digits = non_null_count.to_string().len();
+    int_digits + count_digits > capacity
+}
+
+/// Canonical fingerprint assembly — the ONLY place that turns raw `ColumnAggValues` from
+/// both sides into the (source, delta) fingerprint-string pairs compared in `run()`. Kept
+/// centralized so both probes' differing raw reads always compare byte-for-byte, and so the
+/// VA1 overflow guard (skip SUM on both sides identically) and the VA5 `n=` count component
+/// are applied uniformly regardless of which adapter (real or mock) produced the values.
+pub(crate) fn assemble_fingerprints(
+    specs: &[ColumnAgg],
+    src: &[ColumnAggValues],
+    dlt: &[ColumnAggValues],
+) -> Vec<(String, String)> {
+    let empty = ColumnAggValues {
+        sum: None,
+        min: None,
+        max: None,
+        non_null_count: 0,
+    };
+    specs
+        .iter()
+        .enumerate()
+        .map(|(i, spec)| {
+            let s = src.get(i).unwrap_or(&empty);
+            let d = dlt.get(i).unwrap_or(&empty);
+            match &spec.kind {
+                AggKind::Integer | AggKind::Decimal { .. } => {
+                    let overflow = sum_would_overflow(&spec.kind, s.min.as_deref(), s.max.as_deref(), s.non_null_count)
+                        || sum_would_overflow(&spec.kind, d.min.as_deref(), d.max.as_deref(), d.non_null_count);
+                    if overflow {
+                        println!(
+                            "verify column `{}`: SUM skipped on both sides (decimal precision overflow guard — DataFusion would silently corrupt an overflowing DECIMAL sum)",
+                            spec.name
+                        );
+                    }
+                    let sum_s = if overflow { "skipped".to_string() } else { s.sum.clone().unwrap_or_else(|| "∅".to_string()) };
+                    let sum_d = if overflow { "skipped".to_string() } else { d.sum.clone().unwrap_or_else(|| "∅".to_string()) };
+                    let fp_s = format!(
+                        "sum={}|min={}|max={}|n={}",
+                        sum_s, s.min.as_deref().unwrap_or("∅"), s.max.as_deref().unwrap_or("∅"), s.non_null_count
+                    );
+                    let fp_d = format!(
+                        "sum={}|min={}|max={}|n={}",
+                        sum_d, d.min.as_deref().unwrap_or("∅"), d.max.as_deref().unwrap_or("∅"), d.non_null_count
+                    );
+                    (fp_s, fp_d)
+                }
+                AggKind::DatetimeSec | AggKind::DateOnly => {
+                    let fp_s = format!("min={}|max={}|n={}", s.min.as_deref().unwrap_or("∅"), s.max.as_deref().unwrap_or("∅"), s.non_null_count);
+                    let fp_d = format!("min={}|max={}|n={}", d.min.as_deref().unwrap_or("∅"), d.max.as_deref().unwrap_or("∅"), d.non_null_count);
+                    (fp_s, fp_d)
+                }
+                AggKind::TextMass => {
+                    let fp_s = format!("len={}|n={}", s.sum.as_deref().unwrap_or("0"), s.non_null_count);
+                    let fp_d = format!("len={}|n={}", d.sum.as_deref().unwrap_or("0"), d.non_null_count);
+                    (fp_s, fp_d)
+                }
+            }
+        })
+        .collect()
 }
 
 /// L2 key-set fingerprint over a table's PK column.
@@ -221,8 +332,8 @@ pub trait SourceProbe: Send + Sync {
         columns: &[String],
         ids: &[i64],
     ) -> Result<HashMap<i64, Vec<Option<String>>>>;
-    async fn value_aggregates(&self, table: &str, columns: &[ColumnAgg]) -> Result<Vec<String>>;
-    async fn value_aggregates_scoped(&self, table: &str, columns: &[ColumnAgg], scope: &SourceScope) -> Result<Vec<String>>;
+    async fn value_aggregates(&self, table: &str, columns: &[ColumnAgg]) -> Result<Vec<ColumnAggValues>>;
+    async fn value_aggregates_scoped(&self, table: &str, columns: &[ColumnAgg], scope: &SourceScope) -> Result<Vec<ColumnAggValues>>;
 }
 
 /// Delta-side probe (the synced output).
@@ -247,8 +358,8 @@ pub trait DeltaProbe: Send + Sync {
         columns: &[String],
         ids: &[i64],
     ) -> Result<HashMap<i64, Vec<Option<String>>>>;
-    async fn value_aggregates(&self, table: &str, columns: &[ColumnAgg]) -> Result<Vec<String>>;
-    async fn value_aggregates_latest(&self, table: &str, columns: &[ColumnAgg], cursor_col: &str, scope: &SourceScope) -> Result<Vec<String>>;
+    async fn value_aggregates(&self, table: &str, columns: &[ColumnAgg]) -> Result<Vec<ColumnAggValues>>;
+    async fn value_aggregates_latest(&self, table: &str, columns: &[ColumnAgg], cursor_col: &str, scope: &SourceScope) -> Result<Vec<ColumnAggValues>>;
 }
 
 pub struct VerifyCommand<S, D> {
@@ -408,6 +519,55 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
         for table in &self.tables {
             let default_plan = TablePlan::basic(table.clone());
             let plan = self.table_plans.get(table).unwrap_or(&default_plan);
+            // VA4: a probe error on one table (garbage data, transient connectivity, etc.)
+            // must not abort the whole run — capture it as a per-table Skipped outcome so
+            // every other table still gets verified and `run()` still returns Ok.
+            match self.run_one_table(table, plan).await {
+                Ok(outcome) => outcomes.push(outcome),
+                Err(e) => {
+                    println!("verify {table} VERDICT: SKIPPED: probe error: {e:#}");
+                    outcomes.push(TableOutcome::Skipped {
+                        reason: format!("probe error: {e:#}"),
+                    });
+                }
+            }
+        }
+
+        let pass_count = outcomes
+            .iter()
+            .filter(|o| **o == TableOutcome::Pass)
+            .count();
+        let drift_count = outcomes
+            .iter()
+            .filter(|o| matches!(o, TableOutcome::Drift { .. }))
+            .count();
+        let discrepancy_count = outcomes
+            .iter()
+            .filter(|o| matches!(o, TableOutcome::Discrepancy { .. }))
+            .count();
+        let skipped_count = outcomes
+            .iter()
+            .filter(|o| matches!(o, TableOutcome::Skipped { .. }))
+            .count();
+
+        println!(
+            "verify summary: pass={} drift={} discrepancy={} skipped={}",
+            pass_count, drift_count, discrepancy_count, skipped_count
+        );
+
+        if outcomes
+            .iter()
+            .any(|o| matches!(o, TableOutcome::Discrepancy { .. }))
+        {
+            Ok(VerifyVerdict::Discrepancy)
+        } else {
+            Ok(VerifyVerdict::Clean)
+        }
+    }
+
+    /// Per-table verify body, extracted from `run()` so a probe error on one table can be
+    /// captured as `Skipped` by the caller instead of aborting every other table (VA4).
+    async fn run_one_table(&self, table: &str, plan: &TablePlan) -> Result<TableOutcome> {
             println!("verify {table} plan: {}", plan.describe());
 
             let scols = self.source.columns(table).await?;
@@ -466,48 +626,50 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                 None
             };
 
+            // VA3/V4: the row-cap guard must run BEFORE any full-log window sort. `row_count`
+            // (source: COUNT(*); delta: count(*) over the physical log) is cheap; the
+            // key-set/latest-per-id computation below (which requires a full-log window sort
+            // on the Delta side) only runs once we know we're under the cap.
             let src_row_count;
+            let delta_physical_row_count;
             let delta_label;
             if let Some(scope) = incremental_scope.as_ref().filter(|_| has_id) {
                 src_row_count = self.source.row_count_scoped(table, scope).await?;
+                delta_physical_row_count = self.delta.row_count(table).await?;
                 delta_label = "delta_latest";
-                let delta_stats = self
-                    .delta
-                    .latest_key_stats(table, "id", &scope.cursor_col)
-                    .await?;
-                let dlt_row_count = delta_stats.count;
-                let flag = if src_row_count == dlt_row_count {
+                let flag = if src_row_count == delta_physical_row_count {
                     "match"
                 } else {
                     "differ — see verdict"
                 };
                 println!(
-                    "verify {table} incremental scope: source_scoped={src_row_count} delta_latest={dlt_row_count} cursor={} hwm=updated_at={} last_id={}  [{flag}]",
+                    "verify {table} incremental scope: source_scoped={src_row_count} delta_latest={delta_physical_row_count} cursor={} hwm=updated_at={} last_id={}  [{flag}]",
                     scope.cursor_col,
                     scope.updated_at,
                     scope.last_id
                 );
-                delta_keystats = Some(delta_stats);
             } else {
                 src_row_count = self.source.row_count(table).await?;
-                let dlt_row_count = self.delta.row_count(table).await?;
+                delta_physical_row_count = self.delta.row_count(table).await?;
                 delta_label = "delta";
-                let flag = if src_row_count == dlt_row_count {
+                let flag = if src_row_count == delta_physical_row_count {
                     "match"
                 } else {
                     "differ — see verdict"
                 };
-                println!("verify {table}: source={src_row_count} delta={dlt_row_count}  [{flag}]");
+                println!("verify {table}: source={src_row_count} delta={delta_physical_row_count}  [{flag}]");
             }
 
             let mut outcome = if !missing_in_delta.is_empty() {
                 TableOutcome::Discrepancy {
                     reason: format!("missing columns in Delta: {:?}", missing_in_delta),
                 }
-            } else if !self.deep && src_row_count > self.row_cap {
+            } else if !self.deep
+                && (src_row_count > self.row_cap || delta_physical_row_count > self.row_cap)
+            {
                 TableOutcome::Skipped {
                     reason: format!(
-                        "table has {src_row_count} rows (> cap {cap}); pass --verify-deep to force strict checks",
+                        "table has {src_row_count} source rows / {delta_physical_row_count} delta rows (> cap {cap}); pass --verify-deep to force strict checks",
                         cap = self.row_cap
                     ),
                 }
@@ -517,11 +679,10 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                 }
             } else if let Some(scope) = incremental_scope.as_ref() {
                 let s = self.source.key_stats_scoped(table, "id", scope).await?;
-                let d = delta_keystats.clone().unwrap_or(
-                    self.delta
-                        .latest_key_stats(table, "id", &scope.cursor_col)
-                        .await?,
-                );
+                let d = self
+                    .delta
+                    .latest_key_stats(table, "id", &scope.cursor_col)
+                    .await?;
                 delta_keystats = Some(d.clone());
                 Self::key_stats_outcome("source_scoped", "delta_latest", &s, &d)
             } else {
@@ -544,10 +705,24 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                 let specs: Vec<ColumnAgg> = scols
                     .iter()
                     .filter(|c| dnames.contains(c.name.as_str()) && c.name != "id")
-                    .filter_map(|c| agg_kind(&c.type_str).map(|k| ColumnAgg { name: c.name.clone(), kind: k }))
+                    .filter_map(|c| {
+                        agg_kind(&c.type_str).map(|k| {
+                            // VA2: decimals aggregate at the column's own NATIVE scale
+                            // (from information_schema.NUMERIC_SCALE) instead of a fixed
+                            // scale — otherwise round-then-sum (source) vs sum-then-round
+                            // (fixed-scale cast) diverge deterministically for scale>10.
+                            let kind = match k {
+                                AggKind::Decimal { .. } => AggKind::Decimal {
+                                    scale: c.numeric_scale.unwrap_or(10).min(30),
+                                },
+                                other => other,
+                            };
+                            ColumnAgg { name: c.name.clone(), kind }
+                        })
+                    })
                     .collect();
                 if !specs.is_empty() {
-                    let pair: Option<(Vec<String>, Vec<String>)> =
+                    let pair: Option<(Vec<ColumnAggValues>, Vec<ColumnAggValues>)> =
                         if let Some(scope) = incremental_scope.as_ref() {
                             Some((
                                 self.source.value_aggregates_scoped(table, &specs, scope).await?,
@@ -566,19 +741,14 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                                 self.delta.value_aggregates(table, &specs).await?,
                             ))
                         };
-                    if let Some((sfp, dfp)) = pair {
+                    if let Some((sv, dv)) = pair {
+                        let fingerprints = assemble_fingerprints(&specs, &sv, &dv);
                         let mismatches: Vec<String> = specs
                             .iter()
-                            .enumerate()
-                            .filter(|(i, _)| sfp.get(*i) != dfp.get(*i))
-                            .map(|(i, s)| {
-                                format!(
-                                    "{} ({:?}: source={} delta={})",
-                                    s.name,
-                                    s.kind,
-                                    sfp.get(i).map(|x| x.as_str()).unwrap_or("<none>"),
-                                    dfp.get(i).map(|x| x.as_str()).unwrap_or("<none>")
-                                )
+                            .zip(fingerprints.iter())
+                            .filter(|(_, (s, d))| s != d)
+                            .map(|(spec, (s, d))| {
+                                format!("{} ({:?}: source={} delta={})", spec.name, spec.kind, s, d)
                             })
                             .collect();
                         if mismatches.is_empty() {
@@ -729,39 +899,7 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                 }
             }
 
-            outcomes.push(outcome);
-        }
-
-        let pass_count = outcomes
-            .iter()
-            .filter(|o| **o == TableOutcome::Pass)
-            .count();
-        let drift_count = outcomes
-            .iter()
-            .filter(|o| matches!(o, TableOutcome::Drift { .. }))
-            .count();
-        let discrepancy_count = outcomes
-            .iter()
-            .filter(|o| matches!(o, TableOutcome::Discrepancy { .. }))
-            .count();
-        let skipped_count = outcomes
-            .iter()
-            .filter(|o| matches!(o, TableOutcome::Skipped { .. }))
-            .count();
-
-        println!(
-            "verify summary: pass={} drift={} discrepancy={} skipped={}",
-            pass_count, drift_count, discrepancy_count, skipped_count
-        );
-
-        if outcomes
-            .iter()
-            .any(|o| matches!(o, TableOutcome::Discrepancy { .. }))
-        {
-            Ok(VerifyVerdict::Discrepancy)
-        } else {
-            Ok(VerifyVerdict::Clean)
-        }
+            Ok(outcome)
     }
 }
 
@@ -851,11 +989,13 @@ mod tests {
                     name: "id".to_string(),
                     type_str: "bigint".to_string(),
                     nullable: false,
+                    numeric_scale: None,
                 },
                 ColumnMeta {
                     name: "name".to_string(),
                     type_str: "varchar".to_string(),
                     nullable: true,
+                    numeric_scale: None,
                 },
             ])
         };
@@ -917,6 +1057,7 @@ mod tests {
                 name: "id".to_string(),
                 type_str: "bigint".to_string(),
                 nullable: false,
+                numeric_scale: None,
             }])
         };
         source.expect_columns().returning(move |_| cols());
@@ -965,16 +1106,19 @@ mod tests {
                     name: "id".to_string(),
                     type_str: "bigint".to_string(),
                     nullable: false,
+                    numeric_scale: None,
                 },
                 ColumnMeta {
                     name: "name".to_string(),
                     type_str: "varchar".to_string(),
                     nullable: true,
+                    numeric_scale: None,
                 },
                 ColumnMeta {
                     name: "phone".to_string(),
                     type_str: "varchar".to_string(),
                     nullable: true,
+                    numeric_scale: None,
                 },
             ])
         });
@@ -984,11 +1128,13 @@ mod tests {
                     name: "id".to_string(),
                     type_str: "Int64".to_string(),
                     nullable: false,
+                    numeric_scale: None,
                 },
                 ColumnMeta {
                     name: "name".to_string(),
                     type_str: "Utf8".to_string(),
                     nullable: true,
+                    numeric_scale: None,
                 },
             ])
         });
@@ -1031,6 +1177,7 @@ mod tests {
                 name: "id".to_string(),
                 type_str: "bigint".to_string(),
                 nullable: false,
+                numeric_scale: None,
             }])
         };
         source.expect_columns().returning(move |_| cols());
@@ -1078,6 +1225,7 @@ mod tests {
                 name: "id".to_string(),
                 type_str: "bigint".to_string(),
                 nullable: false,
+                numeric_scale: None,
             }])
         };
         source.expect_columns().returning(move |_| cols());
@@ -1125,6 +1273,7 @@ mod tests {
                 name: "id".to_string(),
                 type_str: "bigint".to_string(),
                 nullable: false,
+                numeric_scale: None,
             }])
         };
         source.expect_columns().returning(move |_| cols());
@@ -1169,6 +1318,7 @@ mod tests {
                 name: "id".to_string(),
                 type_str: "bigint".to_string(),
                 nullable: false,
+                numeric_scale: None,
             }])
         };
         source.expect_columns().returning(move |_| cols());
@@ -1212,6 +1362,7 @@ mod tests {
                 name: "id".to_string(),
                 type_str: "bigint".to_string(),
                 nullable: false,
+                numeric_scale: None,
             }])
         };
         source.expect_columns().returning(move |_| cols());
@@ -1270,11 +1421,13 @@ mod tests {
                     name: "id".to_string(),
                     type_str: "bigint".to_string(),
                     nullable: false,
+                    numeric_scale: None,
                 },
                 ColumnMeta {
                     name: "data".to_string(),
                     type_str: "varchar".to_string(),
                     nullable: true,
+                    numeric_scale: None,
                 },
             ])
         };
@@ -1322,6 +1475,7 @@ mod tests {
                 name: "id".to_string(),
                 type_str: "bigint".to_string(),
                 nullable: false,
+                numeric_scale: None,
             }])
         };
         source.expect_columns().returning(move |_| cols());
@@ -1390,6 +1544,7 @@ mod tests {
                 name: "id".to_string(),
                 type_str: "bigint".to_string(),
                 nullable: false,
+                numeric_scale: None,
             }])
         };
         source.expect_columns().returning(move |_| cols());
@@ -1450,6 +1605,7 @@ mod tests {
                 name: "id".to_string(),
                 type_str: "bigint".to_string(),
                 nullable: false,
+                numeric_scale: None,
             }])
         };
         source.expect_columns().returning(move |_| cols());
@@ -1510,6 +1666,7 @@ mod tests {
                 name: "id".to_string(),
                 type_str: "bigint".to_string(),
                 nullable: false,
+                numeric_scale: None,
             }])
         };
         source.expect_columns().returning(move |_| cols());
@@ -1570,6 +1727,7 @@ mod tests {
                 name: "id".to_string(),
                 type_str: "bigint".to_string(),
                 nullable: false,
+                numeric_scale: None,
             }])
         };
         source.expect_columns().returning(move |_| cols());
@@ -1593,11 +1751,13 @@ mod tests {
                     name: "id".to_string(),
                     type_str: "bigint".to_string(),
                     nullable: false,
+                    numeric_scale: None,
                 },
                 ColumnMeta {
                     name: "created_at".to_string(),
                     type_str: "timestamp".to_string(),
                     nullable: false,
+                    numeric_scale: None,
                 },
             ])
         });
@@ -1606,6 +1766,7 @@ mod tests {
                 name: "id".to_string(),
                 type_str: "Int64".to_string(),
                 nullable: false,
+                numeric_scale: None,
             }])
         });
         let cmd = VerifyCommand::new(source, delta, vec!["events".to_string()]);
@@ -1626,11 +1787,13 @@ mod tests {
                     name: "id".to_string(),
                     type_str: "bigint".to_string(),
                     nullable: false,
+                    numeric_scale: None,
                 },
                 ColumnMeta {
                     name: "name".to_string(),
                     type_str: "varchar".to_string(),
                     nullable: true,
+                    numeric_scale: None,
                 },
             ])
         };
@@ -1658,10 +1821,10 @@ mod tests {
         source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
         source
             .expect_value_aggregates()
-            .returning(|_, _| Ok(vec!["sum=45|min=1|max=10".to_string()]));
+            .returning(|_, _| Ok(vec![ColumnAggValues { sum: Some("45".to_string()), min: Some("1".to_string()), max: Some("10".to_string()), non_null_count: 3 }]));
         delta
             .expect_value_aggregates()
-            .returning(|_, _| Ok(vec!["sum=45|min=1|max=10".to_string()]));
+            .returning(|_, _| Ok(vec![ColumnAggValues { sum: Some("45".to_string()), min: Some("1".to_string()), max: Some("10".to_string()), non_null_count: 3 }]));
         let cmd = VerifyCommand::new(source, delta, vec!["users".to_string()]);
         let result = cmd.run().await;
         assert!(result.is_ok());
@@ -1680,11 +1843,13 @@ mod tests {
                     name: "id".to_string(),
                     type_str: "bigint".to_string(),
                     nullable: false,
+                    numeric_scale: None,
                 },
                 ColumnMeta {
                     name: "name".to_string(),
                     type_str: "varchar".to_string(),
                     nullable: true,
+                    numeric_scale: None,
                 },
             ])
         };
@@ -1712,10 +1877,10 @@ mod tests {
         source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
         source
             .expect_value_aggregates()
-            .returning(|_, _| Ok(vec!["len=45|n=8".to_string()]));
+            .returning(|_, _| Ok(vec![ColumnAggValues { sum: Some("45".to_string()), min: None, max: None, non_null_count: 8 }]));
         delta
             .expect_value_aggregates()
-            .returning(|_, _| Ok(vec!["len=45|n=8".to_string()]));
+            .returning(|_, _| Ok(vec![ColumnAggValues { sum: Some("45".to_string()), min: None, max: None, non_null_count: 8 }]));
         let cmd = VerifyCommand::new(source, delta, vec!["users".to_string()]);
         let result = cmd.run().await;
         assert!(result.is_ok());
@@ -1735,11 +1900,13 @@ mod tests {
                     name: "id".to_string(),
                     type_str: "bigint".to_string(),
                     nullable: false,
+                    numeric_scale: None,
                 },
                 ColumnMeta {
                     name: "name".to_string(),
                     type_str: "varchar".to_string(),
                     nullable: true,
+                    numeric_scale: None,
                 },
             ])
         };
@@ -1780,10 +1947,10 @@ mod tests {
             .returning(move |_, _, _, _| Ok(sample_rows_map_delta.clone()));
         source
             .expect_value_aggregates()
-            .returning(|_, _| Ok(vec!["len=2|n=2".to_string()]));
+            .returning(|_, _| Ok(vec![ColumnAggValues { sum: Some("2".to_string()), min: None, max: None, non_null_count: 2 }]));
         delta
             .expect_value_aggregates()
-            .returning(|_, _| Ok(vec!["len=2|n=2".to_string()]));
+            .returning(|_, _| Ok(vec![ColumnAggValues { sum: Some("2".to_string()), min: None, max: None, non_null_count: 2 }]));
         let cmd = VerifyCommand::new(source, delta, vec!["users".to_string()]);
         let result = cmd.run().await;
         assert!(result.is_ok());
@@ -1802,11 +1969,13 @@ mod tests {
                     name: "id".to_string(),
                     type_str: "bigint".to_string(),
                     nullable: false,
+                    numeric_scale: None,
                 },
                 ColumnMeta {
                     name: "name".to_string(),
                     type_str: "varchar".to_string(),
                     nullable: true,
+                    numeric_scale: None,
                 },
             ])
         };
@@ -1850,10 +2019,10 @@ mod tests {
             .returning(move |_, _, _, _| Ok(delta_rows_for_closure.clone()));
         source
             .expect_value_aggregates()
-            .returning(|_, _| Ok(vec!["len=2|n=2".to_string()]));
+            .returning(|_, _| Ok(vec![ColumnAggValues { sum: Some("2".to_string()), min: None, max: None, non_null_count: 2 }]));
         delta
             .expect_value_aggregates()
-            .returning(|_, _| Ok(vec!["len=2|n=2".to_string()]));
+            .returning(|_, _| Ok(vec![ColumnAggValues { sum: Some("2".to_string()), min: None, max: None, non_null_count: 2 }]));
         let cmd = VerifyCommand::new(source, delta, vec!["users".to_string()]);
         let result = cmd.run().await;
         assert!(result.is_ok());
@@ -1865,17 +2034,20 @@ mod tests {
     async fn verify_incremental_hwm_scoped_latest_pass() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        delta.expect_row_count().returning(|_| Ok(2));
         let cols = || {
             Ok(vec![
                 ColumnMeta {
                     name: "id".to_string(),
                     type_str: "bigint".to_string(),
                     nullable: false,
+                    numeric_scale: None,
                 },
                 ColumnMeta {
                     name: "updated_at".to_string(),
                     type_str: "timestamp".to_string(),
                     nullable: false,
+                    numeric_scale: None,
                 },
             ])
         };
@@ -1955,17 +2127,20 @@ mod tests {
     async fn verify_incremental_hwm_scoped_latest_discrepancy() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        delta.expect_row_count().returning(|_| Ok(2));
         let cols = || {
             Ok(vec![
                 ColumnMeta {
                     name: "id".to_string(),
                     type_str: "bigint".to_string(),
                     nullable: false,
+                    numeric_scale: None,
                 },
                 ColumnMeta {
                     name: "updated_at".to_string(),
                     type_str: "timestamp".to_string(),
                     nullable: false,
+                    numeric_scale: None,
                 },
             ])
         };
@@ -2033,6 +2208,7 @@ mod tests {
                 name: "updated_at".to_string(),
                 type_str: "timestamp".to_string(),
                 nullable: false,
+                numeric_scale: None,
             }])
         };
         source.expect_columns().returning(move |_| cols());
@@ -2075,11 +2251,13 @@ mod tests {
                     name: "id".to_string(),
                     type_str: "bigint".to_string(),
                     nullable: false,
+                    numeric_scale: None,
                 },
                 ColumnMeta {
                     name: "updated_at".to_string(),
                     type_str: "timestamp".to_string(),
                     nullable: false,
+                    numeric_scale: None,
                 },
             ])
         };
@@ -2180,11 +2358,13 @@ mod tests {
                     name: "id".to_string(),
                     type_str: "bigint".to_string(),
                     nullable: false,
+                    numeric_scale: None,
                 },
                 ColumnMeta {
                     name: "amount".to_string(),
                     type_str: "int".to_string(),
                     nullable: true,
+                    numeric_scale: None,
                 },
             ])
         };
@@ -2213,10 +2393,10 @@ mod tests {
         // Value aggregates match on both sides
         source
             .expect_value_aggregates()
-            .returning(|_, _| Ok(vec!["sum=6|min=1|max=3".to_string()]));
+            .returning(|_, _| Ok(vec![ColumnAggValues { sum: Some("6".to_string()), min: Some("1".to_string()), max: Some("3".to_string()), non_null_count: 3 }]));
         delta
             .expect_value_aggregates()
-            .returning(|_, _| Ok(vec!["sum=6|min=1|max=3".to_string()]));
+            .returning(|_, _| Ok(vec![ColumnAggValues { sum: Some("6".to_string()), min: Some("1".to_string()), max: Some("3".to_string()), non_null_count: 3 }]));
         let cmd = VerifyCommand::new(source, delta, vec!["orders".to_string()]);
         let result = cmd.run().await;
         assert!(result.is_ok());
@@ -2235,11 +2415,13 @@ mod tests {
                     name: "id".to_string(),
                     type_str: "bigint".to_string(),
                     nullable: false,
+                    numeric_scale: None,
                 },
                 ColumnMeta {
                     name: "amount".to_string(),
                     type_str: "int".to_string(),
                     nullable: true,
+                    numeric_scale: None,
                 },
             ])
         };
@@ -2268,10 +2450,10 @@ mod tests {
         // Value aggregates differ
         source
             .expect_value_aggregates()
-            .returning(|_, _| Ok(vec!["sum=6|min=1|max=3".to_string()]));
+            .returning(|_, _| Ok(vec![ColumnAggValues { sum: Some("6".to_string()), min: Some("1".to_string()), max: Some("3".to_string()), non_null_count: 3 }]));
         delta
             .expect_value_aggregates()
-            .returning(|_, _| Ok(vec!["sum=9|min=2|max=3".to_string()]));
+            .returning(|_, _| Ok(vec![ColumnAggValues { sum: Some("9".to_string()), min: Some("2".to_string()), max: Some("3".to_string()), non_null_count: 3 }]));
         let cmd = VerifyCommand::new(source, delta, vec!["orders".to_string()]);
         let result = cmd.run().await;
         assert!(result.is_ok());
@@ -2283,22 +2465,26 @@ mod tests {
     async fn verify_incremental_scoped_value_match_stays_pass() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        delta.expect_row_count().returning(|_| Ok(2));
         let cols = || {
             Ok(vec![
                 ColumnMeta {
                     name: "id".to_string(),
                     type_str: "bigint".to_string(),
                     nullable: false,
+                    numeric_scale: None,
                 },
                 ColumnMeta {
                     name: "updated_at".to_string(),
                     type_str: "timestamp".to_string(),
                     nullable: false,
+                    numeric_scale: None,
                 },
                 ColumnMeta {
                     name: "amount".to_string(),
                     type_str: "int".to_string(),
                     nullable: true,
+                    numeric_scale: None,
                 },
             ])
         };
@@ -2332,10 +2518,10 @@ mod tests {
         // Value aggregates match on both sides (scoped)
         source
             .expect_value_aggregates_scoped()
-            .returning(|_, _, _| Ok(vec!["sum=6|min=1|max=3".to_string()]));
+            .returning(|_, _, _| Ok(vec![ColumnAggValues { sum: Some("6".to_string()), min: Some("1".to_string()), max: Some("3".to_string()), non_null_count: 3 }]));
         delta
             .expect_value_aggregates_latest()
-            .returning(|_, _, _, _| Ok(vec!["sum=6|min=1|max=3".to_string()]));
+            .returning(|_, _, _, _| Ok(vec![ColumnAggValues { sum: Some("6".to_string()), min: Some("1".to_string()), max: Some("3".to_string()), non_null_count: 3 }]));
         let cmd =
             VerifyCommand::new(source, delta, vec!["orders".to_string()]).with_table_plans(vec![
                 TablePlan {
@@ -2358,22 +2544,26 @@ mod tests {
     async fn verify_incremental_scoped_value_mismatch_downgrades() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        delta.expect_row_count().returning(|_| Ok(2));
         let cols = || {
             Ok(vec![
                 ColumnMeta {
                     name: "id".to_string(),
                     type_str: "bigint".to_string(),
                     nullable: false,
+                    numeric_scale: None,
                 },
                 ColumnMeta {
                     name: "updated_at".to_string(),
                     type_str: "timestamp".to_string(),
                     nullable: false,
+                    numeric_scale: None,
                 },
                 ColumnMeta {
                     name: "amount".to_string(),
                     type_str: "int".to_string(),
                     nullable: true,
+                    numeric_scale: None,
                 },
             ])
         };
@@ -2407,10 +2597,10 @@ mod tests {
         // Value aggregates differ (scoped)
         source
             .expect_value_aggregates_scoped()
-            .returning(|_, _, _| Ok(vec!["sum=6|min=1|max=3".to_string()]));
+            .returning(|_, _, _| Ok(vec![ColumnAggValues { sum: Some("6".to_string()), min: Some("1".to_string()), max: Some("3".to_string()), non_null_count: 3 }]));
         delta
             .expect_value_aggregates_latest()
-            .returning(|_, _, _, _| Ok(vec!["sum=9|min=2|max=3".to_string()]));
+            .returning(|_, _, _, _| Ok(vec![ColumnAggValues { sum: Some("9".to_string()), min: Some("2".to_string()), max: Some("3".to_string()), non_null_count: 3 }]));
         let cmd =
             VerifyCommand::new(source, delta, vec!["orders".to_string()]).with_table_plans(vec![
                 TablePlan {
@@ -2427,5 +2617,146 @@ mod tests {
         let result = cmd.run().await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), VerifyVerdict::Discrepancy);
+    }
+
+    #[test]
+    fn sum_overflow_guard_boundaries() {
+        // Integer capacity = 38 digits: int_digits + digits(count) > 38 → skip.
+        let d37 = "9".repeat(37);
+        let d38 = "9".repeat(38);
+        assert!(
+            !sum_would_overflow(&AggKind::Integer, Some("1"), Some(&d37), 9),
+            "37 + 1 = 38 fits exactly"
+        );
+        assert!(
+            sum_would_overflow(&AggKind::Integer, Some("1"), Some(&d38), 9),
+            "38 + 1 = 39 exceeds"
+        );
+        // count contributes its own digit length: 10 rows (2 digits) tips the same magnitude.
+        assert!(sum_would_overflow(&AggKind::Integer, Some("1"), Some(&d37), 10));
+        // Decimal at scale 10 → capacity 28 integer digits.
+        let dec = AggKind::Decimal { scale: 10 };
+        let i27 = format!("{}.5", "9".repeat(27));
+        let i28 = format!("{}.5", "9".repeat(28));
+        assert!(!sum_would_overflow(&dec, Some("0.1"), Some(&i27), 9));
+        assert!(sum_would_overflow(&dec, Some("0.1"), Some(&i28), 9));
+        // Sign is ignored for the digit count (min can carry the magnitude).
+        let neg = format!("-{d38}");
+        assert!(sum_would_overflow(&AggKind::Integer, Some(&neg), Some("1"), 9));
+        // Empty column / zero rows never trip the guard.
+        assert!(!sum_would_overflow(&AggKind::Integer, None, None, 9));
+        assert!(!sum_would_overflow(&AggKind::Integer, Some(&d38), Some(&d38), 0));
+    }
+
+    #[test]
+    fn overflow_guard_skips_sum_on_both_sides() {
+        // One side's magnitude trips the guard → BOTH fingerprints carry sum=skipped,
+        // while min/max/n stay compared (and here still mismatch).
+        let specs = vec![ColumnAgg {
+            name: "amount".to_string(),
+            kind: AggKind::Decimal { scale: 10 },
+        }];
+        let big = "9".repeat(28);
+        let src = vec![ColumnAggValues {
+            sum: Some("1".to_string()),
+            min: Some("0".to_string()),
+            max: Some(big),
+            non_null_count: 5,
+        }];
+        let dlt = vec![ColumnAggValues {
+            sum: Some("2".to_string()),
+            min: Some("0".to_string()),
+            max: Some("1".to_string()),
+            non_null_count: 5,
+        }];
+        let fps = assemble_fingerprints(&specs, &src, &dlt);
+        assert!(fps[0].0.starts_with("sum=skipped|"));
+        assert!(fps[0].1.starts_with("sum=skipped|"));
+        assert_ne!(fps[0].0, fps[0].1, "min/max must still be compared");
+    }
+
+    #[test]
+    fn value_null_swap_detected_via_count() {
+        // VA5: a non-extremal 0 → NULL swap leaves sum/min/max identical; the n=
+        // component must break the tie.
+        let specs = vec![ColumnAgg {
+            name: "qty".to_string(),
+            kind: AggKind::Integer,
+        }];
+        let src = vec![ColumnAggValues {
+            sum: Some("10".to_string()),
+            min: Some("0".to_string()),
+            max: Some("7".to_string()),
+            non_null_count: 5,
+        }];
+        let dlt = vec![ColumnAggValues {
+            sum: Some("10".to_string()),
+            min: Some("0".to_string()),
+            max: Some("7".to_string()),
+            non_null_count: 4,
+        }];
+        let fps = assemble_fingerprints(&specs, &src, &dlt);
+        assert_ne!(fps[0].0, fps[0].1, "count component must detect the NULL swap");
+    }
+
+    #[tokio::test]
+    async fn probe_error_on_one_table_skips_it_and_continues() {
+        // VA4: a probe failure on one table must yield Skipped for that table and leave
+        // the rest of the run intact (previously the whole run aborted with Err).
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        source
+            .expect_row_count()
+            .withf(|t| t == "bad")
+            .returning(|_| Err(anyhow::anyhow!("simulated probe failure")));
+        source
+            .expect_row_count()
+            .withf(|t| t == "good")
+            .returning(|_| Ok(5));
+        delta.expect_row_count().returning(|_| Ok(5));
+        let cols = || {
+            Ok(vec![ColumnMeta {
+                name: "id".to_string(),
+                type_str: "bigint".to_string(),
+                nullable: false,
+                numeric_scale: None,
+            }])
+        };
+        source.expect_columns().returning(move |_| cols());
+        delta.expect_columns().returning(move |_| cols());
+        let stats = || {
+            Ok(KeyStats {
+                count: 5,
+                distinct: 5,
+                min: Some(1),
+                max: Some(5),
+                xor: 7,
+                distinct_xor: 7,
+                sum: 15,
+            })
+        };
+        source.expect_key_stats().returning(move |_, _| stats());
+        delta.expect_key_stats().returning(move |_, _| stats());
+        source
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        delta
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
+        source.expect_value_aggregates().returning(|_, _| Ok(vec![]));
+        delta.expect_value_aggregates().returning(|_, _| Ok(vec![]));
+        let cmd = VerifyCommand::new(
+            source,
+            delta,
+            vec!["bad".to_string(), "good".to_string()],
+        );
+        let result = cmd.run().await;
+        assert!(result.is_ok(), "one bad table must not abort the run");
+        assert_eq!(
+            result.unwrap(),
+            VerifyVerdict::Clean,
+            "bad → Skipped, good → Pass ⇒ Clean overall"
+        );
     }
 }

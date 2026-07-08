@@ -103,6 +103,16 @@ impl DeltaWriter {
         self
     }
 
+    /// Memory budget (MB) for bounded datafusion sessions (MERGE and the verify probes).
+    pub(crate) fn merge_memory_mb(&self) -> u64 {
+        self.merge_memory_mb
+    }
+
+    /// Spill dir for bounded datafusion sessions; None = system temp.
+    pub(crate) fn merge_spill_dir(&self) -> Option<&std::path::Path> {
+        self.merge_spill_dir.as_deref()
+    }
+
     fn table_url(&self, table_name: &str) -> Result<Url> {
         if self.use_local_fs {
             let path = std::path::Path::new(&self.prefix).join(table_name);

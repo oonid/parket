@@ -1,9 +1,13 @@
 use anyhow::{Context, Result};
 use deltalake::arrow::array::{Array, Int64Array, StringArray, StringViewArray};
-use deltalake::datafusion::prelude::SessionContext;
+use deltalake::arrow::record_batch::RecordBatch;
+use deltalake::datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+use deltalake::datafusion::execution::memory_pool::FairSpillPool;
+use deltalake::datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use deltalake::datafusion::prelude::{SessionConfig, SessionContext};
 use std::collections::HashMap;
 
-use super::{AggKind, ColumnAgg, ColumnMeta, DeltaProbe, KeyStats};
+use super::{AggKind, ColumnAgg, ColumnAggValues, ColumnMeta, DeltaProbe, KeyStats};
 use crate::writer::DeltaWriter;
 
 pub struct DeltaProbeAdapter {
@@ -34,6 +38,121 @@ impl DeltaProbeAdapter {
         } else {
             None
         }
+    }
+
+    fn i64_at(batch: &deltalake::arrow::record_batch::RecordBatch, col_idx: usize) -> i64 {
+        batch
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .and_then(|a| {
+                if a.is_empty() || a.is_null(0) {
+                    None
+                } else {
+                    Some(a.value(0))
+                }
+            })
+            .unwrap_or(0)
+    }
+
+    /// BOUNDED SESSION (VA3/V4): the window-sort methods (`latest_key_stats`,
+    /// `value_aggregates`, `value_aggregates_latest`) must not run on an unbounded default
+    /// SessionContext on an 8 GB box. Mirrors `merge_batch` in `src/writer/two_stream.rs`
+    /// exactly: a FairSpillPool sized from the writer's configured merge memory budget, a
+    /// DiskManager routed to the configured spill dir (or system temp), single partition
+    /// (one external sorter owns the whole pool instead of fragmenting it), and
+    /// prefer_hash_join disabled (datafusion's HashJoin doesn't spill under a bounded pool).
+    fn bounded_ctx(&self) -> Result<SessionContext> {
+        let pool_bytes = (self.writer.merge_memory_mb() as usize) * 1024 * 1024;
+        let disk_builder = match self.writer.merge_spill_dir() {
+            Some(dir) => {
+                DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![dir.to_path_buf()]))
+            }
+            None => DiskManagerBuilder::default(),
+        };
+        let runtime = std::sync::Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(std::sync::Arc::new(FairSpillPool::new(pool_bytes)))
+                .with_disk_manager_builder(disk_builder)
+                .build()?,
+        );
+        let mut session_config = SessionConfig::new();
+        session_config.options_mut().optimizer.prefer_hash_join = false;
+        session_config.options_mut().execution.target_partitions = 1;
+        Ok(SessionContext::new_with_config_rt(session_config, runtime))
+    }
+
+    /// One SELECT per table (VA3/V4): every column's aggregate expressions are concatenated
+    /// into a single select list instead of one query per column. VA4: casts on the stored
+    /// DATA use `try_cast` so a garbage string (e.g. a Utf8 column drifted from its expected
+    /// numeric type) yields NULL instead of aborting the whole query — the resulting `n=`
+    /// mismatch then surfaces as a Discrepancy naturally, instead of a hard error.
+    fn column_exprs(col: &ColumnAgg) -> Vec<String> {
+        let c = &col.name;
+        match col.kind {
+            AggKind::Integer => vec![
+                format!("cast(sum(try_cast(`{c}` as decimal(38,0))) as varchar)"),
+                format!("cast(min(try_cast(`{c}` as bigint)) as varchar)"),
+                format!("cast(max(try_cast(`{c}` as bigint)) as varchar)"),
+                format!("count(`{c}`)"),
+            ],
+            AggKind::Decimal { scale } => vec![
+                format!("cast(sum(try_cast(`{c}` as decimal(38,{scale}))) as varchar)"),
+                format!("cast(min(try_cast(`{c}` as decimal(38,{scale}))) as varchar)"),
+                format!("cast(max(try_cast(`{c}` as decimal(38,{scale}))) as varchar)"),
+                format!("count(`{c}`)"),
+            ],
+            AggKind::DatetimeSec => vec![
+                format!("substr(replace(cast(min(`{c}`) as varchar), 'T', ' '), 1, 19)"),
+                format!("substr(replace(cast(max(`{c}`) as varchar), 'T', ' '), 1, 19)"),
+                format!("count(`{c}`)"),
+            ],
+            AggKind::DateOnly => vec![
+                format!("substr(cast(min(`{c}`) as varchar), 1, 10)"),
+                format!("substr(cast(max(`{c}`) as varchar), 1, 10)"),
+                format!("count(`{c}`)"),
+            ],
+            AggKind::TextMass => vec![
+                format!("cast(sum(char_length(`{c}`)) as varchar)"),
+                format!("count(`{c}`)"),
+            ],
+        }
+    }
+
+    /// Read one column's slice of the aggregate result batch, matching `column_exprs`'s slot
+    /// count for that column's `AggKind`.
+    fn read_column_values(b: &RecordBatch, offset: &mut usize, kind: &AggKind) -> ColumnAggValues {
+        match kind {
+            AggKind::Integer | AggKind::Decimal { .. } => {
+                let sum = Self::str_at(b, *offset);
+                let min = Self::str_at(b, *offset + 1);
+                let max = Self::str_at(b, *offset + 2);
+                let non_null_count = Self::i64_at(b, *offset + 3);
+                *offset += 4;
+                ColumnAggValues { sum, min, max, non_null_count }
+            }
+            AggKind::DatetimeSec | AggKind::DateOnly => {
+                let min = Self::str_at(b, *offset);
+                let max = Self::str_at(b, *offset + 1);
+                let non_null_count = Self::i64_at(b, *offset + 2);
+                *offset += 3;
+                ColumnAggValues { sum: None, min, max, non_null_count }
+            }
+            AggKind::TextMass => {
+                let sum = Self::str_at(b, *offset);
+                let non_null_count = Self::i64_at(b, *offset + 1);
+                *offset += 2;
+                ColumnAggValues { sum, min: None, max: None, non_null_count }
+            }
+        }
+    }
+
+    fn parse_aggregate_batch(b: &RecordBatch, columns: &[ColumnAgg]) -> Vec<ColumnAggValues> {
+        let mut offset = 0;
+        columns
+            .iter()
+            .map(|col| Self::read_column_values(b, &mut offset, &col.kind))
+            .collect()
     }
 }
 impl DeltaProbe for DeltaProbeAdapter {
@@ -73,6 +192,9 @@ impl DeltaProbe for DeltaProbeAdapter {
                 name: f.name().clone(),
                 type_str: format!("{:?}", f.data_type()),
                 nullable: f.is_nullable(),
+                // The Delta side has no information_schema — native scale only ever comes
+                // from the source (VA2).
+                numeric_scale: None,
             })
             .collect())
     }
@@ -129,7 +251,7 @@ impl DeltaProbe for DeltaProbeAdapter {
         cursor_col: &str,
     ) -> Result<KeyStats> {
         let t = self.writer.open_table(table).await?;
-        let ctx = SessionContext::new();
+        let ctx = self.bounded_ctx()?;
         ctx.register_table("t", t.table_provider().await?)?;
         let sql = format!(
             "WITH ranked AS (              SELECT cast(`{key_col}` as bigint) AS key_value,                     row_number() OVER (PARTITION BY cast(`{key_col}` as bigint) ORDER BY `{cursor_col}` DESC) AS rn              FROM t              )              SELECT count(*) AS c, count(distinct key_value) AS d,                     min(key_value) AS mn, max(key_value) AS mx,                     bit_xor(key_value) AS x, bit_xor(distinct key_value) AS dx,                     cast(sum(cast(key_value as decimal(38,0))) as varchar) AS sm              FROM ranked WHERE rn = 1"
@@ -272,86 +394,23 @@ impl DeltaProbe for DeltaProbeAdapter {
         Ok(map)
     }
 
-    async fn value_aggregates(&self, table: &str, columns: &[ColumnAgg]) -> Result<Vec<String>> {
+    async fn value_aggregates(&self, table: &str, columns: &[ColumnAgg]) -> Result<Vec<ColumnAggValues>> {
+        if columns.is_empty() {
+            return Ok(vec![]);
+        }
         let t = self.writer.open_table(table).await?;
-        let ctx = SessionContext::new();
+        let ctx = self.bounded_ctx()?;
         ctx.register_table("t", t.table_provider().await?)?;
 
-        let mut fingerprints = Vec::with_capacity(columns.len());
-        for col in columns {
-            let fp = match col.kind {
-                AggKind::Integer => {
-                    let sql = format!(
-                        "SELECT cast(sum(cast(`{col}` as decimal(38,0))) as varchar), cast(min(cast(`{col}` as bigint)) as varchar), cast(max(cast(`{col}` as bigint)) as varchar) FROM t",
-                        col = col.name
-                    );
-                    let batches = ctx.sql(&sql).await?.collect().await?;
-                    let b = batches.first().context("delta value_aggregates Integer: empty result")?;
-                    let sum = Self::str_at(b, 0);
-                    let min = Self::str_at(b, 1);
-                    let max = Self::str_at(b, 2);
-                    super::fp_num(sum.as_deref(), min.as_deref(), max.as_deref())
-                }
-                AggKind::Decimal => {
-                    let sql = format!(
-                        "SELECT cast(sum(cast(`{col}` as decimal(38,10))) as varchar), cast(min(cast(`{col}` as decimal(38,10))) as varchar), cast(max(cast(`{col}` as decimal(38,10))) as varchar) FROM t",
-                        col = col.name
-                    );
-                    let batches = ctx.sql(&sql).await?.collect().await?;
-                    let b = batches.first().context("delta value_aggregates Decimal: empty result")?;
-                    let sum = Self::str_at(b, 0);
-                    let min = Self::str_at(b, 1);
-                    let max = Self::str_at(b, 2);
-                    super::fp_num(sum.as_deref(), min.as_deref(), max.as_deref())
-                }
-                AggKind::DatetimeSec => {
-                    let sql = format!(
-                        "SELECT substr(replace(cast(min(`{col}`) as varchar), 'T', ' '), 1, 19), substr(replace(cast(max(`{col}`) as varchar), 'T', ' '), 1, 19) FROM t",
-                        col = col.name
-                    );
-                    let batches = ctx.sql(&sql).await?.collect().await?;
-                    let b = batches.first().context("delta value_aggregates DatetimeSec: empty result")?;
-                    let min = Self::str_at(b, 0);
-                    let max = Self::str_at(b, 1);
-                    super::fp_minmax(min.as_deref(), max.as_deref())
-                }
-                AggKind::DateOnly => {
-                    let sql = format!(
-                        "SELECT substr(cast(min(`{col}`) as varchar), 1, 10), substr(cast(max(`{col}`) as varchar), 1, 10) FROM t",
-                        col = col.name
-                    );
-                    let batches = ctx.sql(&sql).await?.collect().await?;
-                    let b = batches.first().context("delta value_aggregates DateOnly: empty result")?;
-                    let min = Self::str_at(b, 0);
-                    let max = Self::str_at(b, 1);
-                    super::fp_minmax(min.as_deref(), max.as_deref())
-                }
-                AggKind::TextMass => {
-                    let sql = format!(
-                        "SELECT cast(sum(char_length(`{col}`)) as varchar), count(`{col}`) FROM t",
-                        col = col.name
-                    );
-                    let batches = ctx.sql(&sql).await?.collect().await?;
-                    let b = batches.first().context("delta value_aggregates TextMass: empty result")?;
-                    let len_sum = Self::str_at(b, 0);
-                    let count = b
-                        .column(1)
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .and_then(|a| {
-                            if a.is_empty() || a.is_null(0) {
-                                None
-                            } else {
-                                Some(a.value(0))
-                            }
-                        })
-                        .unwrap_or(0);
-                    super::fp_textmass(len_sum.as_deref(), count)
-                }
-            };
-            fingerprints.push(fp);
-        }
-        Ok(fingerprints)
+        let select_list = columns
+            .iter()
+            .flat_map(Self::column_exprs)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT {select_list} FROM t");
+        let batches = ctx.sql(&sql).await?.collect().await?;
+        let b = batches.first().context("delta value_aggregates: empty result")?;
+        Ok(Self::parse_aggregate_batch(b, columns))
     }
 
     async fn value_aggregates_latest(
@@ -360,56 +419,34 @@ impl DeltaProbe for DeltaProbeAdapter {
         columns: &[ColumnAgg],
         cursor_col: &str,
         scope: &super::SourceScope,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<ColumnAggValues>> {
+        if columns.is_empty() {
+            return Ok(vec![]);
+        }
         let t = self.writer.open_table(table).await?;
-        let ctx = SessionContext::new();
+        let ctx = self.bounded_ctx()?;
         ctx.register_table("t", t.table_provider().await?)?;
         let ua = scope.updated_at.replace('\'', "''");
         let lid = scope.last_id;
-        let mut fingerprints = Vec::with_capacity(columns.len());
-        for col in columns {
-            let c = &col.name;
-            let cte = format!(
-                "WITH ranked AS (SELECT `{c}`, row_number() OVER (PARTITION BY cast(`id` as bigint) ORDER BY `{cursor_col}` DESC) AS rn FROM t WHERE (`{cursor_col}` < '{ua}') OR (`{cursor_col}` = '{ua}' AND cast(`id` as bigint) <= {lid})) "
-            );
-            let fp = match col.kind {
-                AggKind::Integer => {
-                    let sql = format!("{cte}SELECT cast(sum(cast(`{c}` as decimal(38,0))) as varchar), cast(min(cast(`{c}` as bigint)) as varchar), cast(max(cast(`{c}` as bigint)) as varchar) FROM ranked WHERE rn = 1");
-                    let batches = ctx.sql(&sql).await?.collect().await?;
-                    let b = batches.first().context("delta value_aggregates_latest Integer: empty result")?;
-                    super::fp_num(Self::str_at(b, 0).as_deref(), Self::str_at(b, 1).as_deref(), Self::str_at(b, 2).as_deref())
-                }
-                AggKind::Decimal => {
-                    let sql = format!("{cte}SELECT cast(sum(cast(`{c}` as decimal(38,10))) as varchar), cast(min(cast(`{c}` as decimal(38,10))) as varchar), cast(max(cast(`{c}` as decimal(38,10))) as varchar) FROM ranked WHERE rn = 1");
-                    let batches = ctx.sql(&sql).await?.collect().await?;
-                    let b = batches.first().context("delta value_aggregates_latest Decimal: empty result")?;
-                    super::fp_num(Self::str_at(b, 0).as_deref(), Self::str_at(b, 1).as_deref(), Self::str_at(b, 2).as_deref())
-                }
-                AggKind::DatetimeSec => {
-                    let sql = format!("{cte}SELECT substr(replace(cast(min(`{c}`) as varchar), 'T', ' '), 1, 19), substr(replace(cast(max(`{c}`) as varchar), 'T', ' '), 1, 19) FROM ranked WHERE rn = 1");
-                    let batches = ctx.sql(&sql).await?.collect().await?;
-                    let b = batches.first().context("delta value_aggregates_latest DatetimeSec: empty result")?;
-                    super::fp_minmax(Self::str_at(b, 0).as_deref(), Self::str_at(b, 1).as_deref())
-                }
-                AggKind::DateOnly => {
-                    let sql = format!("{cte}SELECT substr(cast(min(`{c}`) as varchar), 1, 10), substr(cast(max(`{c}`) as varchar), 1, 10) FROM ranked WHERE rn = 1");
-                    let batches = ctx.sql(&sql).await?.collect().await?;
-                    let b = batches.first().context("delta value_aggregates_latest DateOnly: empty result")?;
-                    super::fp_minmax(Self::str_at(b, 0).as_deref(), Self::str_at(b, 1).as_deref())
-                }
-                AggKind::TextMass => {
-                    let sql = format!("{cte}SELECT cast(sum(char_length(`{c}`)) as varchar), count(`{c}`) FROM ranked WHERE rn = 1");
-                    let batches = ctx.sql(&sql).await?.collect().await?;
-                    let b = batches.first().context("delta value_aggregates_latest TextMass: empty result")?;
-                    let count = b.column(1).as_any().downcast_ref::<Int64Array>()
-                        .and_then(|a| if a.is_empty() || a.is_null(0) { None } else { Some(a.value(0)) })
-                        .unwrap_or(0);
-                    super::fp_textmass(Self::str_at(b, 0).as_deref(), count)
-                }
-            };
-            fingerprints.push(fp);
-        }
-        Ok(fingerprints)
+        let col_list = columns
+            .iter()
+            .map(|c| format!("`{}`", c.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cte = format!(
+            "WITH ranked AS (SELECT {col_list}, row_number() OVER (PARTITION BY cast(`id` as bigint) ORDER BY `{cursor_col}` DESC) AS rn FROM t WHERE (`{cursor_col}` < '{ua}') OR (`{cursor_col}` = '{ua}' AND cast(`id` as bigint) <= {lid})) "
+        );
+        let select_list = columns
+            .iter()
+            .flat_map(Self::column_exprs)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("{cte}SELECT {select_list} FROM ranked WHERE rn = 1");
+        let batches = ctx.sql(&sql).await?.collect().await?;
+        let b = batches
+            .first()
+            .context("delta value_aggregates_latest: empty result")?;
+        Ok(Self::parse_aggregate_batch(b, columns))
     }
 }
 

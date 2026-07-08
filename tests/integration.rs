@@ -891,14 +891,14 @@ async fn verify_value_aggregates_real_basic_match_across_type_families() {
     let env = TestEnv::new(vec!["audit_values"]).await;
 
     sqlx::query(
-        "CREATE TABLE audit_values (            id BIGINT PRIMARY KEY,             qty INT NOT NULL,             amount DECIMAL(18,2) NOT NULL,             happened_at DATETIME(6) NOT NULL,             due_date DATE,             note VARCHAR(255) CHARACTER SET utf8mb4        )",
+        "CREATE TABLE audit_values (            id BIGINT PRIMARY KEY,             qty INT NOT NULL,             amount DECIMAL(18,2) NOT NULL,             ratio DECIMAL(20,12) NOT NULL,             happened_at DATETIME(6) NOT NULL,             due_date DATE,             note VARCHAR(255) CHARACTER SET utf8mb4        )",
     )
     .execute(&env.pool)
     .await
     .expect("failed to create audit_values table");
 
     sqlx::query(
-        "INSERT INTO audit_values (id, qty, amount, happened_at, due_date, note) VALUES             (1, 10, 12.34, '2026-01-01 10:00:00.123456', '2026-01-05', 'alpha'),             (2, 25, 99.99, '2026-01-02 11:30:15.654321', '2026-01-06', 'bravo'),             (3, 7,  5.50,  '2026-01-03 09:45:59.000001', '2026-01-07', 'charlie'),             (4, 3,  1.00,  '2026-01-04 00:00:00.000000', NULL, NULL),             (5, 42, 8.88,  '2026-01-05 06:06:06.000000', '2026-01-08', 'héllo 世界')",
+        "INSERT INTO audit_values (id, qty, amount, ratio, happened_at, due_date, note) VALUES             (1, 10, 12.34, 0.123456789012, '2026-01-01 10:00:00.123456', '2026-01-05', 'alpha'),             (2, 25, 99.99, 3.000000000005, '2026-01-02 11:30:15.654321', '2026-01-06', 'bravo'),             (3, 7,  5.50,  0.999999999999, '2026-01-03 09:45:59.000001', '2026-01-07', 'charlie'),             (4, 3,  1.00,  0.000000000001, '2026-01-04 00:00:00.000000', NULL, NULL),             (5, 42, 8.88,  1.111111111111, '2026-01-05 06:06:06.000000', '2026-01-08', 'héllo 世界')",
     )
     .execute(&env.pool)
     .await
@@ -935,7 +935,7 @@ async fn verify_value_aggregates_real_basic_match_across_type_families() {
     // T2: corrupt the source directly, without re-running the pipeline, and prove verify
     // detects the drift instead of always reporting Clean.
     sqlx::query(
-        "UPDATE audit_values SET amount = amount + 0.01, note = CONCAT(note, 'x') WHERE id = 2",
+        "UPDATE audit_values SET amount = amount + 0.01, ratio = ratio + 0.000000000001, note = CONCAT(note, 'x') WHERE id = 2",
     )
     .execute(&env.pool)
     .await
