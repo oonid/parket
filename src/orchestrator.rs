@@ -39,7 +39,7 @@ pub trait SchemaInspect: Send + Sync {
 #[cfg_attr(test, mockall::automock)]
 pub trait Extract: Send {
     fn calculate_batch_size(&mut self, avg_row_length: Option<u64>) -> u64;
-    fn extract(&mut self, sql: &str) -> Result<Vec<deltalake::arrow::record_batch::RecordBatch>>;
+    fn extract(&mut self, sql: &str) -> Result<crate::extractor::Extraction>;
     fn batch_size(&self) -> u64;
 }
 
@@ -532,7 +532,7 @@ mod tests {
             .returning(|_| Ok(None));
         extract_mock
             .expect_extract()
-            .returning(|_| Ok(vec![]));
+            .returning(|_| ok_batches(vec![]));
         state_mock
             .expect_update_table()
             .returning(|_, _, _| Ok(()));
@@ -685,9 +685,9 @@ mod tests {
                         ],
                     )
                     .unwrap();
-                    Ok(vec![batch])
+                    ok_batches(vec![batch])
                 } else {
-                    Ok(vec![])
+                    ok_batches(vec![])
                 }
             });
         writer_mock
@@ -801,9 +801,9 @@ mod tests {
                         ],
                     )
                     .unwrap();
-                    Ok(vec![batch])
+                    ok_batches(vec![batch])
                 } else {
-                    Ok(vec![])
+                    ok_batches(vec![])
                 }
             });
 
@@ -981,9 +981,9 @@ mod tests {
                         ],
                     )
                     .unwrap();
-                    Ok(vec![batch])
+                    ok_batches(vec![batch])
                 } else {
-                    Ok(vec![])
+                    ok_batches(vec![])
                 }
             });
 
@@ -1044,7 +1044,7 @@ mod tests {
                     vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![1i64]))],
                 )
                 .unwrap();
-                Ok(vec![batch])
+                ok_batches(vec![batch])
             });
         writer_mock
             .expect_overwrite_table()
@@ -1128,7 +1128,7 @@ mod tests {
             .returning(|_| Ok(None));
         extract_mock
             .expect_extract()
-            .returning(|_| Ok(vec![]));
+            .returning(|_| ok_batches(vec![]));
         state_mock
             .expect_load_or_default()
             .returning(|_| AppState::default());
@@ -1194,7 +1194,7 @@ mod tests {
             // table1's (empty) batch completes, then the signal fires — observed only
             // by process_table's post-processing check.
             let _ = tx_clone.send(true);
-            Ok(vec![])
+            ok_batches(vec![])
         });
 
         state_mock
@@ -1286,9 +1286,9 @@ mod tests {
                         ],
                     )
                     .unwrap();
-                    Ok(vec![batch])
+                    ok_batches(vec![batch])
                 } else {
-                    Ok(vec![])
+                    ok_batches(vec![])
                 }
             });
 
@@ -1489,9 +1489,9 @@ mod tests {
                         ],
                     )
                     .unwrap();
-                    Ok(vec![batch])
+                    ok_batches(vec![batch])
                 } else {
-                    Ok(vec![])
+                    ok_batches(vec![])
                 }
             });
         writer_mock

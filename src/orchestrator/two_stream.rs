@@ -73,7 +73,9 @@ where
             if self.progress { info!(table = table_name, after_id = ?hwm_id, "two-stream insert: fetching chunk"); }
             let t_extract = Instant::now();
             let sql = QueryBuilder::build_insert_stream_query(table_name, columns, insert_col, hwm_id, batch_size);
-            let batches = self.extractor.extract(&sql)?;
+            let extraction = self.extractor.extract(&sql)?;
+            let truncated = extraction.truncated;
+            let batches = extraction.batches;
             let extract_ms = t_extract.elapsed().as_millis();
             if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) { break; }
             let chunk_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
@@ -114,7 +116,10 @@ where
                     "batch extracted"
                 );
             }
-            if chunk_rows < batch_size { break; }
+            // M2: the insert stream is cursor-based (`hwm_id` only ever advances over rows
+            // actually received), so a truncated window is safe to resume from — don't treat
+            // it as end-of-data just because it came back short.
+            if chunk_rows < batch_size && !truncated { break; }
         }
 
         // ---- Stream B: completions by update cursor (merge key = insert_col) ----
@@ -132,7 +137,9 @@ where
                 update_hwm.as_ref().map(|h| h.last_id),
                 batch_size,
             );
-            let batches = self.extractor.extract(&sql)?;
+            let extraction = self.extractor.extract(&sql)?;
+            let truncated = extraction.truncated;
+            let batches = extraction.batches;
             let extract_ms = t_extract.elapsed().as_millis();
             if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) { break; }
             let chunk_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
@@ -189,7 +196,9 @@ where
                     "batch extracted"
                 );
             }
-            if chunk_rows < batch_size { break; }
+            // M2: the update stream is cursor-based (`update_hwm` only advances over rows
+            // actually received), so a truncated window is safe to resume from.
+            if chunk_rows < batch_size && !truncated { break; }
         }
 
         Ok(total_rows)
@@ -276,9 +285,9 @@ mod tests {
                         ],
                     )
                     .unwrap();
-                    Ok(vec![batch])
+                    ok_batches(vec![batch])
                 } else {
-                    Ok(vec![])
+                    ok_batches(vec![])
                 }
             });
 
@@ -361,7 +370,7 @@ mod tests {
                     ],
                 )
                 .unwrap();
-                Ok(vec![batch])
+                ok_batches(vec![batch])
             });
 
         writer_mock
@@ -484,7 +493,7 @@ mod tests {
             .returning(move |_| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {
-                    Ok(vec![])
+                    ok_batches(vec![])
                 } else if count == 1 {
                     let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
                         deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
@@ -504,9 +513,9 @@ mod tests {
                         ],
                     )
                     .unwrap();
-                    Ok(vec![batch])
+                    ok_batches(vec![batch])
                 } else {
-                    Ok(vec![])
+                    ok_batches(vec![])
                 }
             });
 
@@ -598,7 +607,7 @@ mod tests {
             .returning(move |sql| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
                 match count {
-                    0 => Ok(vec![]),
+                    0 => ok_batches(vec![]),
                     1 => {
                         assert!(sql.contains("(`updated_at` = '2026-06-01T00:00:00.000000' AND `order_id` > 49)"));
                         assert!(sql.contains("ORDER BY `updated_at` ASC, `order_id` ASC"));
@@ -616,7 +625,7 @@ mod tests {
                             ],
                         )
                         .unwrap();
-                        Ok(vec![batch])
+                        ok_batches(vec![batch])
                     }
                     2 => {
                         assert!(sql.contains("(`updated_at` = '2026-06-01T00:00:00.000000' AND `order_id` > 50)"));
@@ -635,9 +644,9 @@ mod tests {
                             ],
                         )
                         .unwrap();
-                        Ok(vec![batch])
+                        ok_batches(vec![batch])
                     }
-                    _ => Ok(vec![]),
+                    _ => ok_batches(vec![]),
                 }
             });
 
@@ -731,7 +740,7 @@ mod tests {
             .returning(move |_| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {
-                    Ok(vec![])
+                    ok_batches(vec![])
                 } else if count == 1 {
                     let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
                         deltalake::arrow::datatypes::Field::new("order_id", deltalake::arrow::datatypes::DataType::Int64, false),
@@ -751,9 +760,9 @@ mod tests {
                         ],
                     )
                     .unwrap();
-                    Ok(vec![batch])
+                    ok_batches(vec![batch])
                 } else {
-                    Ok(vec![])
+                    ok_batches(vec![])
                 }
             });
 
@@ -826,12 +835,12 @@ mod tests {
             .returning(move |sql| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {
-                    Ok(vec![])
+                    ok_batches(vec![])
                 } else if count == 1 {
                     assert!(sql.contains("2026-06-01T00:00:00.000000"), "seed should be in update stream SQL");
-                    Ok(vec![])
+                    ok_batches(vec![])
                 } else {
-                    Ok(vec![])
+                    ok_batches(vec![])
                 }
             });
 
@@ -911,12 +920,12 @@ mod tests {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {
                     assert!(sql.contains("> 500"), "insert stream should page from the config-seeded last_id, got: {sql}");
-                    Ok(vec![])
+                    ok_batches(vec![])
                 } else if count == 1 {
                     assert!(sql.contains("2026-05-01T00:00:00.000000"), "update stream should use the config-seeded timestamp, got: {sql}");
-                    Ok(vec![])
+                    ok_batches(vec![])
                 } else {
-                    Ok(vec![])
+                    ok_batches(vec![])
                 }
             });
 
@@ -995,13 +1004,13 @@ mod tests {
                 if count == 0 {
                     assert!(sql.contains("> 100"), "insert stream should page from the stored HWM, not the config seed, got: {sql}");
                     assert!(!sql.contains("> 500"), "config seed must not override a stored HWM, got: {sql}");
-                    Ok(vec![])
+                    ok_batches(vec![])
                 } else if count == 1 {
                     assert!(sql.contains("2026-06-01T00:00:00.000000"), "update stream should use the stored HWM timestamp, got: {sql}");
                     assert!(!sql.contains("2026-05-01T00:00:00.000000"), "config seed must not override the stored HWM timestamp, got: {sql}");
-                    Ok(vec![])
+                    ok_batches(vec![])
                 } else {
-                    Ok(vec![])
+                    ok_batches(vec![])
                 }
             });
 
@@ -1078,7 +1087,7 @@ mod tests {
             .returning(move |_| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {
-                    Ok(vec![])
+                    ok_batches(vec![])
                 } else if count == 1 {
                     let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
                         deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
@@ -1098,9 +1107,9 @@ mod tests {
                         ],
                     )
                     .unwrap();
-                    Ok(vec![batch])
+                    ok_batches(vec![batch])
                 } else {
-                    Ok(vec![])
+                    ok_batches(vec![])
                 }
             });
 

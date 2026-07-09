@@ -1,9 +1,20 @@
 use crate::orchestrator::*;
 use crate::config::Config;
 use crate::discovery::{ColumnInfo, IndexInfo};
+use crate::extractor::Extraction;
+use anyhow::Result;
+use deltalake::arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::sync::watch;
+
+/// M2: `Extract::extract` returns `Result<Extraction>` now (batches + a `truncated` flag for
+/// the mid-stream memory circuit breaker). Most orchestrator/loop tests don't exercise
+/// truncation at all — this helper keeps their mock `.returning(|_| ok_batches(vec![...]))`
+/// bodies as close as possible to the pre-M2 `Ok(vec![...])` shape.
+pub(crate) fn ok_batches(batches: Vec<RecordBatch>) -> Result<Extraction> {
+    Ok(Extraction { batches, truncated: false })
+}
 
 pub(crate) fn make_columns() -> Vec<ColumnInfo> {
     vec![
@@ -101,7 +112,7 @@ pub(crate) fn setup_incremental_mocks(
         .returning(|_| Ok(None));
     extract_mock
         .expect_extract()
-        .returning(|_| Ok(vec![]));
+        .returning(|_| ok_batches(vec![]));
     state_mock
         .expect_load_or_default()
         .returning(|_| crate::state::AppState::default());

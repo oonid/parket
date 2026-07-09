@@ -148,6 +148,16 @@ where
             }
 
             let chunk_start = Instant::now();
+            // M2: `batch_size` above is captured ONCE before this loop (not re-read per
+            // iteration, unlike incremental.rs), so this table's offset arithmetic is a
+            // simple, fixed-stride sequence for its whole run — a mid-table circuit-breaker
+            // halving of `self.extractor`'s internal batch_size (see extract() below) does
+            // NOT retroactively change `batch_size` here, so `chunk_index * batch_size` stays
+            // correct for this table regardless of any truncation. And `calculate_batch_size`
+            // unconditionally recomputes `self.extractor`'s batch_size from scratch (avg row
+            // length or the configured default) at the start of the NEXT table's
+            // process_table call, so a halving from this table's breaker never leaks into
+            // another table's offset math either.
             let offset = chunk_index * batch_size;
             let sql = if let Some(key_col) = key_col.as_deref() {
                 QueryBuilder::build_full_refresh_query_keyset(
@@ -161,10 +171,29 @@ where
                 QueryBuilder::build_full_refresh_query_paged(table_name, columns, batch_size, offset)
             };
 
-            let batches = self.extractor.extract(&sql)?;
+            let extraction = self.extractor.extract(&sql)?;
+            let truncated = extraction.truncated;
+            let batches = extraction.batches;
 
             if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
                 break;
+            }
+
+            // M2: the OFFSET-fallback path (no integer PK for keyset pagination) assumes
+            // each chunk consumes exactly `batch_size` rows to compute the NEXT chunk's
+            // offset (`chunk_index * batch_size` above). A breaker-truncated window returns
+            // fewer rows than requested, which would silently skip or duplicate rows once
+            // pagination continued on that assumption — so bail loudly instead. This runs
+            // before writing the chunk, so an OFFSET-paged table's previous snapshot (or, for
+            // chunk_index > 0, the rows already appended) is left untouched. The keyset path
+            // has no such assumption (`last_key` only ever advances over rows actually
+            // received), so it continues safely below instead of bailing.
+            if truncated && key_col.is_none() {
+                bail!(
+                    "full refresh for table `{table_name}`: window exceeded the memory ceiling \
+                     mid-extraction on an OFFSET-paged table; lower TARGET_MEMORY_MB or add an \
+                     integer PRIMARY key so keyset pagination can resume safely"
+                );
             }
 
             let chunk_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
@@ -208,7 +237,12 @@ where
                 );
             }
 
-            if chunk_rows < batch_size {
+            // M2: a truncated window means more rows remain at this `last_key` position even
+            // though fewer than `batch_size` rows came back this round; only the keyset path
+            // reaches here truncated (the offset path already bailed above), and keyset
+            // pagination resumes safely from a partial window (see the key-advance update
+            // just below, which runs for this iteration too).
+            if chunk_rows < batch_size && !truncated {
                 break;
             }
 
@@ -290,7 +324,7 @@ mod tests {
                     ],
                 )
                 .unwrap();
-                Ok(vec![batch])
+                ok_batches(vec![batch])
             });
         writer_mock
             .expect_overwrite_table()
@@ -340,13 +374,13 @@ mod tests {
                 _ => vec![],
             };
             if rows.is_empty() {
-                return Ok(vec![]);
+                return ok_batches(vec![]);
             }
             let batch = RecordBatch::try_new(
                 schema,
                 vec![Arc::new(deltalake::arrow::array::Int64Array::from(rows))],
             ).unwrap();
-            Ok(vec![batch])
+            ok_batches(vec![batch])
         });
 
         writer_mock.expect_overwrite_table().times(1).returning(|_, _, _| Ok(()));
@@ -392,7 +426,7 @@ mod tests {
                         schema,
                         vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![1, 2]))],
                     ).unwrap();
-                    Ok(vec![batch])
+                    ok_batches(vec![batch])
                 }
                 1 => {
                     assert!(sql.contains("WHERE `id` > 2 ORDER BY `id` ASC LIMIT 2"));
@@ -400,9 +434,9 @@ mod tests {
                         schema,
                         vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![3]))],
                     ).unwrap();
-                    Ok(vec![batch])
+                    ok_batches(vec![batch])
                 }
-                _ => Ok(vec![]),
+                _ => ok_batches(vec![]),
             }
         });
 
@@ -449,7 +483,7 @@ mod tests {
                         schema,
                         vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![1, 2]))],
                     ).unwrap();
-                    Ok(vec![batch])
+                    ok_batches(vec![batch])
                 }
                 1 => {
                     assert!(sql.contains("ORDER BY `id`, `name` LIMIT 2 OFFSET 2"));
@@ -457,9 +491,9 @@ mod tests {
                         schema,
                         vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![3]))],
                     ).unwrap();
-                    Ok(vec![batch])
+                    ok_batches(vec![batch])
                 }
-                _ => Ok(vec![]),
+                _ => ok_batches(vec![]),
             }
         });
 
@@ -505,7 +539,7 @@ mod tests {
                         schema,
                         vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![1, 2]))],
                     ).unwrap();
-                    Ok(vec![batch])
+                    ok_batches(vec![batch])
                 }
                 1 => {
                     assert!(sql.contains("ORDER BY `id`, `name` LIMIT 2 OFFSET 2"));
@@ -513,9 +547,9 @@ mod tests {
                         schema,
                         vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![3]))],
                     ).unwrap();
-                    Ok(vec![batch])
+                    ok_batches(vec![batch])
                 }
-                _ => Ok(vec![]),
+                _ => ok_batches(vec![]),
             }
         });
 
@@ -546,7 +580,7 @@ mod tests {
         extract_mock.expect_batch_size().returning(|| 10000);
         writer_mock.expect_ensure_table().returning(|_, _| Ok(()));
         writer_mock.expect_get_schema().returning(|_| Ok(None));
-        extract_mock.expect_extract().returning(|_| Ok(vec![]));
+        extract_mock.expect_extract().returning(|_| ok_batches(vec![]));
         state_mock.expect_update_table()
             .withf(|_, state, _| {
                 state.last_run_status.as_deref() == Some("success")
@@ -589,9 +623,9 @@ mod tests {
                     schema,
                     vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![count as i64 + 1]))],
                 ).unwrap();
-                Ok(vec![batch])
+                ok_batches(vec![batch])
             } else {
-                Ok(vec![])
+                ok_batches(vec![])
             }
         });
 
@@ -691,9 +725,9 @@ mod tests {
                     schema,
                     vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![1i64, 2i64]))],
                 ).unwrap();
-                Ok(vec![batch])
+                ok_batches(vec![batch])
             } else {
-                Ok(vec![])
+                ok_batches(vec![])
             }
         });
 
@@ -763,5 +797,140 @@ mod tests {
 
         let rows = result.expect("shutdown before any chunk must not bail — nothing was destroyed yet");
         assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn full_refresh_offset_path_truncated_window_bails_with_actionable_message() {
+        // M2: the OFFSET-fallback path (no integer PK) assumes each chunk consumes exactly
+        // `batch_size` rows to compute the next chunk's offset; a breaker-truncated window
+        // breaks that assumption, so it must bail with an actionable message instead of
+        // silently corrupting pagination — and must bail BEFORE writing the truncated chunk
+        // (overwrite_table/append_batch have no expectations registered, so either being
+        // called would panic, proving nothing was written).
+        let dir = TempDir::new().unwrap();
+        let config = make_config_with_full_refresh(vec!["products".to_string()]);
+        let schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let writer_mock = MockDeltaWrite::new();
+        let state_mock = MockStateManage::new();
+        let (_tx, rx) = watch::channel(false);
+
+        extract_mock.expect_batch_size().returning(|| 5);
+        extract_mock.expect_extract().returning(|_| {
+            let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![1i64, 2i64]))],
+            )
+            .unwrap();
+            Ok(crate::extractor::Extraction { batches: vec![batch], truncated: true })
+        });
+
+        let mut orch = Orchestrator::new(
+            config,
+            schema_mock,
+            extract_mock,
+            writer_mock,
+            state_mock,
+            rx,
+            dir.path().to_path_buf(),
+            false,
+        );
+
+        let columns = make_full_refresh_columns();
+        let select_columns: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+        let indexes = make_full_refresh_indexes(); // no PRIMARY key => OFFSET-fallback path
+        let result = orch
+            .process_full_refresh("products", &select_columns, &columns, &indexes)
+            .await;
+
+        let err = result.expect_err("a truncated window on the OFFSET-fallback path must bail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("OFFSET-paged table"),
+            "expected the actionable offset-path message, got: {msg}"
+        );
+        assert!(
+            msg.contains("PRIMARY key"),
+            "expected the actionable offset-path message, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_refresh_keyset_path_truncated_window_continues_pagination() {
+        // M2: keyset pagination is cursor-based (`last_key` only ever advances over rows
+        // actually received), so a truncated window is safe to resume from — the loop must
+        // NOT treat a truncated partial chunk as end-of-data, and must still advance
+        // `last_key` so the following request resumes from the right place.
+        let dir = TempDir::new().unwrap();
+        let config = make_config_with_full_refresh(vec!["products".to_string()]);
+        let schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let state_mock = MockStateManage::new();
+        let (_tx, rx) = watch::channel(false);
+
+        extract_mock.expect_batch_size().returning(|| 5);
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        extract_mock.expect_extract().returning(move |sql| {
+            let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+            let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+            ]));
+            match count {
+                0 => {
+                    assert!(!sql.contains("WHERE"), "first keyset chunk should not filter on id yet, got: {sql}");
+                    // Truncated: only 2 of the requested 5 rows came back.
+                    let batch = RecordBatch::try_new(
+                        schema,
+                        vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![1, 2]))],
+                    )
+                    .unwrap();
+                    Ok(crate::extractor::Extraction { batches: vec![batch], truncated: true })
+                }
+                1 => {
+                    assert!(
+                        sql.contains("WHERE `id` > 2"),
+                        "second chunk must resume from the truncated window's last key, got: {sql}"
+                    );
+                    let batch = RecordBatch::try_new(
+                        schema,
+                        vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![3]))],
+                    )
+                    .unwrap();
+                    Ok(crate::extractor::Extraction { batches: vec![batch], truncated: false })
+                }
+                _ => panic!("should not be called a third time: the second window was final"),
+            }
+        });
+
+        writer_mock.expect_overwrite_table().times(1).returning(|_, _, _| Ok(()));
+        writer_mock.expect_append_batch().times(1).returning(|_, _, _| Ok(()));
+
+        let mut orch = Orchestrator::new(
+            config,
+            schema_mock,
+            extract_mock,
+            writer_mock,
+            state_mock,
+            rx,
+            dir.path().to_path_buf(),
+            false,
+        );
+
+        let columns = make_full_refresh_columns();
+        let select_columns: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+        let indexes = make_full_refresh_primary_key("id");
+        let result = orch
+            .process_full_refresh("products", &select_columns, &columns, &indexes)
+            .await;
+
+        let rows = result.expect("a truncated keyset window must not fail the table");
+        assert_eq!(rows, 3);
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
     }
 }

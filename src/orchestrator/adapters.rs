@@ -92,7 +92,7 @@ impl Extract for ExtractorAdapter {
         self.inner.calculate_batch_size(avg_row_length)
     }
 
-    fn extract(&mut self, sql: &str) -> Result<Vec<deltalake::arrow::record_batch::RecordBatch>> {
+    fn extract(&mut self, sql: &str) -> Result<crate::extractor::Extraction> {
         self.inner.extract(sql)
     }
 

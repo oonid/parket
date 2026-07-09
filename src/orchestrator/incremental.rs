@@ -58,7 +58,9 @@ where
                 batch_size,
             );
 
-            let batches = self.extractor.extract(&sql)?;
+            let extraction = self.extractor.extract(&sql)?;
+            let truncated = extraction.truncated;
+            let batches = extraction.batches;
             if batches.is_empty()
                 || batches.iter().all(|b| b.num_rows() == 0)
             {
@@ -117,7 +119,12 @@ where
                 );
             }
 
-            if batch_rows < batch_size {
+            // M2: a truncated window (the mid-stream memory circuit breaker cut it short)
+            // means more rows remain in MariaDB for this same cursor position even though
+            // fewer than `batch_size` rows came back — cursor-based pagination handles this
+            // safely (the cursor only advanced over rows actually received), so do NOT treat
+            // a truncated partial window as "end of data".
+            if batch_rows < batch_size && !truncated {
                 break;
             }
         }
@@ -195,7 +202,7 @@ mod tests {
                         ],
                     )
                     .unwrap();
-                    Ok(vec![batch])
+                    ok_batches(vec![batch])
                 } else if count == 1 {
                     let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
                         deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
@@ -213,9 +220,9 @@ mod tests {
                         ],
                     )
                     .unwrap();
-                    Ok(vec![batch])
+                    ok_batches(vec![batch])
                 } else {
-                    Ok(vec![])
+                    ok_batches(vec![])
                 }
             });
 
@@ -230,6 +237,118 @@ mod tests {
         let result = orch.run().await;
         assert!(matches!(result, ExitCode::Success));
         assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn incremental_truncated_window_continues_loop_and_advances_hwm() {
+        // M2: a breaker-truncated window (rows < batch_size but truncated=true) is a
+        // cursor-based table's safe-to-resume case, not end-of-data — the loop must keep
+        // going, appending the truncated window's rows and advancing the HWM over them,
+        // then pick up the remainder in the next (smaller) request.
+        let dir = TempDir::new().unwrap();
+        let config = make_config(vec!["orders".to_string()]);
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| crate::state::AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(make_full_refresh_indexes()));
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        writer_mock
+            .expect_ensure_table()
+            .returning(|_, _| Ok(()));
+        writer_mock
+            .expect_get_schema()
+            .returning(|_| Ok(None));
+        writer_mock
+            .expect_read_hwm()
+            .returning(|_| Ok(None));
+        extract_mock
+            .expect_batch_size()
+            .returning(|| 5);
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        extract_mock
+            .expect_extract()
+            .returning(move |_| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                    deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+                    deltalake::arrow::datatypes::Field::new(
+                        "updated_at",
+                        deltalake::arrow::datatypes::DataType::Timestamp(deltalake::arrow::datatypes::TimeUnit::Microsecond, None),
+                        false,
+                    ),
+                ]));
+                if count == 0 {
+                    // Truncated window: the circuit breaker cut it short at 2 of the
+                    // requested 5 rows. Must NOT be treated as end-of-data.
+                    let batch = RecordBatch::try_new(
+                        schema,
+                        vec![
+                            Arc::new(deltalake::arrow::array::Int64Array::from(vec![1i64, 2i64])),
+                            Arc::new(deltalake::arrow::array::TimestampMicrosecondArray::from(vec![
+                                1743158400000000i64,
+                                1743158401000000i64,
+                            ])),
+                        ],
+                    )
+                    .unwrap();
+                    Ok(crate::extractor::Extraction { batches: vec![batch], truncated: true })
+                } else if count == 1 {
+                    // A genuinely final, non-truncated partial window: this really is the
+                    // end of data, and the HWM must reflect both windows by now.
+                    let batch = RecordBatch::try_new(
+                        schema,
+                        vec![
+                            Arc::new(deltalake::arrow::array::Int64Array::from(vec![3i64])),
+                            Arc::new(deltalake::arrow::array::TimestampMicrosecondArray::from(vec![1743158402000000i64])),
+                        ],
+                    )
+                    .unwrap();
+                    Ok(crate::extractor::Extraction { batches: vec![batch], truncated: false })
+                } else {
+                    panic!(
+                        "extract should not be called a third time: the second window was \
+                         not truncated and returned fewer rows than batch_size"
+                    );
+                }
+            });
+
+        writer_mock
+            .expect_append_batch()
+            .withf(|_, batches, _| !batches.is_empty() && !batches.iter().all(|b| b.num_rows() == 0))
+            .times(2)
+            .returning(|_, _, _| Ok(()));
+        state_mock
+            .expect_update_table()
+            .withf(|_, state, _| {
+                state.last_run_status.as_deref() == Some("success") && state.last_run_rows == Some(3)
+            })
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success));
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "loop must continue past the truncated window and stop after the genuinely-final one (both windows written, HWM advanced across both)"
+        );
     }
 
     #[tokio::test]
@@ -288,7 +407,7 @@ mod tests {
                     )],
                 )
                 .unwrap();
-                Ok(vec![batch])
+                ok_batches(vec![batch])
             });
         writer_mock
             .expect_append_batch()
@@ -347,7 +466,7 @@ mod tests {
         extract_mock
             .expect_extract()
             .withf(|sql| sql.contains("2026-05-01T00:00:00.000000") && sql.contains("999"))
-            .returning(|_| Ok(vec![]));
+            .returning(|_| ok_batches(vec![]));
         writer_mock
             .expect_append_batch()
             .returning(|_, _, _| Ok(()));
@@ -408,7 +527,7 @@ mod tests {
         extract_mock
             .expect_extract()
             .withf(|sql| sql.contains("2026-09-09T00:00:00.000000") && !sql.contains("2026-05-01"))
-            .returning(|_| Ok(vec![]));
+            .returning(|_| ok_batches(vec![]));
         writer_mock
             .expect_append_batch()
             .returning(|_, _, _| Ok(()));
@@ -479,7 +598,7 @@ mod tests {
         extract_mock
             .expect_extract()
             .withf(|sql| sql.contains("completed_at"))
-            .returning(|_| Ok(vec![]));
+            .returning(|_| ok_batches(vec![]));
         state_mock
             .expect_update_table()
             .returning(|_, _, _| Ok(()));
@@ -557,7 +676,7 @@ mod tests {
                     && sql.contains("ORDER BY `updated_at` ASC, `order_id` ASC")
                     && !sql.contains("`id`")
             })
-            .returning(|_| Ok(vec![]));
+            .returning(|_| ok_batches(vec![]));
         state_mock
             .expect_update_table()
             .returning(|_, _, _| Ok(()));
@@ -597,7 +716,7 @@ mod tests {
         extract_mock
             .expect_extract()
             .times(0)
-            .returning(|_| Ok(vec![]));
+            .returning(|_| ok_batches(vec![]));
         writer_mock
             .expect_ensure_table()
             .returning(|_, _| Ok(()));
