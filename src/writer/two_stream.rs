@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use deltalake::arrow::array::{Array, Int32Array, Int64Array, UInt32Array, UInt64Array};
 use deltalake::arrow::datatypes::DataType;
 use deltalake::arrow::record_batch::RecordBatch;
+use deltalake::datafusion::datasource::MemTable;
 use deltalake::datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use deltalake::datafusion::execution::memory_pool::FairSpillPool;
 use deltalake::datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -36,8 +37,7 @@ impl DeltaWriter {
         table.load().await?;
 
         let schema = batches[0].schema();
-        let merged = deltalake::arrow::compute::concat_batches(&schema, &batches)?;
-        let total_rows = merged.num_rows();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
         let pool_bytes = (self.merge_memory_mb as usize) * 1024 * 1024;
         // Route the external sort's spill to the configured dir (MERGE_SPILL_DIR); else system temp.
@@ -89,7 +89,11 @@ impl DeltaWriter {
             "merge: bounded datafusion session (spills to disk)"
         );
 
-        ctx.register_batch("merge_source_raw", merged)?;
+        // Zero-copy registration: MemTable takes ownership of `batches` directly (a Vec of
+        // partitions, one Vec<RecordBatch> per partition) instead of concat_batches'ing them
+        // into a single contiguous copy first (M3 — halves peak memory for the update window).
+        let provider = MemTable::try_new(schema.clone(), vec![batches])?;
+        ctx.register_table("merge_source_raw", std::sync::Arc::new(provider))?;
 
         let col_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
         let col_list = col_names.join(", ");
@@ -212,12 +216,11 @@ impl DeltaWriter {
 
         // Dedup the incoming batches by key_col (same pattern as merge_batch).
         let schema = batches[0].schema();
-        let merged = deltalake::arrow::compute::concat_batches(&schema, &batches)?;
-        // `merged` now owns the data; free the source Vec so we don't hold it alongside
-        // the concatenated copy and the collected dedup output (peak-memory reduction).
-        drop(batches);
         let ctx = SessionContext::new();
-        ctx.register_batch("delete_source_raw", merged)?;
+        // Zero-copy registration: MemTable moves `batches` in directly instead of
+        // concat_batches'ing them into a separate contiguous copy first (M3).
+        let provider = MemTable::try_new(schema.clone(), vec![batches])?;
+        ctx.register_table("delete_source_raw", std::sync::Arc::new(provider))?;
 
         let col_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
         let col_list = col_names.join(", ");
