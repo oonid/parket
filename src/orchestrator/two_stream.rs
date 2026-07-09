@@ -1,12 +1,14 @@
 use std::time::Instant;
 
 use anyhow::{Result, bail};
+use deltalake::arrow::datatypes::SchemaRef;
 use tracing::info;
 
 use crate::query::QueryBuilder;
 use crate::writer::{extract_hwm_from_batch, extract_max_id, hwm_has_advanced, Hwm};
 
 use super::Orchestrator;
+use super::schema::align_batches_to_schema;
 use super::{DeltaWrite, Extract, SchemaInspect, StateManage};
 
 impl<S, E, W, M> Orchestrator<S, E, W, M>
@@ -22,6 +24,7 @@ where
         columns: &[String],
         insert_col: &str,
         update_col: &str,
+        schema: &SchemaRef,
     ) -> Result<u64> {
         let mut hwm_id = self.writer.read_insert_hwm(table_name).await?;
         let mut update_hwm = self.writer.read_hwm(table_name).await?;
@@ -78,6 +81,9 @@ where
             let batches = extraction.batches;
             let extract_ms = t_extract.elapsed().as_millis();
             if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) { break; }
+            // N5: widen any UInt8/16/32/64 columns (unsigned MariaDB types) to match the
+            // signed Delta schema before cursor extraction and the write below.
+            let batches = align_batches_to_schema(batches, schema, table_name)?;
             let chunk_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
             let arrow_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
             let new_max = batches.iter().filter_map(|b| extract_max_id(b, insert_col)).max();
@@ -142,6 +148,9 @@ where
             let batches = extraction.batches;
             let extract_ms = t_extract.elapsed().as_millis();
             if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) { break; }
+            // N5: widen any UInt8/16/32/64 columns (unsigned MariaDB types) to match the
+            // signed Delta schema before cursor extraction and the write below.
+            let batches = align_batches_to_schema(batches, schema, table_name)?;
             let chunk_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
             let arrow_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
             let new_hwm = batches

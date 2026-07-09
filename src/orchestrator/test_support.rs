@@ -141,6 +141,22 @@ pub(crate) fn make_full_refresh_unique_key(key_col: &str) -> Vec<IndexInfo> {
     }]
 }
 
+/// N5: builds the Delta-schema `SchemaRef` a set of `ColumnInfo` would produce, for tests
+/// that call `process_full_refresh`/`process_incremental`/`process_two_stream` directly
+/// (bypassing `process_table`, which normally computes this and threads it through).
+pub(crate) fn schema_from_columns(columns: &[ColumnInfo]) -> deltalake::arrow::datatypes::SchemaRef {
+    use deltalake::arrow::datatypes::{Field, Schema};
+    let fields: Vec<Field> = columns
+        .iter()
+        .map(|c| {
+            let dt = super::schema::mariadb_type_to_arrow(&c.data_type, &c.column_type)
+                .expect("test column type must be supported by mariadb_type_to_arrow");
+            Field::new(&c.name, dt, true)
+        })
+        .collect();
+    std::sync::Arc::new(Schema::new(fields))
+}
+
 pub(crate) fn make_full_refresh_columns() -> Vec<ColumnInfo> {
     vec![
         ColumnInfo {

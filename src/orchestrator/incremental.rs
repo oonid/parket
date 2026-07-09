@@ -1,12 +1,14 @@
 use std::time::Instant;
 
 use anyhow::{Result, bail};
+use deltalake::arrow::datatypes::SchemaRef;
 use tracing::info;
 
 use crate::query::QueryBuilder;
 use crate::writer::{extract_hwm_from_batch, hwm_has_advanced};
 
 use super::Orchestrator;
+use super::schema::align_batches_to_schema;
 use super::{DeltaWrite, Extract, SchemaInspect, StateManage};
 
 impl<S, E, W, M> Orchestrator<S, E, W, M>
@@ -22,6 +24,7 @@ where
         columns: &[String],
         ts_col: &str,
         key_col: &str,
+        schema: &SchemaRef,
     ) -> Result<u64> {
         let mut current_hwm = match self.writer.read_hwm(table_name).await? {
             Some(h) => Some(h),
@@ -66,6 +69,10 @@ where
             {
                 break;
             }
+
+            // N5: widen any UInt8/16/32/64 columns (unsigned MariaDB types) to match the
+            // signed Delta schema before HWM extraction and the write below.
+            let batches = align_batches_to_schema(batches, schema, table_name)?;
 
             let batch_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
             let arrow_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();

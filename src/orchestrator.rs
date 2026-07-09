@@ -306,11 +306,11 @@ where
                         "incremental table '{table_name}' key column `{key_col}` is missing from the Delta table schema (the schema-evolution filter dropped it because the Delta schema lacks it); evolve the Delta schema to add `{key_col}` or run a full refresh for this table"
                     );
                 }
-                self.process_incremental(table_name, &select_columns, &ts_col, &key_col).await?
+                self.process_incremental(table_name, &select_columns, &ts_col, &key_col, &schema).await?
             }
             ExtractionMode::FullRefresh => {
                 let indexes = self.schema_inspect.discover_indexes(table_name).await?;
-                self.process_full_refresh(table_name, &select_columns, &columns, &indexes)
+                self.process_full_refresh(table_name, &select_columns, &columns, &indexes, &schema)
                     .await?
             }
             ExtractionMode::TwoStream => {
@@ -326,7 +326,7 @@ where
                         "two-stream table '{table_name}' update cursor column `{update_col}` is missing from the Delta table schema (the schema-evolution filter dropped it because the Delta schema lacks it); evolve the Delta schema to add `{update_col}` or run a full refresh for this table"
                     );
                 }
-                self.process_two_stream(table_name, &select_columns, &insert_col, &update_col).await?
+                self.process_two_stream(table_name, &select_columns, &insert_col, &update_col, &schema).await?
             }
             ExtractionMode::Auto => unreachable!(),
         };

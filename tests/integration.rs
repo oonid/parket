@@ -1125,3 +1125,191 @@ async fn verify_value_aggregates_real_incremental_hwm_scope_matches_latest_rows(
 
     assert_eq!(verdict_after_corruption, VerifyVerdict::Discrepancy);
 }
+
+// N5: unsigned MariaDB integer columns. `mariadb_type_to_arrow` widens each unsigned
+// width to the narrowest SIGNED Arrow/Delta type that holds its full range (Delta has no
+// unsigned type), and `align_batch_to_schema` casts the UInt* batches connector_arrow
+// emits to match, erroring (not corrupting) on any value that doesn't fit. These two
+// Docker tests lock that in against real MariaDB + MinIO + delta-rs 0.32. No `updated_at`
+// column → auto FullRefresh; `id BIGINT PRIMARY KEY` gives the keyset path a PK to page on.
+//
+// PROBE OBSERVATION (pre-fix, recorded for the record): writing the UInt* batches against
+// the old SIGNED-narrower Delta schema, delta-rs 0.32 errored at write time; with the fix,
+// in-range unsigned values round-trip exactly and a BIGINT UNSIGNED value > i64::MAX fails
+// the table by name (see the two tests below).
+#[tokio::test]
+#[serial_test::serial]
+async fn unsigned_columns_round_trip() {
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let env = TestEnv::new(vec!["unsigned_probe"]).await;
+
+    sqlx::query(
+        "CREATE TABLE unsigned_probe (\
+            id BIGINT PRIMARY KEY, \
+            a TINYINT UNSIGNED NOT NULL, \
+            b SMALLINT UNSIGNED NOT NULL, \
+            c INT UNSIGNED NOT NULL, \
+            d BIGINT UNSIGNED NOT NULL, \
+            e MEDIUMINT UNSIGNED NOT NULL\
+        )",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create unsigned_probe table");
+
+    // Row 1 small; row 2 pushes every column past its SIGNED counterpart's max
+    // (a>i8::MAX 127, b>i16::MAX 32767, c>i32::MAX, e>mediumint-signed 8388607) — and d
+    // large but still <= i64::MAX so BIGINT UNSIGNED round-trips within its supported range.
+    sqlx::query(
+        "INSERT INTO unsigned_probe (id, a, b, c, d, e) VALUES \
+            (1, 1, 2, 3, 12345, 4), \
+            (2, 200, 40000, 3000000000, 9000000000000000000, 10000000)",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert unsigned_probe rows");
+
+    let mut orchestrator = env.make_orchestrator();
+    let exit_code = orchestrator.run().await;
+    assert!(
+        matches!(exit_code, ExitCode::Success),
+        "in-range unsigned columns must sync cleanly, got {exit_code:?}"
+    );
+
+    let mut table = env.open_delta_table("unsigned_probe").await;
+    table.load().await.expect("failed to load delta table");
+
+    // Delta stores Int8/16/32 (and their unsigned sources) all as INTEGER→Int32, and
+    // Int64/UInt64 as LONG→Int64 (see writer::schema::arrow_type_to_delta). So the widened
+    // columns read back as Int32/Int64 — the point is that no value was truncated to a type
+    // too narrow to hold it (i8/i16/i32 for the above-max values), which the value checks below
+    // confirm. `types_equivalent` (orchestrator::schema) treats these as matching the expected
+    // signed types so a second run's schema-evolution check does NOT false-flag (asserted below).
+    let kernel_schema = table.snapshot().unwrap().schema();
+    let arrow_schema: deltalake::arrow::datatypes::Schema =
+        deltalake::kernel::engine::arrow_conversion::TryIntoArrow::try_into_arrow(
+            kernel_schema.as_ref(),
+        )
+        .expect("failed to convert schema");
+    use deltalake::arrow::datatypes::DataType;
+    let dt = |n: &str| arrow_schema.field_with_name(n).unwrap().data_type().clone();
+    assert_eq!(dt("a"), DataType::Int32, "tinyint unsigned widened to Delta INTEGER");
+    assert_eq!(dt("b"), DataType::Int32, "smallint unsigned widened to Delta INTEGER");
+    assert_eq!(dt("c"), DataType::Int64, "int unsigned needs 64 bits (> i32::MAX)");
+    assert_eq!(dt("d"), DataType::Int64, "bigint unsigned -> Delta LONG");
+    assert_eq!(dt("e"), DataType::Int32, "mediumint unsigned -> Delta INTEGER");
+
+    // Every above-signed-max value must survive exactly (read back as bigint via datafusion).
+    let expected = vec![2i64, 200, 40000, 3_000_000_000, 9_000_000_000_000_000_000, 10_000_000];
+    assert_eq!(
+        read_unsigned_probe_maxima(&env).await,
+        expected,
+        "count + per-column maxima (a,b,c,d,e) must round-trip exactly"
+    );
+
+    // Second run: proves the widened Delta types don't trip the schema-evolution check
+    // (types_equivalent accepts Int32/Int64 for the expected signed widths) and that a
+    // full-refresh overwrite of the same unsigned data stays clean and identical.
+    let mut orchestrator2 = env.make_orchestrator();
+    let exit_code2 = orchestrator2.run().await;
+    assert!(
+        matches!(exit_code2, ExitCode::Success),
+        "second run over unsigned columns must stay clean (no schema-evolution false flag), got {exit_code2:?}"
+    );
+    assert_eq!(
+        read_unsigned_probe_maxima(&env).await,
+        expected,
+        "values must be identical after the second full-refresh run"
+    );
+}
+
+// count(*) + per-column max(cast(col as bigint)) over the unsigned_probe Delta table, in
+// column order (count, a, b, c, d, e). Factored out so both runs assert the same values.
+async fn read_unsigned_probe_maxima(env: &TestEnv) -> Vec<i64> {
+    let mut t = env.open_delta_table("unsigned_probe").await;
+    t.load().await.unwrap();
+    let ctx = deltalake::datafusion::prelude::SessionContext::new();
+    ctx.register_table("up", t.table_provider().await.unwrap())
+        .unwrap();
+    let b = ctx
+        .sql(
+            "SELECT count(*), max(cast(a as bigint)), max(cast(b as bigint)), \
+             max(cast(c as bigint)), max(cast(d as bigint)), max(cast(e as bigint)) FROM up",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let r = &b[0];
+    (0..6)
+        .map(|i| {
+            r.column(i)
+                .as_any()
+                .downcast_ref::<deltalake::arrow::array::Int64Array>()
+                .unwrap()
+                .value(0)
+        })
+        .collect()
+}
+
+// A BIGINT UNSIGNED value above i64::MAX has no signed 64-bit representation; the cast must
+// fail the table loudly (by column name) rather than wrap negative or corrupt the write.
+#[tokio::test]
+#[serial_test::serial]
+async fn bigint_unsigned_beyond_i64_fails_actionably() {
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let env = TestEnv::new(vec!["unsigned_overflow"]).await;
+
+    sqlx::query("CREATE TABLE unsigned_overflow (id BIGINT PRIMARY KEY, d BIGINT UNSIGNED NOT NULL)")
+        .execute(&env.pool)
+        .await
+        .expect("failed to create unsigned_overflow table");
+
+    // 9300000000000000000 > i64::MAX (9223372036854775807).
+    sqlx::query("INSERT INTO unsigned_overflow (id, d) VALUES (1, 9300000000000000000)")
+        .execute(&env.pool)
+        .await
+        .expect("failed to insert overflow row");
+
+    let mut orchestrator = env.make_orchestrator();
+    let exit_code = orchestrator.run().await;
+
+    // Sole table, extraction/cast fails before any write → all-failed → Fatal. The
+    // per-table error (logged above at ERROR) names column `d` and the i64::MAX ceiling.
+    assert!(
+        matches!(exit_code, ExitCode::Fatal),
+        "a BIGINT UNSIGNED value above i64::MAX must fail the table (Fatal), got {exit_code:?}"
+    );
+
+    // ensure_table creates the (empty) Delta table before extraction, but the cast fails
+    // before any batch is written — so the table exists yet holds ZERO rows: no negative-
+    // wrapped / corrupt data ever lands.
+    let mut table = env.open_delta_table("unsigned_overflow").await;
+    table.load().await.expect("failed to load delta table");
+    let ctx = deltalake::datafusion::prelude::SessionContext::new();
+    ctx.register_table("t", table.table_provider().await.unwrap())
+        .unwrap();
+    let b = ctx
+        .sql("SELECT count(*) FROM t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let n = b[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<deltalake::arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(n, 0, "the failed table must contain no partial/corrupt rows");
+}

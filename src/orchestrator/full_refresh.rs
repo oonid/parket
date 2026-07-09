@@ -2,6 +2,7 @@ use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
 use deltalake::arrow::array::{Array, Int16Array, Int32Array, Int64Array, Int8Array, UInt16Array, UInt32Array, UInt64Array, UInt8Array};
+use deltalake::arrow::datatypes::SchemaRef;
 use deltalake::arrow::record_batch::RecordBatch;
 use tracing::info;
 
@@ -9,6 +10,7 @@ use crate::discovery::{ColumnInfo, IndexInfo};
 use crate::query::QueryBuilder;
 
 use super::Orchestrator;
+use super::schema::align_batches_to_schema;
 use super::{DeltaWrite, Extract, SchemaInspect, StateManage};
 
 fn is_integer_key_column(columns: &[ColumnInfo], key_col: &str) -> bool {
@@ -108,6 +110,7 @@ where
         columns: &[String],
         source_columns: &[ColumnInfo],
         indexes: &[IndexInfo],
+        schema: &SchemaRef,
     ) -> Result<u64> {
         let batch_size = self.extractor.batch_size();
         let mut total_rows = 0u64;
@@ -178,6 +181,12 @@ where
             if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
                 break;
             }
+
+            // N5: connector_arrow emits UInt8/16/32/64 for unsigned MariaDB columns; widen
+            // those columns to match the (possibly-widened) signed Delta schema before any
+            // further processing touches them (keyset max-key extraction, then the write
+            // itself). All-signed batches pass through unchanged.
+            let batches = align_batches_to_schema(batches, schema, table_name)?;
 
             // M2: the OFFSET-fallback path (no integer PK for keyset pagination) assumes
             // each chunk consumes exactly `batch_size` rows to compute the NEXT chunk's
@@ -749,7 +758,7 @@ mod tests {
         let select_columns: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
         let indexes = make_full_refresh_indexes();
         let result = orch
-            .process_full_refresh("products", &select_columns, &columns, &indexes)
+            .process_full_refresh("products", &select_columns, &columns, &indexes, &schema_from_columns(&columns))
             .await;
 
         let err = result.expect_err("shutdown after a chunk was already committed must bail");
@@ -792,7 +801,7 @@ mod tests {
         let select_columns: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
         let indexes = make_full_refresh_indexes();
         let result = orch
-            .process_full_refresh("products", &select_columns, &columns, &indexes)
+            .process_full_refresh("products", &select_columns, &columns, &indexes, &schema_from_columns(&columns))
             .await;
 
         let rows = result.expect("shutdown before any chunk must not bail — nothing was destroyed yet");
@@ -843,7 +852,7 @@ mod tests {
         let select_columns: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
         let indexes = make_full_refresh_indexes(); // no PRIMARY key => OFFSET-fallback path
         let result = orch
-            .process_full_refresh("products", &select_columns, &columns, &indexes)
+            .process_full_refresh("products", &select_columns, &columns, &indexes, &schema_from_columns(&columns))
             .await;
 
         let err = result.expect_err("a truncated window on the OFFSET-fallback path must bail");
@@ -926,7 +935,7 @@ mod tests {
         let select_columns: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
         let indexes = make_full_refresh_primary_key("id");
         let result = orch
-            .process_full_refresh("products", &select_columns, &columns, &indexes)
+            .process_full_refresh("products", &select_columns, &columns, &indexes, &schema_from_columns(&columns))
             .await;
 
         let rows = result.expect("a truncated keyset window must not fail the table");
