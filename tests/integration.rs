@@ -1211,9 +1211,12 @@ async fn unsigned_columns_round_trip() {
         "count + per-column maxima (a,b,c,d,e) must round-trip exactly"
     );
 
-    // Second run: proves the widened Delta types don't trip the schema-evolution check
-    // (types_equivalent accepts Int32/Int64 for the expected signed widths) and that a
-    // full-refresh overwrite of the same unsigned data stays clean and identical.
+    // Second run: proves a full-refresh overwrite of the existing (already-widened,
+    // INTEGER/LONG-typed) Delta table with freshly-extracted UInt* batches stays clean and
+    // identical — i.e. align + overwrite are idempotent across runs. (FullRefresh mode does
+    // not invoke schema_evolution_check; types_equivalent's Int32/Int64 acceptance for the
+    // expected signed widths, which matters for the incremental/two-stream paths, is covered
+    // by the orchestrator::schema lib unit tests.)
     let mut orchestrator2 = env.make_orchestrator();
     let exit_code2 = orchestrator2.run().await;
     assert!(
