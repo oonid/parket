@@ -509,9 +509,13 @@ mod tests {
 
     #[tokio::test]
     async fn nullable_cursor_auto_resolves_to_full_refresh_in_preflight() {
-        // O3 parity: --check uses the same detect_mode as the run, so a table whose
-        // `updated_at` is nullable must resolve to FullRefresh under auto (never a
-        // green incremental pass over a cursor that would silently skip NULL rows).
+        // O3/pf1 smoke: drives preflight's check_table through the FullRefresh
+        // KEY-reason match with a nullable `updated_at` + `id` — the arm that was
+        // `unreachable!()` before O3 made this combination reachable (pf1). The mode
+        // demotion itself is asserted directly by the discovery::detect_mode unit
+        // tests; preflight shares that resolver, so this test's value is executing
+        // the new reason arm without panicking (KEY string is printed, not returned,
+        // so it can't be asserted here without capturing stdout).
         let config = make_config(vec!["orders".to_string()]);
         let mut inspect = MockPreflightInspect::new();
         let mut storage = MockPreflightStorage::new();

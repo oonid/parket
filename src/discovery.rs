@@ -276,7 +276,10 @@ pub fn detect_mode(
     let has_id = columns.iter().any(|c| c.name == "id");
 
     match ts_col {
-        Some(c) if c.nullable => {
+        // Warn only when nullability is the DECIDING factor (id present, so the table
+        // would otherwise have qualified for incremental). A table without `id` is
+        // full_refresh regardless — attributing that to the cursor would mislead.
+        Some(c) if has_id && c.nullable => {
             warn!(
                 "auto-detection found timestamp cursor candidate '{timestamp_col}' but it is \
                  nullable — a nullable cursor is unsafe for incremental extraction (NULL-cursor \
