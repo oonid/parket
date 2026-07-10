@@ -23,13 +23,17 @@ a plan → confirm → implement+test → review → commit loop, stopping for c
 snapshot branch (`snapshot/pre-<step>-<date>`) before starting each fix; small reviewable diffs; never
 weaken an existing test assertion to make it pass.
 
-**Branch state (2026-07-08; history REWRITTEN — all pre-rewrite hashes remapped in this doc):** active work on `test/verify-docker-integration` (C1 `2b8c3f9`,
-R2 `313ba2b`, docs, Docker verify tests `108d9e3`, N2/N3/N6 `2399b50`+`54bbf45`, VA batch
-`a9bf774`). `vendor/connector_arrow`: upstream PR #79 **merged** and released as v0.12.1 —
-submodule back on aljazerzen upstream at `3e98df6` (`3a3059d`); the temporary fork pin is retired. `audit/critical-fixes` is
-parked at R1 (`1ff706f`); fast-forward it and prune the redundant `snapshot/*` /
-`fix/r2-hwm-progress` branches once the Docker tests land. parket itself is not pushed to a
-remote; base `b59fd47` (= origin/master).
+**Branch state (2026-07-10; history REWRITTEN — all pre-rewrite hashes remapped in this doc):**
+`master` fast-forwarded to the audit head `c7a9f8e` (from `b59fd47` = origin/master); active work
+continues on `test/verify-docker-integration` (same head). The 20 stale branches — 18 `snapshot/*`,
+`fix/r2-hwm-progress`, `audit/critical-fixes` — are **pruned** after verification: every commit
+subject on the old pre-rewrite chains is present in the new chain (zero information loss; hashes
+recoverable via reflog within the gc window). `vendor/connector_arrow`: upstream PR #79 **merged**
+and released as v0.12.1 — submodule back on aljazerzen upstream at `3e98df6` (`3a3059d`); the
+temporary fork pin is retired. Coverage gate at housekeeping time: `cargo llvm-cov --lib
+--fail-under-lines 90` reports **89.67% lines** (regions 89.03%, functions 86.02%) — below the 90%
+floor, so the gate currently **fails**; closing the ~0.33-point gap is open work. parket itself is
+still not pushed to a remote.
 
 **Cross-engine status (updated after `108d9e3`):** the verify value-aggregate SQL is now
 **execution-proven** against real MariaDB + MinIO for: full-refresh/basic deep verify across
