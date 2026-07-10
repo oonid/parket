@@ -568,16 +568,19 @@ mod tests {
                         name: "order_id".to_string(),
                         data_type: "bigint".to_string(),
                         column_type: "bigint(20)".to_string(),
+                        nullable: false,
                     },
                     crate::discovery::ColumnInfo {
                         name: "name".to_string(),
                         data_type: "varchar".to_string(),
                         column_type: "varchar(255)".to_string(),
+                        nullable: false,
                     },
                     crate::discovery::ColumnInfo {
                         name: "updated_at".to_string(),
                         data_type: "timestamp".to_string(),
                         column_type: "timestamp".to_string(),
+                        nullable: false,
                     },
                 ])
             });
@@ -701,16 +704,19 @@ mod tests {
                         name: "order_id".to_string(),
                         data_type: "bigint".to_string(),
                         column_type: "bigint(20)".to_string(),
+                        nullable: false,
                     },
                     crate::discovery::ColumnInfo {
                         name: "name".to_string(),
                         data_type: "varchar".to_string(),
                         column_type: "varchar(255)".to_string(),
+                        nullable: false,
                     },
                     crate::discovery::ColumnInfo {
                         name: "updated_at".to_string(),
                         data_type: "timestamp".to_string(),
                         column_type: "timestamp".to_string(),
+                        nullable: false,
                     },
                 ])
             });

@@ -242,9 +242,9 @@ mod tests {
     #[test]
     fn schema_evolution_column_addition_warns_and_excludes() {
         let mariadb_cols = vec![
-            ColumnInfo { name: "id".into(), data_type: "bigint".into(), column_type: "bigint(20)".into() },
-            ColumnInfo { name: "name".into(), data_type: "varchar".into(), column_type: "varchar(255)".into() },
-            ColumnInfo { name: "email".into(), data_type: "varchar".into(), column_type: "varchar(255)".into() },
+            ColumnInfo { name: "id".into(), data_type: "bigint".into(), column_type: "bigint(20)".into(), nullable: false },
+            ColumnInfo { name: "name".into(), data_type: "varchar".into(), column_type: "varchar(255)".into(), nullable: false },
+            ColumnInfo { name: "email".into(), data_type: "varchar".into(), column_type: "varchar(255)".into(), nullable: false },
         ];
         let delta_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn schema_evolution_column_drop_errors() {
         let mariadb_cols = vec![
-            ColumnInfo { name: "id".into(), data_type: "bigint".into(), column_type: "bigint(20)".into() },
+            ColumnInfo { name: "id".into(), data_type: "bigint".into(), column_type: "bigint(20)".into(), nullable: false },
         ];
         let delta_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -272,8 +272,8 @@ mod tests {
     #[test]
     fn schema_evolution_no_changes() {
         let mariadb_cols = vec![
-            ColumnInfo { name: "id".into(), data_type: "bigint".into(), column_type: "bigint(20)".into() },
-            ColumnInfo { name: "name".into(), data_type: "varchar".into(), column_type: "varchar(255)".into() },
+            ColumnInfo { name: "id".into(), data_type: "bigint".into(), column_type: "bigint(20)".into(), nullable: false },
+            ColumnInfo { name: "name".into(), data_type: "varchar".into(), column_type: "varchar(255)".into(), nullable: false },
         ];
         let delta_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -530,8 +530,8 @@ mod tests {
     #[test]
     fn schema_evolution_type_change_errors() {
         let mariadb_cols = vec![
-            ColumnInfo { name: "id".into(), data_type: "bigint".into(), column_type: "bigint(20)".into() },
-            ColumnInfo { name: "age".into(), data_type: "bigint".into(), column_type: "bigint(20)".into() },
+            ColumnInfo { name: "id".into(), data_type: "bigint".into(), column_type: "bigint(20)".into(), nullable: false },
+            ColumnInfo { name: "age".into(), data_type: "bigint".into(), column_type: "bigint(20)".into(), nullable: false },
         ];
         let delta_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -549,8 +549,8 @@ mod tests {
     #[test]
     fn schema_evolution_unsupported_type_in_existing_column() {
         let mariadb_cols = vec![
-            ColumnInfo { name: "id".into(), data_type: "bigint".into(), column_type: "bigint(20)".into() },
-            ColumnInfo { name: "location".into(), data_type: "geometry".into(), column_type: "geometry".into() },
+            ColumnInfo { name: "id".into(), data_type: "bigint".into(), column_type: "bigint(20)".into(), nullable: false },
+            ColumnInfo { name: "location".into(), data_type: "geometry".into(), column_type: "geometry".into(), nullable: false },
         ];
         let delta_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),

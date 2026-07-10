@@ -133,15 +133,20 @@ where
                 crate::config::ExtractionMode::FullRefresh => {
                     // Determine why it's FullRefresh
                     let has_id = columns.iter().any(|c| c.name == "id");
-                    let has_ts = columns.iter().any(|c| {
+                    let ts_candidate = columns.iter().find(|c| {
                         c.name == ts_col
                             && (c.data_type == "timestamp" || c.data_type == "datetime")
                     });
-                    match (has_id, has_ts) {
-                        (false, false) => format!("no id/{ts_col}"),
-                        (false, true) => "no id".to_string(),
-                        (true, false) => format!("no {ts_col}"),
-                        (true, true) => unreachable!(), // Would be Incremental
+                    match (has_id, ts_candidate) {
+                        (false, None) => format!("no id/{ts_col}"),
+                        (false, Some(_)) => "no id".to_string(),
+                        (true, None) => format!("no {ts_col}"),
+                        // O3: id + a right-typed but nullable cursor is demoted to
+                        // FullRefresh by detect_mode — this is now reachable, not a bug.
+                        (true, Some(c)) if c.nullable => {
+                            format!("nullable {ts_col} (unsafe cursor)")
+                        }
+                        (true, Some(_)) => unreachable!(), // Would be Incremental
                     }
                 }
                 crate::config::ExtractionMode::TwoStream => unreachable!(), // Already handled above
@@ -313,6 +318,17 @@ mod tests {
             name: name.to_string(),
             data_type: data_type.to_string(),
             column_type: column_type.to_string(),
+            nullable: false,
+        }
+    }
+
+    /// Same as `col`, but `nullable: true` — for O3 nullable-cursor preflight tests.
+    fn nullable_col(name: &str, data_type: &str, column_type: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            column_type: column_type.to_string(),
+            nullable: true,
         }
     }
 
@@ -489,6 +505,37 @@ mod tests {
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn nullable_cursor_auto_resolves_to_full_refresh_in_preflight() {
+        // O3 parity: --check uses the same detect_mode as the run, so a table whose
+        // `updated_at` is nullable must resolve to FullRefresh under auto (never a
+        // green incremental pass over a cursor that would silently skip NULL rows).
+        let config = make_config(vec!["orders".to_string()]);
+        let mut inspect = MockPreflightInspect::new();
+        let mut storage = MockPreflightStorage::new();
+        let mut hwm = MockPreflightHwm::new();
+
+        storage.expect_check_writable().returning(|| Ok(()));
+        hwm.expect_read_hwm().returning(|_| Ok(None));
+        inspect.expect_discover_columns().returning(|_| {
+            Ok(vec![
+                col("id", "bigint", "bigint(20)"),
+                col("name", "varchar", "varchar(255)"),
+                nullable_col("updated_at", "timestamp", "timestamp"),
+            ])
+        });
+        inspect
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
+        // Passes as a FullRefresh table (the KEY reason names the nullable cursor);
+        // the essential assertion is that preflight does NOT treat it as incremental,
+        // which read_hwm-only-for-incremental setups would otherwise mask.
+        let result = check.run().await;
+        assert!(result.is_ok(), "nullable-cursor table must preflight as full_refresh: {result:?}");
     }
 
     #[tokio::test]

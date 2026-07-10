@@ -429,12 +429,12 @@ mod tests {
     #[test]
     fn column_info_to_v57_schema_produces_valid_schema() {
         let columns = vec![
-            ColumnInfo { name: "id".into(), data_type: "bigint".into(), column_type: "bigint(20)".into() },
-            ColumnInfo { name: "name".into(), data_type: "varchar".into(), column_type: "varchar(255)".into() },
-            ColumnInfo { name: "price".into(), data_type: "double".into(), column_type: "double".into() },
-            ColumnInfo { name: "updated_at".into(), data_type: "timestamp".into(), column_type: "timestamp".into() },
-            ColumnInfo { name: "is_active".into(), data_type: "boolean".into(), column_type: "tinyint(1)".into() },
-            ColumnInfo { name: "birth_date".into(), data_type: "date".into(), column_type: "date".into() },
+            ColumnInfo { name: "id".into(), data_type: "bigint".into(), column_type: "bigint(20)".into(), nullable: false },
+            ColumnInfo { name: "name".into(), data_type: "varchar".into(), column_type: "varchar(255)".into(), nullable: false },
+            ColumnInfo { name: "price".into(), data_type: "double".into(), column_type: "double".into(), nullable: false },
+            ColumnInfo { name: "updated_at".into(), data_type: "timestamp".into(), column_type: "timestamp".into(), nullable: false },
+            ColumnInfo { name: "is_active".into(), data_type: "boolean".into(), column_type: "tinyint(1)".into(), nullable: false },
+            ColumnInfo { name: "birth_date".into(), data_type: "date".into(), column_type: "date".into(), nullable: false },
         ];
         let schema = column_info_to_v57_schema(&columns).unwrap();
         assert_eq!(schema.fields().len(), 6);
@@ -823,8 +823,8 @@ mod tests {
     #[test]
     fn column_info_to_v57_schema_unsupported_type() {
         let columns = vec![
-            ColumnInfo { name: "id".into(), data_type: "bigint".into(), column_type: "bigint(20)".into() },
-            ColumnInfo { name: "data".into(), data_type: "geometry".into(), column_type: "geometry".into() },
+            ColumnInfo { name: "id".into(), data_type: "bigint".into(), column_type: "bigint(20)".into(), nullable: false },
+            ColumnInfo { name: "data".into(), data_type: "geometry".into(), column_type: "geometry".into(), nullable: false },
         ];
         let result = column_info_to_v57_schema(&columns);
         assert!(result.is_err());

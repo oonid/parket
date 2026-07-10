@@ -22,16 +22,19 @@ pub(crate) fn make_columns() -> Vec<ColumnInfo> {
             name: "id".to_string(),
             data_type: "bigint".to_string(),
             column_type: "bigint(20)".to_string(),
+            nullable: false,
         },
         ColumnInfo {
             name: "name".to_string(),
             data_type: "varchar".to_string(),
             column_type: "varchar(255)".to_string(),
+            nullable: false,
         },
         ColumnInfo {
             name: "updated_at".to_string(),
             data_type: "timestamp".to_string(),
             column_type: "timestamp".to_string(),
+            nullable: false,
         },
     ]
 }
@@ -163,11 +166,13 @@ pub(crate) fn make_full_refresh_columns() -> Vec<ColumnInfo> {
             name: "id".to_string(),
             data_type: "bigint".to_string(),
             column_type: "bigint(20)".to_string(),
+            nullable: false,
         },
         ColumnInfo {
             name: "name".to_string(),
             data_type: "varchar".to_string(),
             column_type: "varchar(255)".to_string(),
+            nullable: false,
         },
     ]
 }

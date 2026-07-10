@@ -33,6 +33,11 @@ pub struct ColumnInfo {
     pub name: String,
     pub data_type: String,
     pub column_type: String,
+    /// Whether the source column is `NULL`-able. Not fed into `compute_schema_hash`
+    /// (structural mapping only). Used by `detect_mode`/`detect_timestamp_col` to
+    /// refuse auto-selecting a nullable cursor (O3): the incremental query filters
+    /// `WHERE <cursor> IS NOT NULL`, so a nullable cursor silently skips NULL rows.
+    pub nullable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -63,7 +68,7 @@ impl SchemaInspector {
 
     pub async fn discover_columns(&self, table: &str) -> Result<Vec<ColumnInfo>> {
         let rows: Vec<MySqlColumnRow> = sqlx::query_as(
-            "SELECT COLUMN_NAME AS column_name, DATA_TYPE AS data_type, COLUMN_TYPE AS column_type FROM information_schema.columns WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION"
+            "SELECT COLUMN_NAME AS column_name, DATA_TYPE AS data_type, COLUMN_TYPE AS column_type, IS_NULLABLE AS is_nullable FROM information_schema.columns WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION"
         )
         .bind(&self.database)
         .bind(table)
@@ -81,6 +86,7 @@ impl SchemaInspector {
                 name: r.column_name,
                 data_type: r.data_type,
                 column_type: r.column_type,
+                nullable: r.is_nullable == "YES",
             })
             .collect();
 
@@ -217,10 +223,14 @@ pub fn filter_unsupported_columns(columns: &[ColumnInfo]) -> Vec<ColumnInfo> {
 /// Auto-detect a timestamp cursor column: returns the first `TIMESTAMP_CANDIDATES`
 /// entry present as a `timestamp`/`datetime` column, or `None` if none match.
 /// (Used only when there is no explicit `TABLE_TIMESTAMP_<table>` override.)
+/// A candidate that is `NULL`-able is skipped (O3): auto-detection must never pick
+/// a cursor that would silently drop NULL-cursor rows under incremental extraction.
 pub fn detect_timestamp_col(columns: &[ColumnInfo]) -> Option<String> {
     for candidate in TIMESTAMP_CANDIDATES {
         if columns.iter().any(|c| {
-            c.name == *candidate && (c.data_type == "timestamp" || c.data_type == "datetime")
+            c.name == *candidate
+                && (c.data_type == "timestamp" || c.data_type == "datetime")
+                && !c.nullable
         }) {
             return Some((*candidate).to_string());
         }
@@ -228,6 +238,14 @@ pub fn detect_timestamp_col(columns: &[ColumnInfo]) -> Option<String> {
     None
 }
 
+/// Resolve the extraction mode for a table.
+///
+/// O3: a nullable cursor column is unsafe for incremental extraction — the
+/// incremental query filters `WHERE <cursor> IS NOT NULL`, so rows with a NULL
+/// cursor value would be silently skipped forever. Auto-detection therefore never
+/// selects a nullable cursor (falls back to FullRefresh, `warn!`ing why). An
+/// *explicit* `TABLE_MODE=incremental` override on a nullable cursor is still
+/// honored (operator intent), but loudly `warn!`s about the NULL-row exclusion.
 pub fn detect_mode(
     columns: &[ColumnInfo],
     override_mode: Option<&ExtractionMode>,
@@ -237,19 +255,38 @@ pub fn detect_mode(
         && *mode != ExtractionMode::Auto
     {
         info!("using mode override: {:?}", mode);
+        if *mode == ExtractionMode::Incremental
+            && let Some(c) = columns.iter().find(|c| c.name == timestamp_col)
+            && c.nullable
+        {
+            warn!(
+                "TABLE_MODE=incremental explicitly configured with nullable cursor column \
+                 '{timestamp_col}' — rows where '{timestamp_col}' IS NULL will be silently \
+                 excluded from incremental extraction (honoring explicit override; see audit \
+                 finding O3/D2)"
+            );
+        }
         return mode.clone();
     }
 
-    let has_timestamp = columns.iter().any(|c| {
+    let ts_col = columns.iter().find(|c| {
         c.name == timestamp_col
             && (c.data_type == "timestamp" || c.data_type == "datetime")
     });
     let has_id = columns.iter().any(|c| c.name == "id");
 
-    if has_timestamp && has_id {
-        ExtractionMode::Incremental
-    } else {
-        ExtractionMode::FullRefresh
+    match ts_col {
+        Some(c) if c.nullable => {
+            warn!(
+                "auto-detection found timestamp cursor candidate '{timestamp_col}' but it is \
+                 nullable — a nullable cursor is unsafe for incremental extraction (NULL-cursor \
+                 rows would be silently skipped); falling back to full_refresh (see audit \
+                 finding O3; run --inspect for details)"
+            );
+            ExtractionMode::FullRefresh
+        }
+        Some(_) if has_id => ExtractionMode::Incremental,
+        _ => ExtractionMode::FullRefresh,
     }
 }
 
@@ -276,6 +313,19 @@ pub fn validate_two_stream_cursors(
     // reuse the timestamp/datetime check
     validate_timestamp_col(columns, update_col)
         .map_err(|_| anyhow::anyhow!("two-stream update cursor '{update_col}' is missing or not a timestamp/datetime column"))?;
+
+    // O3: an explicitly configured two-stream update cursor is honored even if
+    // nullable (operator intent), but rows with a NULL cursor are silently excluded
+    // from the update stream — warn loudly (see D2).
+    if let Some(c) = columns.iter().find(|c| c.name == update_col)
+        && c.nullable
+    {
+        warn!(
+            "two-stream update cursor '{update_col}' is nullable — rows where '{update_col}' IS \
+             NULL will be silently excluded from the update stream (honoring explicit two-stream \
+             cursor configuration; see audit finding O3/D2)"
+        );
+    }
     Ok(())
 }
 
@@ -299,6 +349,7 @@ struct MySqlColumnRow {
     column_name: String,
     data_type: String,
     column_type: String,
+    is_nullable: String,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -331,6 +382,17 @@ mod tests {
             name: name.to_string(),
             data_type: data_type.to_string(),
             column_type: column_type.to_string(),
+            nullable: false,
+        }
+    }
+
+    /// Same as `col`, but `nullable: true` — for O3 nullable-cursor tests.
+    fn nullable_col(name: &str, data_type: &str, column_type: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            column_type: column_type.to_string(),
+            nullable: true,
         }
     }
 
@@ -534,6 +596,30 @@ mod tests {
     }
 
     #[test]
+    fn detect_mode_nullable_cursor_auto_falls_back_to_full_refresh() {
+        // O3: id + a nullable updated_at, no override — auto-detection must NOT
+        // select the nullable cursor for incremental (silent NULL-row loss trap).
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            nullable_col("updated_at", "timestamp", "timestamp"),
+        ];
+        let mode = detect_mode(&columns, None, "updated_at");
+        assert_eq!(mode, ExtractionMode::FullRefresh);
+    }
+
+    #[test]
+    fn detect_mode_override_incremental_with_nullable_cursor_still_incremental() {
+        // O3 decision (b): an explicit TABLE_MODE=incremental override on a nullable
+        // cursor is honored (operator intent), just loudly warned about.
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            nullable_col("updated_at", "timestamp", "timestamp"),
+        ];
+        let mode = detect_mode(&columns, Some(&ExtractionMode::Incremental), "updated_at");
+        assert_eq!(mode, ExtractionMode::Incremental);
+    }
+
+    #[test]
     fn compute_schema_hash_deterministic() {
         let columns = vec![
             col("id", "int", "int(11)"),
@@ -651,6 +737,18 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("two-stream insert cursor"));
         assert!(err.contains("not an integer column"));
+    }
+
+    #[test]
+    fn validate_two_stream_cursors_nullable_update_col_still_ok() {
+        // O3 decision (b): a nullable update cursor is honored (Ok), just warned about.
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("user_id", "bigint", "bigint(20)"),
+            nullable_col("updated_at", "timestamp", "timestamp"),
+        ];
+        let result = validate_two_stream_cursors(&columns, "user_id", "updated_at");
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -772,6 +870,32 @@ mod tests {
             col("updated_at", "timestamp", "timestamp"),
             col("modified_at", "timestamp", "timestamp"),
         ];
+        assert_eq!(detect_timestamp_col(&columns), Some("updated_at".to_string()));
+    }
+
+    #[test]
+    fn detect_timestamp_col_skips_nullable_candidate() {
+        // O3: a nullable updated_at must not be auto-selected as the cursor.
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            nullable_col("updated_at", "timestamp", "timestamp"),
+        ];
+        assert_eq!(detect_timestamp_col(&columns), None);
+    }
+
+    #[test]
+    fn detect_timestamp_col_falls_through_when_top_candidate_nullable() {
+        // A nullable updated_at is skipped; the next-priority NOT NULL candidate wins.
+        let columns = vec![
+            nullable_col("updated_at", "timestamp", "timestamp"),
+            col("modified_at", "datetime", "datetime"),
+        ];
+        assert_eq!(detect_timestamp_col(&columns), Some("modified_at".to_string()));
+    }
+
+    #[test]
+    fn detect_timestamp_col_not_null_candidate_returned() {
+        let columns = vec![col("updated_at", "timestamp", "timestamp")];
         assert_eq!(detect_timestamp_col(&columns), Some("updated_at".to_string()));
     }
 
