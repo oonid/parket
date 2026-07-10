@@ -1415,3 +1415,84 @@ async fn verify_key_set_works_with_non_id_primary_key() {
          machinery genuinely ran against `code_id` rather than being Skipped"
     );
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn table_with_time_year_bit_columns_syncs_with_columns_skipped() {
+    // N1/O8: TIME/YEAR/BIT are not in discovery::EXTRACTABLE_DATA_TYPES. Pre-fix, `t`
+    // (TIME) and `y` (YEAR) would reach the vendored connector_arrow's `create_field`
+    // unmapped and ABORT THE WHOLE PROCESS (exit 101, not this crate's 0/1/2 contract);
+    // `b` (BIT) would fail via `mariadb_type_to_arrow`'s bail (whole-table failure, not a
+    // process abort, but still worse than the geometry precedent). Post-fix, all three
+    // are silently skipped with a warn — the table still syncs successfully with just
+    // `id` + `name`, proving the panic/whole-table-failure path is sealed end-to-end
+    // against a real MariaDB server, not just in unit tests that construct ColumnInfo by
+    // hand.
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let env = TestEnv::new(vec!["skippy"]).await;
+
+    sqlx::query(
+        "CREATE TABLE skippy (\
+            id BIGINT PRIMARY KEY, \
+            name VARCHAR(50), \
+            t TIME, \
+            y YEAR, \
+            b BIT(8)\
+        )",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create skippy table");
+
+    sqlx::query(
+        "INSERT INTO skippy (id, name, t, y, b) VALUES \
+            (1, 'alice', '12:34:56', 2026, b'00000001'), \
+            (2, 'bob', '23:45:01', 2025, b'00000010')",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert skippy rows");
+
+    let mut orchestrator = env.make_orchestrator();
+    let exit_code = orchestrator.run().await;
+    assert!(
+        matches!(exit_code, ExitCode::Success),
+        "expected Success exit code (columns skipped, not a process abort or table \
+         failure), got {exit_code:?}"
+    );
+
+    let mut table = env.open_delta_table("skippy").await;
+    table.load().await.expect("failed to load delta table");
+    let kernel_schema = table.snapshot().unwrap().schema();
+    let arrow_schema: deltalake::arrow::datatypes::Schema =
+        deltalake::kernel::engine::arrow_conversion::TryIntoArrow::try_into_arrow(
+            kernel_schema.as_ref(),
+        )
+        .expect("failed to convert schema");
+    let mut field_names: Vec<&str> = arrow_schema.fields().iter().map(|f| f.name().as_str()).collect();
+    field_names.sort_unstable();
+    assert_eq!(
+        field_names,
+        vec!["id", "name"],
+        "Delta schema must contain ONLY id + name — t/y/b must be skipped, not present as \
+         (unmapped) columns"
+    );
+
+    let row_count = count_delta_rows(&env, "skippy").await;
+    assert_eq!(row_count, 2, "expected 2 rows in Delta table for skippy");
+
+    assert_eq!(
+        count_matching(&env, "skippy", "id = 1 AND name = 'alice'").await,
+        1,
+        "row 1's surviving columns must round-trip intact"
+    );
+    assert_eq!(
+        count_matching(&env, "skippy", "id = 2 AND name = 'bob'").await,
+        1,
+        "row 2's surviving columns must round-trip intact"
+    );
+}

@@ -36,6 +36,19 @@ use crate::discovery::ColumnInfo;
 /// The physical batches extracted off the wire still arrive as the original UInt* arrays
 /// though — `align_batch_to_schema` casts them to match this widened schema before they
 /// reach the Delta writer.
+/// N1/O8: `discovery::filter_unsupported_columns` runs on every extraction path
+/// (`Orchestrator::process_table`, `PreflightCheck::check_table`) BEFORE columns ever
+/// reach this function or `column_info_to_v57_schema` — it keeps a column only if its
+/// DATA_TYPE is in `discovery::EXTRACTABLE_DATA_TYPES`, which mirrors the match arms
+/// below exactly (kept in sync by the
+/// `mariadb_type_to_arrow_covers_exactly_the_extractable_allowlist` test). So the `_ =>
+/// bail!` arm below should be unreachable from those callers in normal operation — it
+/// remains as defense-in-depth (e.g. direct callers/tests that construct `ColumnInfo`
+/// bypassing the filter, per `column_info_to_v57_schema_unsupported_type` below) rather
+/// than the primary guard. Returning a graceful `Err` here (not a panic) is what makes a
+/// column that somehow evades the allowlist fail just its own table instead of the
+/// process — the vendored connector_arrow's own `create_field` has no such fallback and
+/// `todo!()`s (process abort) on anything it doesn't recognize.
 pub(crate) fn mariadb_type_to_arrow(data_type: &str, column_type: &str) -> Result<DataType> {
     let is_unsigned = column_type.to_ascii_lowercase().contains("unsigned");
     match data_type {
@@ -565,5 +578,35 @@ mod tests {
     async fn schema_evolution_integration_with_existing_delta_table() {
         // This test is in orchestrator.rs as it tests the full orchestrator flow
         // Placeholder kept for tracking that it exists in the main tests
+    }
+
+    #[test]
+    fn mariadb_type_to_arrow_covers_exactly_the_extractable_allowlist() {
+        // N1/O8: keeps discovery::EXTRACTABLE_DATA_TYPES and this function's match arms
+        // in sync in both directions:
+        //  1. every allowlisted type must be accepted here (else a column parket itself
+        //     decided was safe would still bail the table);
+        //  2. known-unmapped types must stay OUT of the allowlist and still be rejected
+        //     here (else the allowlist would be stale and let an unmapped type through
+        //     to the connector's todo!()).
+        use crate::discovery::EXTRACTABLE_DATA_TYPES;
+
+        for dt in EXTRACTABLE_DATA_TYPES {
+            assert!(
+                mariadb_type_to_arrow(dt, dt).is_ok(),
+                "allowlisted type '{dt}' must be accepted by mariadb_type_to_arrow"
+            );
+        }
+
+        for dt in ["time", "year", "bit", "uuid", "inet4", "inet6", "geometry", "point", "vector"] {
+            assert!(
+                !EXTRACTABLE_DATA_TYPES.contains(&dt),
+                "'{dt}' must stay out of the extractable allowlist"
+            );
+            assert!(
+                mariadb_type_to_arrow(dt, dt).is_err(),
+                "'{dt}' unexpectedly accepted by mariadb_type_to_arrow — allowlist is stale"
+            );
+        }
     }
 }

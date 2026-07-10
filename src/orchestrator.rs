@@ -235,8 +235,19 @@ where
         let start = Instant::now();
 
         let columns = self.schema_inspect.discover_columns(table_name).await?;
+        // N1/O8: this MUST run before any schema building (`column_info_to_v57_schema`
+        // below), `schema_evolution_check`, or column-name selection — everything past
+        // this point only ever sees the filtered set, so a column type the vendored
+        // connector_arrow can't map (time/year/bit/uuid/geometry/future types) never
+        // reaches `mariadb_type_to_arrow` or the connector's `create_field` at all. See
+        // `discovery::EXTRACTABLE_DATA_TYPES` for the allowlist this enforces.
         let columns = filter_unsupported_columns(&columns);
 
+        // If an explicit TABLE_TIMESTAMP_<table> override names a column that
+        // `filter_unsupported_columns` just dropped (e.g. a TIME column), it is no
+        // longer present in `columns` at all, so `validate_timestamp_col` bails
+        // actionably ("missing or not a timestamp/datetime column") — a per-table
+        // error, not a panic and not silent (N1/O8 consequence check).
         let ts_col = match self.config.table_timestamp_col.get(table_name) {
             Some(ovr) => {
                 crate::discovery::validate_timestamp_col(&columns, ovr)?;
@@ -1514,5 +1525,50 @@ mod tests {
         );
         let result = orch.run().await;
         assert!(matches!(result, ExitCode::Success));
+    }
+
+    #[tokio::test]
+    async fn explicit_timestamp_cursor_on_filtered_time_column_bails_actionably() {
+        // N1/O8 consequence check: TIME is not in discovery::EXTRACTABLE_DATA_TYPES, so
+        // filter_unsupported_columns drops the `t` column before ts_col resolution ever
+        // runs. An explicit TABLE_TIMESTAMP_<table> override naming that (now-absent)
+        // column must fail the table with an actionable "missing or not a
+        // timestamp/datetime column" error (validate_timestamp_col sees an absent
+        // column) — never a panic, never silently ignored. Only discover_columns is
+        // mocked: process_table must bail before get_avg_row_length/ensure_table/etc are
+        // ever reached, so any further mock call would panic on "no expectation set".
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["events".to_string()]);
+        config
+            .table_timestamp_col
+            .insert("events".to_string(), "t".to_string());
+        let mut schema_mock = MockSchemaInspect::new();
+        let extract_mock = MockExtract::new();
+        let writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| AppState::default());
+        schema_mock.expect_discover_columns().returning(|_| {
+            Ok(vec![
+                ColumnInfo { name: "id".into(), data_type: "bigint".into(), column_type: "bigint(20)".into(), nullable: false },
+                ColumnInfo { name: "name".into(), data_type: "varchar".into(), column_type: "varchar(50)".into(), nullable: false },
+                ColumnInfo { name: "t".into(), data_type: "time".into(), column_type: "time".into(), nullable: false },
+            ])
+        });
+        state_mock
+            .expect_update_table()
+            .withf(|name, state, _| {
+                name == "events" && state.last_run_status.as_deref() == Some("failed")
+            })
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(
+            matches!(result, ExitCode::Fatal),
+            "expected Fatal (single table failed actionably, not a panic), got {result:?}"
+        );
     }
 }

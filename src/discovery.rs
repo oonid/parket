@@ -17,15 +17,60 @@ const TIMESTAMP_CANDIDATES: &[&str] = &[
     "modified_date",
 ];
 
-const UNSUPPORTED_DATA_TYPES: &[&str] = &[
-    "geometry",
-    "point",
-    "linestring",
-    "polygon",
-    "geometrycollection",
-    "multipolygon",
-    "multilinestring",
-    "multipoint",
+/// N1/O8 gatekeeper — the single source of truth for "can parket safely extract this
+/// column". The vendored connector_arrow (`vendor/connector_arrow`, `create_field`) still
+/// has a `todo!()` for any wire type it doesn't recognize; hitting it **aborts the whole
+/// process** (exit code 101, not parket's 0/1/2 contract), not just the one table. Its own
+/// mapping is bigger than parket's — `mariadb_type_to_arrow`
+/// (`src/orchestrator/schema.rs`) only maps a subset of what MariaDB can produce, and
+/// `time`/`year`/`bit`/`uuid`/`inet4`/`inet6`/geometry/future types are outside it.
+///
+/// `mariadb_type_to_arrow` itself returns a graceful `Result::Err` (bail!, not a panic) for
+/// anything outside this set — so a column reaching it unfiltered would fail *that one
+/// table*, not abort the process. But nothing guarantees every parket-accepted type is
+/// also connector-mappable, and "fail the whole table" is still worse than the
+/// geometry-family precedent of skipping the one unsupported column with a warn. So
+/// `filter_unsupported_columns` below is the actual enforcement point: a column survives
+/// pipeline-wide ONLY if its DATA_TYPE is in this allowlist — everything else (including
+/// any future/unknown type) is dropped with a warn before it can reach schema building,
+/// `mariadb_type_to_arrow`, or the connector at all. See audit-findings.md N1 (§2) / O8.
+///
+/// This list mirrors `mariadb_type_to_arrow`'s match arms EXACTLY — the two are kept in
+/// sync by `orchestrator::schema::mariadb_type_to_arrow_covers_exactly_the_extractable_allowlist`,
+/// which asserts every entry here is accepted there and spot-checks known-excluded types
+/// are rejected there. If you add a mapping to `mariadb_type_to_arrow`, add the matching
+/// DATA_TYPE string(s) here too (or that type stays permanently skipped despite being
+/// mappable).
+pub(crate) const EXTRACTABLE_DATA_TYPES: &[&str] = &[
+    "tinyint",
+    "smallint",
+    "mediumint",
+    "int",
+    "bigint",
+    "float",
+    "double",
+    "decimal",
+    "numeric",
+    "varchar",
+    "char",
+    "text",
+    "tinytext",
+    "mediumtext",
+    "longtext",
+    "json",
+    "enum",
+    "set",
+    "date",
+    "datetime",
+    "timestamp",
+    "boolean",
+    "bool",
+    "blob",
+    "tinyblob",
+    "mediumblob",
+    "longblob",
+    "binary",
+    "varbinary",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,16 +249,29 @@ impl SchemaInspector {
     }
 }
 
+/// N1/O8: allowlist-driven column filter — a column is kept ONLY if its DATA_TYPE is in
+/// `EXTRACTABLE_DATA_TYPES` (mirrors `mariadb_type_to_arrow` exactly). Everything else —
+/// `time`, `year`, `bit`-variants, `uuid`, `inet4`/`inet6`, the geometry family, and any
+/// future/unknown type — is uniformly skipped with a warn naming the column, its declared
+/// type, and that it is excluded from extraction. This replaces the old blocklist (which
+/// only named the geometry family) with an explicit allowlist so a *new* MariaDB type
+/// nobody has taught parket about is safe by default (skipped, not a process abort or a
+/// whole-table failure). Used by both the orchestrator (`process_table`) and preflight
+/// (`--check`) so the two paths never diverge on what gets extracted.
 pub fn filter_unsupported_columns(columns: &[ColumnInfo]) -> Vec<ColumnInfo> {
     columns
         .iter()
         .filter(|c| {
             let dt = c.data_type.to_lowercase();
-            if UNSUPPORTED_DATA_TYPES.contains(&dt.as_str()) {
-                warn!("skipping unsupported column type: {} ({})", c.name, c.column_type);
-                false
-            } else {
+            if EXTRACTABLE_DATA_TYPES.contains(&dt.as_str()) {
                 true
+            } else {
+                warn!(
+                    "excluding column '{}' (type '{}', declared '{}') from extraction: not in \
+                     the extractable-type allowlist — see audit finding N1/O8",
+                    c.name, c.data_type, c.column_type
+                );
+                false
             }
         })
         .cloned()
@@ -673,25 +731,72 @@ mod tests {
         assert_ne!(compute_schema_hash(&cols_a), compute_schema_hash(&cols_b));
     }
 
+    // N1/O8: `UNSUPPORTED_DATA_TYPES` (a geometry-only blocklist) was replaced by the
+    // `EXTRACTABLE_DATA_TYPES` allowlist above — a column is now excluded whenever its
+    // type is absent from the allowlist, not just when it matches a hardcoded blocklist
+    // entry. `unsupported_types_list_complete` asserted the old blocklist's exact
+    // contents; there is no equivalent blocklist left to assert against, so it is
+    // replaced by the allowlist-coverage tests below (`filter_keeps_every_allowlisted_type`,
+    // `filter_removes_time_year_bit_uuid_keeps_rest`, `filter_removes_inet_types`,
+    // `filter_removes_unknown_future_type`).
+
     #[test]
-    fn unsupported_types_list_complete() {
-        let expected = [
-            "geometry",
-            "point",
-            "linestring",
-            "polygon",
-            "geometrycollection",
-            "multipolygon",
-            "multilinestring",
-            "multipoint",
+    fn filter_keeps_every_allowlisted_type() {
+        // Every DATA_TYPE mariadb_type_to_arrow maps must survive the filter.
+        let columns: Vec<ColumnInfo> = EXTRACTABLE_DATA_TYPES
+            .iter()
+            .enumerate()
+            .map(|(i, dt)| col(&format!("c{i}"), dt, dt))
+            .collect();
+        let filtered = filter_unsupported_columns(&columns);
+        assert_eq!(
+            filtered.len(),
+            columns.len(),
+            "every allowlisted type must survive filter_unsupported_columns"
+        );
+    }
+
+    #[test]
+    fn filter_removes_time_year_bit_uuid_keeps_rest() {
+        // O8: time/year/bit used to fail the whole table (via mariadb_type_to_arrow's
+        // bail); uuid was never mapped at all. All four are now skipped uniformly,
+        // like geometry, instead of failing or reaching the connector.
+        let columns = vec![
+            col("id", "bigint", "bigint(20)"),
+            col("name", "varchar", "varchar(50)"),
+            col("t", "time", "time"),
+            col("y", "year", "year(4)"),
+            col("b", "bit", "bit(8)"),
+            col("u", "uuid", "uuid"),
         ];
-        for t in &expected {
-            assert!(
-                UNSUPPORTED_DATA_TYPES.contains(t),
-                "missing unsupported type: {t}"
-            );
-        }
-        assert_eq!(UNSUPPORTED_DATA_TYPES.len(), expected.len());
+        let filtered = filter_unsupported_columns(&columns);
+        let names: Vec<&str> = filtered.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "name"]);
+    }
+
+    #[test]
+    fn filter_removes_inet_types() {
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("ip4", "inet4", "inet4"),
+            col("ip6", "inet6", "inet6"),
+        ];
+        let filtered = filter_unsupported_columns(&columns);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "id");
+    }
+
+    #[test]
+    fn filter_removes_unknown_future_type() {
+        // A type nobody has taught parket about yet must be safe-by-default (skipped),
+        // not reach the connector or panic.
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("embedding", "vector", "vector(768)"),
+        ];
+        let filtered = filter_unsupported_columns(&columns);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "id");
     }
 
     #[test]

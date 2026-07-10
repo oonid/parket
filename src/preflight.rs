@@ -963,6 +963,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preflight_skips_time_year_bit_columns_without_failing() {
+        // N1/O8 parity: preflight shares filter_unsupported_columns with the orchestrator
+        // (see check_table above), so time/year/bit columns are silently excluded from
+        // the reported COLUMNS count (and the warn fires) instead of failing the
+        // pre-flight check — the same behavior as the geometry family already had.
+        let config = make_config(vec!["events".to_string()]);
+        let mut inspect = MockPreflightInspect::new();
+        let mut storage = MockPreflightStorage::new();
+        let mut hwm = MockPreflightHwm::new();
+
+        storage.expect_check_writable().returning(|| Ok(()));
+        hwm.expect_read_hwm().returning(|_| Ok(None));
+        inspect.expect_discover_columns().returning(|_| {
+            Ok(vec![
+                col("id", "bigint", "bigint(20)"),
+                col("name", "varchar", "varchar(50)"),
+                col("t", "time", "time"),
+                col("y", "year", "year(4)"),
+                col("b", "bit", "bit(8)"),
+            ])
+        });
+        inspect
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(64)));
+
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
+        let result = check.run().await;
+        assert!(
+            result.is_ok(),
+            "table with only geometry-class-excluded columns beyond id/name must still \
+             preflight successfully: {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn hwm_with_both_updated_at_and_last_id() {
         // Format HWM when both updated_at and last_id are present.
         let config = make_config(vec!["orders".to_string()]);
