@@ -58,6 +58,7 @@ isolation, and exact set-equality beyond the aggregate fingerprints.
 | T1–T5 | `108d9e3` | Docker verify tests committed + strengthened: corruption→Discrepancy (both paths), post-HWM scope exclusion, NULL + multibyte rows; ran green under real MariaDB+MinIO (Opus-reviewed) |
 | N4 (+N1 mappings) | `36c485c`, `3a3059d` | DATE/MEDIUMINT/VARBINARY/JSON mapped instead of `todo!()` panic; [connector_arrow#79](https://github.com/aljazerzen/connector_arrow/pull/79) **merged upstream** (v0.12.1) — submodule back on aljazerzen |
 | O2/R4, R3, R5 | `6978d6c`, `52aa55a` | interrupted runs exit PartialFailure + table state "interrupted" (never "success"); shutdown mid-full-refresh after chunk 0 bails as a failure naming the partial rewrite; SIGTERM joins SIGINT (second signal → exit 130); state.json fsync (file before rename, dir after) — residual: O2-r stage-and-swap |
+| N1-residual + O8 | `ee09a7f` | explicit EXTRACTABLE_DATA_TYPES allowlist as the pipeline gatekeeper (single-sourced across orchestrator + preflight, bidirectional sync test vs mariadb_type_to_arrow); time/year/bit/uuid/inet/geometry/future types uniformly column-skipped with a warn instead of table-fail/process-abort; Docker-proven (TIME/YEAR/BIT table syncs, Delta schema exactly [id,name]) (Opus-reviewed) |
 | V3 | `6c1fe9c` | verify resolves the real key: two-stream insert cursor > discovered single-column integer PK (new SourceProbe::integer_pk) > `id` fallback; threaded through key-stats/scoping/sampling/value filters incl. SourceScope.key_col; honest Skipped reason; Docker-proven on a `code_id`-keyed table (Clean → corruption → Discrepancy) (Opus-reviewed) — residual: V3-r |
 | O3 (+pf1) | `e3395da`, `04e2678` | ColumnInfo carries nullability; auto-detection never selects a nullable cursor (demotes to full_refresh + warn when nullability is the deciding factor); explicit incremental/two-stream cursors honored + loud warn (row loss itself = D2); preflight inherits via shared detect_mode and its KEY reason names the nullable cursor — eliminating pf1's reachable unreachable!() (Opus-reviewed) |
 | N5 | `2f0c4f8` | unsigned int columns widened to signed Arrow/Delta types (tinyint/smallint/mediumint→Int32-range, int/bigint→Int64) + batches cast before write (safe:false errors on >i64::MAX BIGINT UNSIGNED by name); Docker-proven round-trip incl. above-signed-max values across 2 runs + actionable overflow failure (Opus-reviewed). Migration: pre-fix unsigned Delta tables have narrower types → evolution check flags them → full-refresh to rebuild |
@@ -67,7 +68,7 @@ isolation, and exact set-equality beyond the aggregate fingerprints.
 | VA1/VA2/VA3/V4/VA4/VA5 | `a9bf774` | component fingerprints + central assembly; native-scale decimals (Docker-proven); sum-overflow guard; n= counts; cap-before-scan incl. Delta rows; one-query aggregates; bounded probe sessions; try_cast + per-table Skipped-on-error (Opus-reviewed) — residual: VA1-r |
 
 ## 2. Open — Critical
-- **N1 — extraction panics the process on unmapped column types.** *Largely mitigated by `36c485c`* (DATE/MEDIUMINT/VARBINARY/JSON now mapped; upstream PR #79). **Still open:** (a) the `todo!()` in `create_field` remains for any *other* unmapped type (`time`, `year`, `bit`-variants, geometry passed through, future types) → still a process abort; add a parket **preflight allowlist** so unmapped types are per-table errors, and/or upstream a follow-up turning the `todo!()` into a `ConnectorError`. (b) O8 remains: `time`/`year` fail the whole table instead of being skipped like geometry. *(Detail: audit-2026-07-06 §1.)*
+*(empty — all Critical findings resolved as of `ee09a7f`. N1's parket-side gatekeeper is in place; the remaining upstream nicety — turning connector_arrow's `todo!()` into a `ConnectorError` — is tracked as N1-u below, Low, since it is unreachable from parket's callers.)*
 
 ## 3. Open — High
 - **N2, N3** — **done** (`2399b50`, Opus-reviewed). Residuals registered below: N2-r (partial-chunk cross-run duplicates), N3-r (detect_mode literal-`id`).
@@ -94,7 +95,7 @@ isolation, and exact set-equality beyond the aggregate fingerprints.
 - **O5** — two-stream cursor config silently overrides explicit `TABLE_MODE`. Bail/warn on conflict.
 - **O6** — `adapters.rs:157-167` `get_schema` `Err(_)=>Ok(None)` (R1-class recurrence, ×2 duplicated impls) silently disables schema-evolution check. Classify missing-vs-transient like R1.
 - **O7** — `--check`/run parity: mode-override skips column validation; no evolution check in preflight; S3 health-check written at bucket root ignoring `s3_prefix`; local mode probes nothing.
-- **O8** — unsupported-type inconsistency: geometry skipped gracefully; `time`/`year`/`bit` fail the whole table (and would panic in the connector — N1 class). Extend skip-list or map them.
+- **O8** — **done** (`ee09a7f`).
 - **R3, R5** — **done** (`6978d6c`). Minor tidiness follow-up: a failed write still leaves a stale `.tmp` (pre-existing; overwritten on next success).
 - **D1** — new source columns silently dropped forever by evolution filter (`orchestrator/schema.rs:84-96`); also feeds N3. Additive evolution or fail loudly.
 - **D2** — `WHERE ts IS NOT NULL` permanently drops NULL-cursor rows (`query.rs:31,36`) with no backfill (pairs with O3).
@@ -113,6 +114,8 @@ isolation, and exact set-equality beyond the aggregate fingerprints.
 - **T2–T5** — ~~corruption/scope/NULL/multibyte test coverage~~ **done** (`108d9e3`). Still open (T6): two-stream verify verdicts, Drift + Skipped tiers, VARCHAR-only drift isolation under Docker; suite also lacks keyset page-boundary (C1) and R2-bail coverage.
 
 ## 5. Open — Low
+- **N1-u** — upstream follow-up: connector_arrow `create_field` `todo!()` → proper `ConnectorError` (offered in PR #79's description; unreachable from parket since `ee09a7f`).
+- **N1-r2** — the allowlist↔mapping sync test proves allowlist ⊆ mapping + spot-checks known-excluded types; a NEW mapping arm added without allowlisting would be silently skipped (soft failure), not caught. Also: a source column ALTERed from an extractable to a non-extractable type yields a misleading "exists in Delta but not in MariaDB" evolution message (safe bail, wrong wording).
 - **L1** calendar: O(|years|) loop + `i64` overflow near extremes (`calendar.rs:7-19`).
 - **L2** negative pre-1970 timestamps: truncating vs euclid division mismatch in rendering (`writer/datetime.rs:62-82`).
 - **L4** dedup `ROW_NUMBER … ORDER BY key` keeps an arbitrary duplicate (order by version DESC).
