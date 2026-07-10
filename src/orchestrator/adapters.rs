@@ -313,3 +313,214 @@ impl DeltaWrite for LocalDeltaWriterAdapter {
             .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchestrator::test_support::make_config;
+    use deltalake::arrow::array::{Int64Array, StringArray};
+    use deltalake::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use deltalake::arrow::record_batch::RecordBatch;
+
+    fn make_schema() -> SchemaRef {
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]))
+    }
+
+    fn make_batch(schema: SchemaRef, ids: Vec<i64>, values: Vec<&str>) -> RecordBatch {
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(values)),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// O6: exercises the full `LocalDeltaWriterAdapter` surface end-to-end against a real
+    /// local Delta table (no network), including both `get_schema_impl` branches — an
+    /// existing table (`Ok(Some(..))`) and a genuinely missing one (`Ok(None)`).
+    #[tokio::test]
+    async fn local_delta_writer_adapter_full_lifecycle() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = make_config(vec![]);
+        let adapter = LocalDeltaWriterAdapter::new(temp.path(), &config);
+        let schema = make_schema();
+
+        adapter.ensure_table("t", schema.clone()).await.unwrap();
+
+        let existing_schema = adapter.get_schema("t").await.unwrap();
+        assert!(existing_schema.is_some());
+
+        let missing_schema = adapter.get_schema("does_not_exist").await.unwrap();
+        assert!(missing_schema.is_none());
+
+        let hwm = Hwm {
+            updated_at: "2024-01-01 00:00:00".to_string(),
+            last_id: 1,
+        };
+        adapter
+            .append_batch(
+                "t",
+                vec![make_batch(schema.clone(), vec![1, 2], vec!["a", "b"])],
+                Some(hwm),
+            )
+            .await
+            .unwrap();
+
+        let read_back = adapter.read_hwm("t").await.unwrap();
+        assert_eq!(read_back.map(|h| h.last_id), Some(1));
+
+        adapter
+            .merge_batch(
+                "t",
+                vec![make_batch(schema.clone(), vec![1, 3], vec!["A", "c"])],
+                "id".to_string(),
+                Some(3),
+                None,
+            )
+            .await
+            .unwrap();
+
+        adapter
+            .delete_then_append(
+                "t",
+                vec![make_batch(schema.clone(), vec![2], vec!["B"])],
+                "id".to_string(),
+                Some(4),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let hwm2 = Hwm {
+            updated_at: "2024-01-02 00:00:00".to_string(),
+            last_id: 4,
+        };
+        adapter
+            .append_two_stream(
+                "t",
+                vec![make_batch(schema.clone(), vec![5], vec!["e"])],
+                Some(5),
+                Some(hwm2),
+            )
+            .await
+            .unwrap();
+
+        let insert_hwm = adapter.read_insert_hwm("t").await.unwrap();
+        assert_eq!(insert_hwm, Some(5));
+
+        adapter
+            .overwrite_table(
+                "t",
+                vec![make_batch(schema.clone(), vec![9], vec!["z"])],
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// O6: `DeltaWriterAdapter` (S3-backed) delegates to the same `DeltaWriter` used by
+    /// `LocalDeltaWriterAdapter`. Pointing at an unroutable endpoint (mirrors the
+    /// `ensure_table_s3_connection_error` / `read_hwm_s3_error_propagates` pattern in
+    /// `writer.rs`) exercises every delegation without needing real S3 infrastructure: the
+    /// empty-batch calls short-circuit to `Ok(())` before touching the network, and the
+    /// others fail fast with a connection error (including the `get_schema` "not a missing
+    /// table" context-wrapping branch).
+    #[tokio::test]
+    async fn delta_writer_adapter_propagates_s3_connection_errors() {
+        let mut config = make_config(vec![]);
+        config.s3_endpoint = Some("http://localhost:1".to_string());
+        config.s3_bucket = "nonexistent-bucket".to_string();
+        let adapter = DeltaWriterAdapter::new(&config);
+        let schema = make_schema();
+
+        assert!(adapter.ensure_table("t", schema.clone()).await.is_err());
+        assert!(adapter.append_batch("t", vec![], None).await.is_ok());
+        assert!(adapter.overwrite_table("t", vec![], None).await.is_ok());
+        assert!(adapter.read_hwm("t").await.is_err());
+        assert!(adapter.get_schema("t").await.is_err());
+        assert!(
+            adapter
+                .merge_batch("t", vec![], "id".to_string(), None, None)
+                .await
+                .is_ok()
+        );
+        assert!(
+            adapter
+                .delete_then_append("t", vec![], "id".to_string(), None, None)
+                .await
+                .is_ok()
+        );
+        assert!(adapter.read_insert_hwm("t").await.is_err());
+        assert!(
+            adapter
+                .append_two_stream("t", vec![], None, None)
+                .await
+                .is_ok()
+        );
+    }
+
+    /// O6: `SchemaInspectorAdapter` is a thin delegation to `discovery::SchemaInspector`.
+    /// A lazy pool pointed at an unroutable address, with a short `acquire_timeout`, fails
+    /// fast on first use (sqlx's default 30s acquire timeout would otherwise make each of
+    /// the 4 calls below take up to 30s), exercising every delegation without a real MySQL
+    /// server.
+    #[tokio::test]
+    async fn schema_inspector_adapter_propagates_connection_errors() {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("mysql://user:pass@127.0.0.1:1/testdb")
+            .unwrap();
+        let adapter = SchemaInspectorAdapter::new(pool, "testdb".to_string());
+
+        assert!(adapter.discover_columns("orders").await.is_err());
+        assert!(adapter.discover_indexes("orders").await.is_err());
+        assert!(adapter.get_avg_row_length("orders").await.is_err());
+        assert!(adapter.max_timestamp("orders", "updated_at").await.is_err());
+    }
+
+    /// O6: `calculate_batch_size`/`batch_size` are pure delegations; `extract` fails before
+    /// any network I/O when the configured URL doesn't even parse.
+    #[test]
+    fn extractor_adapter_delegates_to_batch_extractor() {
+        let mut config = make_config(vec![]);
+        config.database_url = "not-a-valid-database-url".to_string();
+        let mut adapter = ExtractorAdapter::new(&config);
+
+        let size = adapter.calculate_batch_size(Some(1024));
+        assert!(size > 0);
+        assert_eq!(adapter.batch_size(), size);
+        assert!(adapter.extract("SELECT 1").is_err());
+    }
+
+    /// O6: `StateManageAdapter` delegates to `AppState`, backed by a real state file on
+    /// disk (no network involved at all).
+    #[test]
+    fn state_manage_adapter_load_and_update_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.json");
+        let mut adapter = StateManageAdapter::new();
+
+        let initial = adapter.load_or_default(&path);
+        assert!(initial.tables.is_empty());
+
+        let table_state = TableState {
+            last_run_at: Some("2024-01-01T00:00:00Z".to_string()),
+            last_run_status: Some("success".to_string()),
+            last_run_rows: Some(10),
+            last_run_duration_ms: Some(5),
+            extraction_mode: Some("full".to_string()),
+            schema_columns_hash: Some("abc".to_string()),
+        };
+        adapter
+            .update_table("orders", table_state, &path)
+            .unwrap();
+
+        let reloaded = adapter.load_or_default(&path);
+        assert!(reloaded.tables.contains_key("orders"));
+    }
+}

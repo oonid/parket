@@ -632,4 +632,169 @@ mod tests {
             Some(&vec![Some("c".to_string()), Some("30".to_string())])
         );
     }
+
+    #[tokio::test]
+    async fn delta_probe_max_cursor_real() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = std::sync::Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("qty", DataType::Int64, false),
+        ]));
+        writer.ensure_table("orders", schema.clone()).await.unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(Int64Array::from(vec![1i64, 2i64, 3i64])),
+                std::sync::Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
+                std::sync::Arc::new(Int64Array::from(vec![10i64, 20i64, 30i64])),
+            ],
+        )
+        .unwrap();
+        writer
+            .append_batch("orders", vec![batch], None)
+            .await
+            .unwrap();
+
+        let probe = DeltaProbeAdapter::new(writer);
+        let max_qty = probe.max_cursor("orders", "qty").await.unwrap();
+        assert_eq!(max_qty, Some("30".to_string()));
+    }
+
+    #[tokio::test]
+    async fn delta_probe_latest_key_stats_real() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = std::sync::Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("qty", DataType::Int64, false),
+        ]));
+        writer.ensure_table("orders", schema.clone()).await.unwrap();
+        // id=1 appears twice (qty=10 then qty=15, the later row wins by cursor `qty` DESC).
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(Int64Array::from(vec![1i64, 2i64, 1i64])),
+                std::sync::Arc::new(StringArray::from(vec![Some("a"), Some("b"), Some("a2")])),
+                std::sync::Arc::new(Int64Array::from(vec![10i64, 20i64, 15i64])),
+            ],
+        )
+        .unwrap();
+        writer
+            .append_batch("orders", vec![batch], None)
+            .await
+            .unwrap();
+
+        let probe = DeltaProbeAdapter::new(writer);
+        let ks = probe
+            .latest_key_stats("orders", "id", "qty")
+            .await
+            .unwrap();
+        assert_eq!(ks.count, 2);
+        assert_eq!(ks.distinct, 2);
+        assert_eq!(ks.min, Some(1));
+        assert_eq!(ks.max, Some(2));
+        assert_eq!(ks.xor, 3); // 1 ^ 2
+        assert_eq!(ks.distinct_xor, 3);
+    }
+
+    #[tokio::test]
+    async fn delta_probe_value_aggregates_real() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = std::sync::Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("qty", DataType::Int64, false),
+        ]));
+        writer.ensure_table("orders", schema.clone()).await.unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(Int64Array::from(vec![1i64, 2i64, 3i64])),
+                std::sync::Arc::new(Int64Array::from(vec![10i64, 20i64, 30i64])),
+            ],
+        )
+        .unwrap();
+        writer
+            .append_batch("orders", vec![batch], None)
+            .await
+            .unwrap();
+
+        let probe = DeltaProbeAdapter::new(writer);
+        let columns = vec![ColumnAgg {
+            name: "qty".to_string(),
+            kind: AggKind::Integer,
+        }];
+        let result = probe.value_aggregates("orders", &columns).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].sum, Some("60".to_string()));
+        assert_eq!(result[0].min, Some("10".to_string()));
+        assert_eq!(result[0].max, Some("30".to_string()));
+        assert_eq!(result[0].non_null_count, 3);
+
+        // Empty column list short-circuits without touching the table.
+        let empty = probe.value_aggregates("orders", &[]).await.unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delta_probe_value_aggregates_latest_real() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = std::sync::Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Utf8, false),
+            Field::new("qty", DataType::Int64, false),
+        ]));
+        writer.ensure_table("orders", schema.clone()).await.unwrap();
+        // id=1 has two versions: ts=2024-01-01 (qty=10) and ts=2024-01-03 (qty=15, latest).
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(Int64Array::from(vec![1i64, 2i64, 1i64])),
+                std::sync::Arc::new(StringArray::from(vec![
+                    "2024-01-01",
+                    "2024-01-02",
+                    "2024-01-03",
+                ])),
+                std::sync::Arc::new(Int64Array::from(vec![10i64, 20i64, 15i64])),
+            ],
+        )
+        .unwrap();
+        writer
+            .append_batch("orders", vec![batch], None)
+            .await
+            .unwrap();
+
+        let probe = DeltaProbeAdapter::new(writer);
+        let scope = crate::verify::SourceScope {
+            cursor_col: "ts".to_string(),
+            updated_at: "2024-01-03".to_string(),
+            last_id: 1,
+            key_col: "id".to_string(),
+        };
+        let columns = vec![ColumnAgg {
+            name: "qty".to_string(),
+            kind: AggKind::Integer,
+        }];
+        let result = probe
+            .value_aggregates_latest("orders", &columns, "ts", &scope)
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        // Latest-per-key rows are id=1 (qty=15) and id=2 (qty=20).
+        assert_eq!(result[0].sum, Some("35".to_string()));
+        assert_eq!(result[0].min, Some("15".to_string()));
+        assert_eq!(result[0].max, Some("20".to_string()));
+        assert_eq!(result[0].non_null_count, 2);
+
+        // Empty column list short-circuits without touching the table.
+        let empty = probe
+            .value_aggregates_latest("orders", &[], "ts", &scope)
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+    }
 }
