@@ -428,13 +428,14 @@ impl DeltaProbe for DeltaProbeAdapter {
         ctx.register_table("t", t.table_provider().await?)?;
         let ua = scope.updated_at.replace('\'', "''");
         let lid = scope.last_id;
+        let key = &scope.key_col;
         let col_list = columns
             .iter()
             .map(|c| format!("`{}`", c.name))
             .collect::<Vec<_>>()
             .join(", ");
         let cte = format!(
-            "WITH ranked AS (SELECT {col_list}, row_number() OVER (PARTITION BY cast(`id` as bigint) ORDER BY `{cursor_col}` DESC) AS rn FROM t WHERE (`{cursor_col}` < '{ua}') OR (`{cursor_col}` = '{ua}' AND cast(`id` as bigint) <= {lid})) "
+            "WITH ranked AS (SELECT {col_list}, row_number() OVER (PARTITION BY cast(`{key}` as bigint) ORDER BY `{cursor_col}` DESC) AS rn FROM t WHERE (`{cursor_col}` < '{ua}') OR (`{cursor_col}` = '{ua}' AND cast(`{key}` as bigint) <= {lid})) "
         );
         let select_list = columns
             .iter()

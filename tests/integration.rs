@@ -1316,3 +1316,102 @@ async fn bigint_unsigned_beyond_i64_fails_actionably() {
         .value(0);
     assert_eq!(n, 0, "the failed table must contain no partial/corrupt rows");
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn verify_key_set_works_with_non_id_primary_key() {
+    // V3: a table keyed by something other than a literal `id` column must still get a
+    // real key-set verdict from `--verify`, not a silent Skipped-as-Clean. `code_id` is
+    // the table's single-column integer PRIMARY key; there is no `id` column at all.
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let env = TestEnv::new(vec!["keyed_by_code"]).await;
+
+    sqlx::query(
+        "CREATE TABLE keyed_by_code (            code_id BIGINT PRIMARY KEY,             amount INT NOT NULL        )",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create keyed_by_code table");
+
+    sqlx::query(
+        "INSERT INTO keyed_by_code (code_id, amount) VALUES (100, 10), (200, 20), (300, 30)",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert keyed_by_code rows");
+
+    // No TABLE_MODE configured for this table and no timestamp column present ⇒ auto-detect
+    // resolves full_refresh.
+    let mut orchestrator = env.make_orchestrator();
+    let exit_code = orchestrator.run().await;
+    assert!(
+        matches!(exit_code, ExitCode::Success),
+        "expected Success exit code, got {exit_code:?}"
+    );
+
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let verdict = VerifyCommand::new(source, delta, vec!["keyed_by_code".to_string()])
+        .with_table_plans(vec![TablePlan {
+            table: "keyed_by_code".to_string(),
+            mode: VerifyMode::Basic,
+        }])
+        .with_deep(true)
+        .run()
+        .await
+        .expect("verify should succeed against a non-id-keyed table");
+
+    assert_eq!(
+        verdict,
+        VerifyVerdict::Clean,
+        "a genuinely-synced non-id-keyed table must verify Clean, not Skipped-as-Clean by \
+         accident — the assertion that matters is the corruption check below actually \
+         flipping this to Discrepancy"
+    );
+
+    // Corrupt one source value directly, without re-running the pipeline, so the ONLY way
+    // verify can catch it is by actually running the key-set/value machinery against
+    // `code_id` — proving the fix, not just that Skipped happens to report Clean.
+    sqlx::query("UPDATE keyed_by_code SET amount = amount + 1 WHERE code_id = 200")
+        .execute(&env.pool)
+        .await
+        .expect("failed to corrupt keyed_by_code row directly");
+
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let verdict_after_corruption =
+        VerifyCommand::new(source, delta, vec!["keyed_by_code".to_string()])
+            .with_table_plans(vec![TablePlan {
+                table: "keyed_by_code".to_string(),
+                mode: VerifyMode::Basic,
+            }])
+            .with_deep(true)
+            .run()
+            .await
+            .expect("verify should succeed after corruption");
+
+    assert_eq!(
+        verdict_after_corruption,
+        VerifyVerdict::Discrepancy,
+        "post-corruption verify must catch the drift via the non-id key, proving the \
+         machinery genuinely ran against `code_id` rather than being Skipped"
+    );
+}

@@ -51,6 +51,10 @@ pub struct SourceScope {
     pub cursor_col: String,
     pub updated_at: String,
     pub last_id: i64,
+    /// The resolved key column used for the tie-break predicate and the latest-per-key
+    /// window (V3): the table's discovered single-column integer PRIMARY key, or the `id`
+    /// fallback — never a literal `"id"` baked into the SQL.
+    pub key_col: String,
 }
 
 impl TablePlan {
@@ -316,6 +320,9 @@ pub trait SourceProbe: Send + Sync {
     async fn row_count_scoped(&self, table: &str, scope: &SourceScope) -> Result<i64>;
     async fn max_cursor(&self, table: &str, cursor_col: &str) -> Result<Option<String>>;
     async fn columns(&self, table: &str) -> Result<Vec<ColumnMeta>>;
+    /// V3: the table's single-column integer PRIMARY key, if it has one — used to derive
+    /// the key-set verdict's key column instead of requiring a column literally named `id`.
+    async fn integer_pk(&self, table: &str) -> Result<Option<String>>;
     async fn key_stats(&self, table: &str, key_col: &str) -> Result<KeyStats>;
     async fn key_stats_scoped(
         &self,
@@ -605,16 +612,33 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                     "verify {table} freshness: cursor={cursor} source_max={source_max:?} delta_max={delta_max:?}"
                 );
             }
-            let has_id = scols.iter().any(|c| c.name == "id");
+            // V3: resolve the real key column instead of requiring one literally named
+            // `id`. Two-stream mode's insert_cursor IS the config-declared intent (matches
+            // pipeline semantics) so it's used directly without probing. Every other mode
+            // asks the source for the table's single-column integer PRIMARY key, falling
+            // back to an `id` column (if present) to preserve pre-V3 behavior for
+            // id-keyed tables that have no declared PK.
+            let key_col: Option<String> = match &plan.mode {
+                VerifyMode::TwoStream { insert_cursor, .. } => Some(insert_cursor.clone()),
+                _ => match self.source.integer_pk(table).await? {
+                    Some(key) => Some(key),
+                    None => scols.iter().find(|c| c.name == "id").map(|c| c.name.clone()),
+                },
+            };
+            let has_key = key_col.is_some();
 
-            let incremental_scope = match &plan.mode {
-                VerifyMode::Incremental {
-                    cursor_col,
-                    hwm: Some(hwm),
-                } => Some(SourceScope {
+            let incremental_scope = match (&plan.mode, key_col.as_ref()) {
+                (
+                    VerifyMode::Incremental {
+                        cursor_col,
+                        hwm: Some(hwm),
+                    },
+                    Some(key),
+                ) => Some(SourceScope {
                     cursor_col: cursor_col.clone(),
                     updated_at: hwm.updated_at.clone(),
                     last_id: hwm.last_id,
+                    key_col: key.clone(),
                 }),
                 _ => None,
             };
@@ -633,7 +657,7 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
             let src_row_count;
             let delta_physical_row_count;
             let delta_label;
-            if let Some(scope) = incremental_scope.as_ref().filter(|_| has_id) {
+            if let Some(scope) = incremental_scope.as_ref().filter(|_| has_key) {
                 src_row_count = self.source.row_count_scoped(table, scope).await?;
                 delta_physical_row_count = self.delta.row_count(table).await?;
                 delta_label = "delta_latest";
@@ -673,21 +697,23 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                         cap = self.row_cap
                     ),
                 }
-            } else if !has_id {
+            } else if !has_key {
                 TableOutcome::Skipped {
-                    reason: "no `id` column for key-set verdict".to_string(),
+                    reason: "no single-column integer PRIMARY key (or `id` column) for key-set verdict".to_string(),
                 }
             } else if let Some(scope) = incremental_scope.as_ref() {
-                let s = self.source.key_stats_scoped(table, "id", scope).await?;
+                let key = key_col.as_deref().unwrap();
+                let s = self.source.key_stats_scoped(table, key, scope).await?;
                 let d = self
                     .delta
-                    .latest_key_stats(table, "id", &scope.cursor_col)
+                    .latest_key_stats(table, key, &scope.cursor_col)
                     .await?;
                 delta_keystats = Some(d.clone());
                 Self::key_stats_outcome("source_scoped", "delta_latest", &s, &d)
             } else {
-                let s = self.source.key_stats(table, "id").await?;
-                let d = self.delta.key_stats(table, "id").await?;
+                let key = key_col.as_deref().unwrap();
+                let s = self.source.key_stats(table, key).await?;
+                let d = self.delta.key_stats(table, key).await?;
                 delta_keystats = Some(d.clone());
                 if matches!(&plan.mode, VerifyMode::TwoStream { .. }) {
                     Self::two_stream_key_stats_outcome("source", delta_label, &s, &d)
@@ -704,7 +730,10 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
             if matches!(outcome, TableOutcome::Pass) {
                 let specs: Vec<ColumnAgg> = scols
                     .iter()
-                    .filter(|c| dnames.contains(c.name.as_str()) && c.name != "id")
+                    .filter(|c| {
+                        dnames.contains(c.name.as_str())
+                            && Some(c.name.as_str()) != key_col.as_deref()
+                    })
                     .filter_map(|c| {
                         agg_kind(&c.type_str).map(|k| {
                             // VA2: decimals aggregate at the column's own NATIVE scale
@@ -833,25 +862,26 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                             }
                         }
 
+                        let key = key_col.as_deref().unwrap();
                         let comparable: Vec<String> = scols
                             .iter()
                             .filter(|c| {
                                 dnames.contains(c.name.as_str())
                                     && is_value_comparable(&c.type_str)
-                                    && c.name != "id"
+                                    && c.name != key
                             })
                             .map(|c| c.name.clone())
                             .collect();
                         if !comparable.is_empty() {
-                            let ids = self.source.sample_ids(table, "id", SAMPLE_SIZE).await?;
+                            let ids = self.source.sample_ids(table, key, SAMPLE_SIZE).await?;
                             if !ids.is_empty() {
                                 let srows = self
                                     .source
-                                    .sample_rows(table, "id", &comparable, &ids)
+                                    .sample_rows(table, key, &comparable, &ids)
                                     .await?;
                                 let drows = self
                                     .delta
-                                    .sample_rows(table, "id", &comparable, &ids)
+                                    .sample_rows(table, key, &comparable, &ids)
                                     .await?;
                                 let mut matched = 0;
                                 let mut missing = 0;
@@ -981,6 +1011,7 @@ mod tests {
     async fn verify_reports_counts_for_each_table() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         source.expect_row_count().returning(|_| Ok(100));
         delta.expect_row_count().returning(|_| Ok(100));
         let cols = || {
@@ -1050,6 +1081,7 @@ mod tests {
     async fn verify_basic_mode_does_not_probe_freshness() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         source.expect_row_count().returning(|_| Ok(2));
         delta.expect_row_count().returning(|_| Ok(2));
         let cols = || {
@@ -1098,6 +1130,7 @@ mod tests {
     async fn verify_reports_schema_diff() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         source.expect_row_count().returning(|_| Ok(0));
         delta.expect_row_count().returning(|_| Ok(0));
         source.expect_columns().returning(|_| {
@@ -1170,6 +1203,7 @@ mod tests {
     async fn verify_reports_key_set() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         source.expect_row_count().returning(|_| Ok(3));
         delta.expect_row_count().returning(|_| Ok(3));
         let cols = || {
@@ -1218,6 +1252,7 @@ mod tests {
     async fn verify_verdict_pass() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         source.expect_row_count().returning(|_| Ok(5));
         delta.expect_row_count().returning(|_| Ok(5));
         let cols = || {
@@ -1266,6 +1301,7 @@ mod tests {
     async fn verify_verdict_drift_on_new_ids() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         source.expect_row_count().returning(|_| Ok(10));
         delta.expect_row_count().returning(|_| Ok(5));
         let cols = || {
@@ -1311,6 +1347,7 @@ mod tests {
     async fn verify_verdict_discrepancy_extra_delta_ids() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         source.expect_row_count().returning(|_| Ok(5));
         delta.expect_row_count().returning(|_| Ok(5));
         let cols = || {
@@ -1355,6 +1392,7 @@ mod tests {
     async fn verify_verdict_distinct_fallback() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         source.expect_row_count().returning(|_| Ok(3));
         delta.expect_row_count().returning(|_| Ok(5));
         let cols = || {
@@ -1413,6 +1451,7 @@ mod tests {
     async fn verify_census_sample_skipped_on_appendlog() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         source.expect_row_count().returning(|_| Ok(3));
         delta.expect_row_count().returning(|_| Ok(5));
         let cols = || {
@@ -1720,6 +1759,7 @@ mod tests {
     async fn verify_verdict_size_skip() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         source.expect_row_count().returning(|_| Ok(5_000_000));
         delta.expect_row_count().returning(|_| Ok(4_000_000));
         let cols = || {
@@ -1743,6 +1783,7 @@ mod tests {
     async fn verify_verdict_missing_column_fails() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         source.expect_row_count().returning(|_| Ok(100));
         delta.expect_row_count().returning(|_| Ok(100));
         source.expect_columns().returning(|_| {
@@ -1779,6 +1820,7 @@ mod tests {
     async fn verify_census_match() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         source.expect_row_count().returning(|_| Ok(10));
         delta.expect_row_count().returning(|_| Ok(10));
         let cols = || {
@@ -1835,6 +1877,7 @@ mod tests {
     async fn verify_census_differs_is_non_failing() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         source.expect_row_count().returning(|_| Ok(10));
         delta.expect_row_count().returning(|_| Ok(10));
         let cols = || {
@@ -1892,6 +1935,7 @@ mod tests {
     async fn verify_sample_match() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         source.expect_row_count().returning(|_| Ok(10));
         delta.expect_row_count().returning(|_| Ok(10));
         let cols = || {
@@ -1961,6 +2005,7 @@ mod tests {
     async fn verify_sample_differs_non_failing() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         source.expect_row_count().returning(|_| Ok(10));
         delta.expect_row_count().returning(|_| Ok(10));
         let cols = || {
@@ -2034,6 +2079,7 @@ mod tests {
     async fn verify_incremental_hwm_scoped_latest_pass() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         delta.expect_row_count().returning(|_| Ok(2));
         let cols = || {
             Ok(vec![
@@ -2127,6 +2173,7 @@ mod tests {
     async fn verify_incremental_hwm_scoped_latest_discrepancy() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         delta.expect_row_count().returning(|_| Ok(2));
         let cols = || {
             Ok(vec![
@@ -2203,6 +2250,7 @@ mod tests {
     async fn verify_incremental_hwm_without_id_skips_key_set() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         let cols = || {
             Ok(vec![ColumnMeta {
                 name: "updated_at".to_string(),
@@ -2243,6 +2291,7 @@ mod tests {
     async fn verify_incremental_without_hwm_uses_raw_path() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         source.expect_row_count().returning(|_| Ok(5));
         delta.expect_row_count().returning(|_| Ok(5));
         let cols = || {
@@ -2350,6 +2399,7 @@ mod tests {
     async fn verify_value_aggregates_match_stays_pass() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         source.expect_row_count().returning(|_| Ok(3));
         delta.expect_row_count().returning(|_| Ok(3));
         let cols = || {
@@ -2407,6 +2457,7 @@ mod tests {
     async fn verify_value_aggregates_mismatch_downgrades_to_discrepancy() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         source.expect_row_count().returning(|_| Ok(3));
         delta.expect_row_count().returning(|_| Ok(3));
         let cols = || {
@@ -2465,6 +2516,7 @@ mod tests {
     async fn verify_incremental_scoped_value_match_stays_pass() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         delta.expect_row_count().returning(|_| Ok(2));
         let cols = || {
             Ok(vec![
@@ -2544,6 +2596,7 @@ mod tests {
     async fn verify_incremental_scoped_value_mismatch_downgrades() {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         delta.expect_row_count().returning(|_| Ok(2));
         let cols = || {
             Ok(vec![
@@ -2705,6 +2758,7 @@ mod tests {
         // the rest of the run intact (previously the whole run aborted with Err).
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
         source
             .expect_row_count()
             .withf(|t| t == "bad")
@@ -2758,5 +2812,263 @@ mod tests {
             VerifyVerdict::Clean,
             "bad → Skipped, good → Pass ⇒ Clean overall"
         );
+    }
+
+    // --- V3: key resolution beyond a literal `id` column --------------------------------
+
+    #[tokio::test]
+    async fn verify_non_id_integer_pk_drives_key_stats() {
+        // A table keyed by `order_id` (no `id` column at all) must still get a real
+        // key-set verdict instead of being Skipped-as-Clean (V3's false-confidence trap).
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        source.expect_row_count().returning(|_| Ok(3));
+        delta.expect_row_count().returning(|_| Ok(3));
+        let cols = || {
+            Ok(vec![ColumnMeta {
+                name: "order_id".to_string(),
+                type_str: "bigint".to_string(),
+                nullable: false,
+                numeric_scale: None,
+            }])
+        };
+        source.expect_columns().returning(move |_| cols());
+        delta.expect_columns().returning(move |_| cols());
+        source
+            .expect_integer_pk()
+            .returning(|_| Ok(Some("order_id".to_string())));
+        let stats = || {
+            Ok(KeyStats {
+                count: 3,
+                distinct: 3,
+                min: Some(1),
+                max: Some(3),
+                xor: 1,
+                distinct_xor: 1,
+                sum: 6,
+            })
+        };
+        source
+            .expect_key_stats()
+            .withf(|_, key_col| key_col == "order_id")
+            .returning(move |_, _| stats());
+        delta
+            .expect_key_stats()
+            .withf(|_, key_col| key_col == "order_id")
+            .returning(move |_, _| stats());
+        source
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        delta
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
+        source
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec![]));
+        delta
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec![]));
+        let plan = TablePlan::basic("orders");
+        let cmd = VerifyCommand::new(source, delta, vec!["orders".to_string()]);
+        let outcome = cmd.run_one_table("orders", &plan).await.unwrap();
+        assert_eq!(outcome, TableOutcome::Pass);
+    }
+
+    #[tokio::test]
+    async fn verify_no_pk_and_no_id_column_is_skipped_with_honest_reason() {
+        // No discovered integer PK and no `id` column: this must still Skip (there's no
+        // fair key to compare), but the reason must name the real gap instead of
+        // hardcoding "no `id` column" — a table that legitimately has no usable key
+        // shouldn't read as if `id` were the only thing considered.
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        source.expect_row_count().returning(|_| Ok(3));
+        delta.expect_row_count().returning(|_| Ok(3));
+        let cols = || {
+            Ok(vec![ColumnMeta {
+                name: "note".to_string(),
+                type_str: "varchar".to_string(),
+                nullable: true,
+                numeric_scale: None,
+            }])
+        };
+        source.expect_columns().returning(move |_| cols());
+        delta.expect_columns().returning(move |_| cols());
+        source.expect_integer_pk().returning(|_| Ok(None));
+        let plan = TablePlan::basic("events");
+        let cmd = VerifyCommand::new(source, delta, vec!["events".to_string()]);
+        let outcome = cmd.run_one_table("events", &plan).await.unwrap();
+        match outcome {
+            TableOutcome::Skipped { reason } => {
+                assert!(
+                    reason.contains("no single-column integer PRIMARY key (or `id` column)"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_two_stream_key_is_insert_cursor_without_probing() {
+        // Two-stream mode's key is the config-declared insert_cursor (pipeline intent),
+        // not a probed PRIMARY key — integer_pk must NOT be called at all (no expectation
+        // is registered for it below; mockall panics on an unexpected call, which is
+        // exactly the assertion here).
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        source.expect_row_count().returning(|_| Ok(3));
+        delta.expect_row_count().returning(|_| Ok(3));
+        let cols = || {
+            Ok(vec![ColumnMeta {
+                name: "order_id".to_string(),
+                type_str: "bigint".to_string(),
+                nullable: false,
+                numeric_scale: None,
+            }])
+        };
+        source.expect_columns().returning(move |_| cols());
+        delta.expect_columns().returning(move |_| cols());
+        source
+            .expect_max_cursor()
+            .returning(|_, _| Ok(Some("2026-06-30 12:00:00".to_string())));
+        delta
+            .expect_max_cursor()
+            .returning(|_, _| Ok(Some("2026-06-30T12:00:00.000000".to_string())));
+        let stats = || {
+            Ok(KeyStats {
+                count: 3,
+                distinct: 3,
+                min: Some(1),
+                max: Some(3),
+                xor: 1,
+                distinct_xor: 1,
+                sum: 6,
+            })
+        };
+        source
+            .expect_key_stats()
+            .withf(|_, key_col| key_col == "order_id")
+            .returning(move |_, _| stats());
+        delta
+            .expect_key_stats()
+            .withf(|_, key_col| key_col == "order_id")
+            .returning(move |_, _| stats());
+        source
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        delta
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![0i64; cols.len()]));
+        source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
+        source
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec![]));
+        delta
+            .expect_value_aggregates()
+            .returning(|_, _| Ok(vec![]));
+        let plan = TablePlan {
+            table: "orders".to_string(),
+            mode: VerifyMode::TwoStream {
+                insert_cursor: "order_id".to_string(),
+                update_cursor: "updated_at".to_string(),
+                update_hwm: None,
+                insert_hwm: Some(3),
+            },
+        };
+        let cmd = VerifyCommand::new(source, delta, vec!["orders".to_string()]);
+        let outcome = cmd.run_one_table("orders", &plan).await.unwrap();
+        assert_eq!(outcome, TableOutcome::Pass);
+    }
+
+    #[tokio::test]
+    async fn verify_incremental_scoped_uses_resolved_non_id_key() {
+        // The incremental-scoped path (SourceScope.key_col threading) must also use the
+        // resolved non-id key end to end: row_count_scoped, key_stats_scoped, and
+        // latest_key_stats all see `order_id`, not a literal `id`.
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        delta.expect_row_count().returning(|_| Ok(2));
+        let cols = || {
+            Ok(vec![
+                ColumnMeta {
+                    name: "order_id".to_string(),
+                    type_str: "bigint".to_string(),
+                    nullable: false,
+                    numeric_scale: None,
+                },
+                ColumnMeta {
+                    name: "updated_at".to_string(),
+                    type_str: "timestamp".to_string(),
+                    nullable: false,
+                    numeric_scale: None,
+                },
+            ])
+        };
+        source.expect_columns().returning(move |_| cols());
+        delta.expect_columns().returning(move |_| cols());
+        source
+            .expect_max_cursor()
+            .returning(|_, _| Ok(Some("2026-06-30 12:00:00".to_string())));
+        delta
+            .expect_max_cursor()
+            .returning(|_, _| Ok(Some("2026-06-30T12:00:00.000000".to_string())));
+        source
+            .expect_integer_pk()
+            .returning(|_| Ok(Some("order_id".to_string())));
+        source.expect_row_count_scoped().returning(|_, scope| {
+            assert_eq!(scope.key_col, "order_id");
+            Ok(2)
+        });
+        source
+            .expect_key_stats_scoped()
+            .returning(|_, key_col, scope| {
+                assert_eq!(key_col, "order_id");
+                assert_eq!(scope.key_col, "order_id");
+                Ok(KeyStats {
+                    count: 2,
+                    distinct: 2,
+                    min: Some(43),
+                    max: Some(44),
+                    xor: 7,
+                    distinct_xor: 7,
+                    sum: 87,
+                })
+            });
+        delta
+            .expect_latest_key_stats()
+            .returning(|_, key_col, cursor_col| {
+                assert_eq!(key_col, "order_id");
+                assert_eq!(cursor_col, "updated_at");
+                Ok(KeyStats {
+                    count: 2,
+                    distinct: 2,
+                    min: Some(43),
+                    max: Some(44),
+                    xor: 7,
+                    distinct_xor: 7,
+                    sum: 87,
+                })
+            });
+        source
+            .expect_value_aggregates_scoped()
+            .returning(|_, _, _| Ok(vec![]));
+        delta
+            .expect_value_aggregates_latest()
+            .returning(|_, _, _, _| Ok(vec![]));
+        let plan = TablePlan {
+            table: "orders".to_string(),
+            mode: VerifyMode::Incremental {
+                cursor_col: "updated_at".to_string(),
+                hwm: Some(Hwm {
+                    updated_at: "2026-06-30 12:00:00".to_string(),
+                    last_id: 42,
+                }),
+            },
+        };
+        let cmd = VerifyCommand::new(source, delta, vec!["orders".to_string()]);
+        let outcome = cmd.run_one_table("orders", &plan).await.unwrap();
+        assert_eq!(outcome, TableOutcome::Pass);
     }
 }

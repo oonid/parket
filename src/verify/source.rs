@@ -6,8 +6,9 @@ use super::{AggKind, ColumnAgg, ColumnAggValues, ColumnMeta, KeyStats, SourcePro
 
 fn scope_predicate_sql(scope: &SourceScope) -> String {
     format!(
-        "(`{cursor}` < ?) OR (`{cursor}` = ? AND CAST(`id` AS SIGNED) <= ?)",
+        "(`{cursor}` < ?) OR (`{cursor}` = ? AND CAST(`{key}` AS SIGNED) <= ?)",
         cursor = scope.cursor_col,
+        key = scope.key_col,
     )
 }
 
@@ -78,6 +79,33 @@ impl SourceProbe for SourceProbeAdapter {
                 numeric_scale: numeric_scale.and_then(|s| u32::try_from(s).ok()),
             })
             .collect())
+    }
+
+    /// V3: mirrors `select_integer_pk` in `orchestrator/full_refresh.rs` — exactly one
+    /// column in the PRIMARY key, and that column is an integer type. Deliberately avoids
+    /// selecting any numeric information_schema column (SEQ_IN_INDEX etc. are BIGINT
+    /// UNSIGNED and need a CAST to decode via sqlx — simplest to just not select them).
+    async fn integer_pk(&self, table: &str) -> Result<Option<String>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT s.COLUMN_NAME, c.DATA_TYPE FROM information_schema.statistics s \
+             JOIN information_schema.columns c \
+               ON c.TABLE_SCHEMA = s.TABLE_SCHEMA AND c.TABLE_NAME = s.TABLE_NAME AND c.COLUMN_NAME = s.COLUMN_NAME \
+             WHERE s.TABLE_SCHEMA = DATABASE() AND s.TABLE_NAME = ? AND s.INDEX_NAME = 'PRIMARY'",
+        )
+        .bind(table)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("source integer_pk lookup for `{table}`"))?;
+        if rows.len() != 1 {
+            // No PRIMARY key, or a composite one — neither is a usable single-column key.
+            return Ok(None);
+        }
+        let (key_col, data_type) = &rows[0];
+        let is_integer = matches!(
+            data_type.to_ascii_lowercase().as_str(),
+            "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint"
+        );
+        Ok(is_integer.then(|| key_col.clone()))
     }
 
     async fn key_stats(&self, table: &str, key_col: &str) -> Result<KeyStats> {
