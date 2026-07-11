@@ -112,7 +112,29 @@ impl BatchExtractor {
                 break;
             }
 
-            window_bytes += batch_bytes;
+            // H-2026-07-11-2: unsigned columns are widened AFTER extraction by
+            // align_batch_to_schema (UInt8→Int16, UInt16→Int32, UInt32→Int64 — each
+            // doubles that column's buffer; UInt64→Int64 is width-neutral). The breaker
+            // must budget for the POST-alignment window, so UInt8/16/32 column buffers
+            // are counted twice here — otherwise an unsigned-heavy window admitted at
+            // just under the ceiling could double past it before the write.
+            let widen_extra: u64 = batch
+                .schema()
+                .fields()
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| {
+                    matches!(
+                        f.data_type(),
+                        deltalake::arrow::datatypes::DataType::UInt8
+                            | deltalake::arrow::datatypes::DataType::UInt16
+                            | deltalake::arrow::datatypes::DataType::UInt32
+                    )
+                })
+                .map(|(i, _)| batch.column(i).get_array_memory_size() as u64)
+                .sum();
+
+            window_bytes += batch_bytes + widen_extra;
             batches.push(batch);
 
             if window_bytes > ceiling {
@@ -443,5 +465,49 @@ mod tests {
         let batches2 = vec![make_large_batch(100)];
         let _ = ext.extract_from_stream_ca(batches2).unwrap();
         assert_eq!(ext.batch_size(), size_after_first_adapt);
+    }
+
+    #[test]
+    fn breaker_weights_unsigned_columns_for_post_align_widening() {
+        // H-2026-07-11-2: UInt8/16/32 buffers double after align_batch_to_schema, so the
+        // breaker counts them twice. An unsigned batch must therefore trip the ceiling at
+        // roughly HALF the raw bytes a signed batch of identical layout would need.
+        use deltalake::arrow::array::{Int16Array, UInt16Array};
+        use deltalake::arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let rows = 300_000usize; // ~600 KB raw per column
+
+        let unsigned_batch = {
+            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::UInt16, false)]));
+            RecordBatch::try_new(schema, vec![Arc::new(UInt16Array::from(vec![1u16; rows]))]).unwrap()
+        };
+        let signed_batch = {
+            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int16, false)]));
+            RecordBatch::try_new(schema, vec![Arc::new(Int16Array::from(vec![1i16; rows]))]).unwrap()
+        };
+        let raw = signed_batch.get_array_memory_size() as u64;
+        assert_eq!(raw, unsigned_batch.get_array_memory_size() as u64, "same raw layout");
+
+        // Ceiling: 1 MiB * 2 = 2 MiB. One ~600KB batch alone stays under; craft counts so
+        // that WEIGHTED unsigned (2x) crosses after 2 batches while raw signed does not.
+        let mut ext_unsigned = BatchExtractor::new("mysql://u:p@h/db", 1, 10000);
+        let out = ext_unsigned
+            .extract_from_stream_ca(vec![unsigned_batch.clone(), unsigned_batch.clone()])
+            .unwrap();
+        assert!(
+            out.truncated,
+            "2 unsigned batches (raw {}B x2, weighted x2) must cross the 2 MiB ceiling",
+            raw
+        );
+
+        let mut ext_signed = BatchExtractor::new("mysql://u:p@h/db", 1, 10000);
+        let out = ext_signed
+            .extract_from_stream_ca(vec![signed_batch.clone(), signed_batch.clone()])
+            .unwrap();
+        assert!(
+            !out.truncated,
+            "2 signed batches of identical raw size must stay under the ceiling"
+        );
     }
 }
