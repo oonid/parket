@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use anyhow::{Result, bail};
 use deltalake::arrow::datatypes::SchemaRef;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::query::QueryBuilder;
 use crate::writer::{extract_hwm_from_batch, hwm_has_advanced};
@@ -25,7 +25,27 @@ where
         ts_col: &str,
         key_col: &str,
         schema: &SchemaRef,
+        cursor_nullable: bool,
     ) -> Result<u64> {
+        // D2: an explicitly-configured nullable incremental cursor still drops NULL-cursor rows
+        // (the incremental query filters `WHERE <ts> IS NOT NULL`; O3 only stopped auto-selecting
+        // nullable cursors). Make that loss OBSERVABLE — once per run, count the excluded rows and
+        // warn loudly. A NOT NULL cursor can't have any, so the COUNT(*) is skipped in that case.
+        if cursor_nullable {
+            let null_rows = self.schema_inspect.count_null(table_name, ts_col).await?;
+            if null_rows > 0 {
+                warn!(
+                    table = table_name,
+                    cursor = ts_col,
+                    null_rows,
+                    "incremental cursor `{ts_col}` on table `{table_name}` is nullable and {null_rows} \
+                     row(s) have a NULL `{ts_col}` — those rows are EXCLUDED from incremental \
+                     extraction (the cursor query filters `{ts_col} IS NOT NULL`) and will never \
+                     sync; run this table as full_refresh if they must be captured (see audit D2/O3)"
+                );
+            }
+        }
+
         let mut current_hwm = match self.writer.read_hwm(table_name).await? {
             Some(h) => Some(h),
             None => self.config.table_initial_hwm.get(table_name).map(|(ua, id)| {
@@ -812,6 +832,98 @@ mod tests {
         let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
         let result = orch.run().await;
         assert!(matches!(result, ExitCode::Fatal), "sole table must fail: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn incremental_nullable_cursor_counts_and_warns_but_still_succeeds() {
+        // D2: an explicit TABLE_MODE=incremental on a NULLABLE cursor is honored (O3 decision b),
+        // but rows whose cursor is NULL are silently excluded by `WHERE <ts> IS NOT NULL`. The run
+        // must probe count_null ONCE, warn (side effect), and STILL succeed — the loss is made
+        // observable, not fatal. Assert Success + that count_null was called exactly once.
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["orders".to_string()]);
+        config
+            .table_modes
+            .insert("orders".to_string(), crate::config::ExtractionMode::Incremental);
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| crate::state::AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| {
+                Ok(vec![
+                    crate::discovery::ColumnInfo {
+                        name: "id".to_string(),
+                        data_type: "bigint".to_string(),
+                        column_type: "bigint(20)".to_string(),
+                        nullable: false,
+                    },
+                    crate::discovery::ColumnInfo {
+                        name: "updated_at".to_string(),
+                        data_type: "timestamp".to_string(),
+                        column_type: "timestamp".to_string(),
+                        nullable: true, // nullable cursor — the D2 trap
+                    },
+                ])
+            });
+        schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(make_full_refresh_indexes()));
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        // The D2 probe: called exactly once per run for the (nullable) cursor column, reporting
+        // 5 excluded NULL-cursor rows. Its result is a warn side effect, not a failure.
+        schema_mock
+            .expect_count_null()
+            .withf(|table, col| table == "orders" && col == "updated_at")
+            .times(1)
+            .returning(|_, _| Ok(5));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        extract_mock.expect_batch_size().returning(|| 10000);
+        writer_mock.expect_ensure_table().returning(|_, _| Ok(()));
+        writer_mock.expect_get_schema().returning(|_| Ok(None));
+        writer_mock.expect_read_hwm().returning(|_| Ok(None));
+        extract_mock
+            .expect_extract()
+            .returning(|_| ok_batches(vec![]));
+        state_mock
+            .expect_update_table()
+            .withf(|_, state, _| state.last_run_status.as_deref() == Some("success"))
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success), "nullable-cursor run must succeed (warn only): {result:?}");
+    }
+
+    #[tokio::test]
+    async fn incremental_not_null_cursor_skips_count_null_probe() {
+        // D2: a NOT NULL cursor provably has zero NULL-cursor rows, so the count_null probe (a
+        // COUNT(*) scan) is skipped entirely — count_null must NEVER be called. No expectation is
+        // registered for it, so any call would panic the mock.
+        let dir = TempDir::new().unwrap();
+        let config = make_config(vec!["orders".to_string()]); // make_columns() → NOT NULL updated_at
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
+        let mut state_mock = MockStateManage::new();
+
+        setup_incremental_mocks(&mut schema_mock, &mut extract_mock, &mut writer_mock, &mut state_mock);
+        // Deliberately NO expect_count_null: the probe must not run for a NOT NULL cursor.
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success));
     }
 
     #[tokio::test]

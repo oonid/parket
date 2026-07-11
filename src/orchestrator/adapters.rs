@@ -69,6 +69,12 @@ impl SchemaInspect for SchemaInspectorAdapter {
             .max_timestamp(table, col)
             .await
     }
+
+    async fn count_null(&self, table: &str, col: &str) -> Result<i64> {
+        crate::discovery::SchemaInspector::new(self.pool.clone(), self.database.clone())
+            .count_null(table, col)
+            .await
+    }
 }
 
 pub struct ExtractorAdapter {
@@ -489,6 +495,7 @@ mod tests {
         assert!(adapter.discover_indexes("orders").await.is_err());
         assert!(adapter.get_avg_row_length("orders").await.is_err());
         assert!(adapter.max_timestamp("orders", "updated_at").await.is_err());
+        assert!(adapter.count_null("orders", "updated_at").await.is_err());
     }
 
     /// O6: `calculate_batch_size`/`batch_size` are pure delegations; `extract` fails before

@@ -166,6 +166,20 @@ impl SchemaInspector {
         Ok(row.and_then(|(m,)| m))
     }
 
+    /// COUNT of rows whose `col` IS NULL. D2 observability probe: an explicitly-configured
+    /// nullable incremental / two-stream *update* cursor silently excludes NULL-cursor rows
+    /// (both incremental queries filter `WHERE <col> IS NOT NULL`), so the orchestrator counts
+    /// and warns about them once per run instead of dropping them invisibly. `col` is
+    /// backtick-quoted; this is only ever called with a discovered/validated cursor column.
+    pub async fn count_null(&self, table: &str, col: &str) -> Result<i64> {
+        let sql = format!("SELECT COUNT(*) FROM `{table}` WHERE `{col}` IS NULL");
+        let row: (i64,) = sqlx::query_as(&sql)
+            .fetch_one(&self.pool)
+            .await
+            .with_context(|| format!("failed to count NULL `{col}` rows for table {table}"))?;
+        Ok(row.0)
+    }
+
     pub async fn check_updated_at_index(&self, table: &str) -> Result<bool> {
         let row: Option<(i64,)> = sqlx::query_as(
             "SELECT COUNT(*) FROM information_schema.statistics WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = 'updated_at'"

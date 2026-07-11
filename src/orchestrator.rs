@@ -34,6 +34,9 @@ pub trait SchemaInspect: Send + Sync {
     async fn discover_indexes(&self, table: &str) -> Result<Vec<IndexInfo>>;
     async fn get_avg_row_length(&self, table: &str) -> Result<Option<u64>>;
     async fn max_timestamp(&self, table: &str, col: &str) -> Result<Option<String>>;
+    /// D2: count rows whose cursor column is NULL (silently excluded from incremental /
+    /// two-stream extraction by the `WHERE <col> IS NOT NULL` filter).
+    async fn count_null(&self, table: &str, col: &str) -> Result<i64>;
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -320,7 +323,15 @@ where
                         "incremental table '{table_name}' key column `{key_col}` is missing from the Delta table schema (the schema-evolution filter dropped it because the Delta schema lacks it); evolve the Delta schema to add `{key_col}` or run a full refresh for this table"
                     );
                 }
-                self.process_incremental(table_name, &select_columns, &ts_col, &key_col, &schema).await?
+                // D2: whether the cursor is nullable decides if the NULL-cursor exclusion is
+                // reachable at all — a NOT NULL column provably has zero NULL rows, so the probe
+                // is only worth running (a COUNT(*) scan) when the cursor is actually nullable.
+                let cursor_nullable = columns
+                    .iter()
+                    .find(|c| c.name == ts_col)
+                    .map(|c| c.nullable)
+                    .unwrap_or(false);
+                self.process_incremental(table_name, &select_columns, &ts_col, &key_col, &schema, cursor_nullable).await?
             }
             ExtractionMode::FullRefresh => {
                 let indexes = self.schema_inspect.discover_indexes(table_name).await?;
@@ -340,7 +351,14 @@ where
                         "two-stream table '{table_name}' update cursor column `{update_col}` is missing from the Delta table schema (the schema-evolution filter dropped it because the Delta schema lacks it); evolve the Delta schema to add `{update_col}` or run a full refresh for this table"
                     );
                 }
-                self.process_two_stream(table_name, &select_columns, &insert_col, &update_col, &schema).await?
+                // D2: the update stream filters `WHERE <update_col> IS NOT NULL`, so a nullable
+                // update cursor silently drops NULL rows; only probe (COUNT(*)) when it can fire.
+                let update_cursor_nullable = columns
+                    .iter()
+                    .find(|c| c.name == update_col)
+                    .map(|c| c.nullable)
+                    .unwrap_or(false);
+                self.process_two_stream(table_name, &select_columns, &insert_col, &update_col, &schema, update_cursor_nullable).await?
             }
             ExtractionMode::Auto => unreachable!(),
         };

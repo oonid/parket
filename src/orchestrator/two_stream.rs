@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use anyhow::{Result, bail};
 use deltalake::arrow::datatypes::SchemaRef;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::query::QueryBuilder;
 use crate::writer::{extract_hwm_from_batch, extract_max_id, hwm_has_advanced, Hwm};
@@ -25,7 +25,27 @@ where
         insert_col: &str,
         update_col: &str,
         schema: &SchemaRef,
+        update_cursor_nullable: bool,
     ) -> Result<u64> {
+        // D2: the update stream filters `WHERE <update_col> IS NOT NULL`, so an explicitly-
+        // configured nullable update cursor silently drops rows whose `update_col` is NULL. Make
+        // it OBSERVABLE — once per run, count and warn. Skipped for a NOT NULL cursor (can't fire).
+        if update_cursor_nullable {
+            let null_rows = self.schema_inspect.count_null(table_name, update_col).await?;
+            if null_rows > 0 {
+                warn!(
+                    table = table_name,
+                    cursor = update_col,
+                    null_rows,
+                    "two-stream update cursor `{update_col}` on table `{table_name}` is nullable and \
+                     {null_rows} row(s) have a NULL `{update_col}` — completions on those rows are \
+                     EXCLUDED from the update stream (the query filters `{update_col} IS NOT NULL`) \
+                     and will never sync; run this table as full_refresh if they must be captured \
+                     (see audit D2/O3)"
+                );
+            }
+        }
+
         let mut hwm_id = self.writer.read_insert_hwm(table_name).await?;
         let mut update_hwm = self.writer.read_hwm(table_name).await?;
         let mut total_rows = 0u64;
@@ -1164,6 +1184,82 @@ mod tests {
         unsafe { std::env::remove_var("UPDATE_STRATEGY"); }
 
         assert!(matches!(result, ExitCode::Success));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn two_stream_nullable_update_cursor_counts_and_warns_but_still_succeeds() {
+        // D2: a nullable two-stream update cursor is honored (O3 decision b) but silently drops
+        // rows whose `update_col` is NULL from the update stream. The run must probe count_null
+        // ONCE, warn (side effect), and STILL succeed. Assert Success + count_null called once.
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_insert_cursor.insert("orders".to_string(), "id".to_string());
+        config.table_update_cursor.insert("orders".to_string(), "updated_at".to_string());
+
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| crate::state::AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| {
+                Ok(vec![
+                    crate::discovery::ColumnInfo {
+                        name: "id".to_string(),
+                        data_type: "bigint".to_string(),
+                        column_type: "bigint(20)".to_string(),
+                        nullable: false,
+                    },
+                    crate::discovery::ColumnInfo {
+                        name: "name".to_string(),
+                        data_type: "varchar".to_string(),
+                        column_type: "varchar(255)".to_string(),
+                        nullable: false,
+                    },
+                    crate::discovery::ColumnInfo {
+                        name: "updated_at".to_string(),
+                        data_type: "timestamp".to_string(),
+                        column_type: "timestamp".to_string(),
+                        nullable: true, // nullable update cursor — the D2 trap
+                    },
+                ])
+            });
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        schema_mock
+            .expect_max_timestamp()
+            .returning(|_, _| Ok(None));
+        // The D2 probe: called exactly once for the nullable update cursor, reporting 3 excluded
+        // NULL rows. Result is a warn side effect, not a failure.
+        schema_mock
+            .expect_count_null()
+            .withf(|table, col| table == "orders" && col == "updated_at")
+            .times(1)
+            .returning(|_, _| Ok(3));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        extract_mock.expect_batch_size().returning(|| 10000);
+        writer_mock.expect_ensure_table().returning(|_, _| Ok(()));
+        writer_mock.expect_get_schema().returning(|_| Ok(None));
+        writer_mock.expect_read_insert_hwm().returning(|_| Ok(None));
+        writer_mock.expect_read_hwm().returning(|_| Ok(None));
+        extract_mock.expect_extract().returning(|_| ok_batches(vec![]));
+        state_mock
+            .expect_update_table()
+            .withf(|_, state, _| state.last_run_status.as_deref() == Some("success"))
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success), "nullable update-cursor run must succeed (warn only): {result:?}");
     }
 
     #[tokio::test]

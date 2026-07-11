@@ -522,6 +522,72 @@ async fn incremental_extraction_creates_delta_table_with_hwm() {
     assert_eq!(hwm.last_id, 3, "HWM last_id should be 3");
 }
 
+/// D2: an explicitly-configured `TABLE_MODE=incremental` on a NULLABLE cursor column is
+/// honored (O3 decision b), but rows whose cursor is NULL are silently excluded by the
+/// `WHERE updated_at IS NOT NULL` filter. This documents that known limitation end-to-end:
+/// the run SUCCEEDS, the non-NULL rows sync, and the NULL-cursor rows are genuinely ABSENT
+/// (the count_null probe warns about them but does not fail the table).
+#[tokio::test]
+#[serial_test::serial]
+async fn incremental_nullable_cursor_excludes_null_rows_but_succeeds() {
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let mut env = TestEnv::new(vec!["orders"]).await;
+    // Explicit incremental override on a nullable cursor (the D2 scenario).
+    env.config
+        .table_modes
+        .insert("orders".to_string(), parket::config::ExtractionMode::Incremental);
+
+    sqlx::query(
+        "CREATE TABLE orders (\
+            id BIGINT AUTO_INCREMENT PRIMARY KEY, \
+            name VARCHAR(255), \
+            qty INT, \
+            updated_at TIMESTAMP(6) NULL DEFAULT NULL\
+        )",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create orders table");
+
+    // 3 rows with a non-NULL cursor + 2 rows whose updated_at IS NULL.
+    sqlx::query(
+        "INSERT INTO orders (name, qty, updated_at) VALUES \
+            ('widget', 10, '2026-01-01 10:00:00.000000'), \
+            ('gadget', 5,  '2026-01-01 11:00:00.000000'), \
+            ('doohickey', 3, '2026-01-02 09:00:00.000000'), \
+            ('orphan_a', 1, NULL), \
+            ('orphan_b', 2, NULL)",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert orders");
+
+    let mut orchestrator = env.make_orchestrator();
+    let exit_code = orchestrator.run().await;
+
+    // The NULL-cursor rows are a documented, warned-about limitation — NOT a failure.
+    assert!(
+        matches!(exit_code, ExitCode::Success),
+        "expected Success (NULL-cursor loss is warned, not fatal), got {exit_code:?}"
+    );
+
+    // Only the 3 non-NULL-cursor rows synced; the 2 NULL-cursor rows are genuinely excluded.
+    let row_count = count_delta_rows(&env, "orders").await;
+    assert_eq!(
+        row_count, 3,
+        "expected only the 3 non-NULL-cursor rows in Delta (NULL-cursor rows excluded by D2)"
+    );
+    let null_named = count_matching(&env, "orders", "name = 'orphan_a' OR name = 'orphan_b'").await;
+    assert_eq!(
+        null_named, 0,
+        "the NULL-cursor rows must be absent from Delta (documents the D2 limitation)"
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn crash_recovery_hwm_advances_and_only_new_rows_appended() {
