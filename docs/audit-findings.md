@@ -99,9 +99,7 @@ isolation, and exact set-equality beyond the aggregate fingerprints.
 - **N8** — `ORDER BY <all columns>` OFFSET fallback: ci-collation and TEXT-prefix ties break total order (skip/dup on PK-less tables) + per-page full filesort. Prefer any UNIQUE index; BINARY-strengthen ordering.
 - **VA2, VA4, VA5** — **done** (`a9bf774`): native-scale decimals; try_cast + per-table Skipped-on-error; n= in every fingerprint.
 - **VA1-r** — the overflow guard is conservative: near the DECIMAL(38,scale) capacity it drops SUM on both sides, so a corruption altering *only* the sum (min/max/n unchanged) is invisible in that narrow window. Acceptable trade-off vs DataFusion's silent corruption; note for completeness.
-- **O4** — unknown `TABLE_MODE` values (typos, `two_stream`) silently → Auto (`config/parse.rs:37-41`). Bail.
-- **O5** — two-stream cursor config silently overrides explicit `TABLE_MODE`. Bail/warn on conflict.
-- **O6** — `adapters.rs:157-167` `get_schema` `Err(_)=>Ok(None)` (R1-class recurrence, ×2 duplicated impls) silently disables schema-evolution check. Classify missing-vs-transient like R1.
+- **O4, O5, O6** — **done** (`743fc95`, config-intent batch; see §1): invalid `TABLE_MODE` bails actionably; two-stream/`TABLE_MODE` conflict bails at config load; `get_schema` classifies missing-vs-transient like R1.
 - **O7** — `--check`/run parity: mode-override skips column validation; no evolution check in preflight; S3 health-check written at bucket root ignoring `s3_prefix`; local mode probes nothing.
 - **O8** — **done** (`ee09a7f`).
 - **R3, R5** — **done** (`6978d6c`). Minor tidiness follow-up: a failed write still leaves a stale `.tmp` (pre-existing; overwritten on next success).
