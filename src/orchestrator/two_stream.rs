@@ -48,6 +48,13 @@ where
 
         let mut hwm_id = self.writer.read_insert_hwm(table_name).await?;
         let mut update_hwm = self.writer.read_hwm(table_name).await?;
+        // D3: remember whether the writer had a watermark STORED before any seeding below. A seed
+        // derived this run (config TABLE_HWM or the live MAX(update_col) bootstrap) lives only in
+        // memory and reaches Delta only if a stream later writes — if both streams write nothing,
+        // it is lost, and the next run re-seeds from a NEWER MAX, silently skipping completions
+        // that arrived in between. We persist a freshly-derived seed immediately (below).
+        let insert_was_stored = hwm_id.is_some();
+        let update_was_stored = update_hwm.is_some();
         let mut total_rows = 0u64;
 
         // O1: TABLE_HWM_<t> is a valid pre-seed for two-stream tables too (e.g. bootstrapping
@@ -97,6 +104,28 @@ where
                 }
                 update_hwm = Some(Hwm { updated_at: seed, last_id: i64::MAX });
             }
+        }
+
+        // D3: persist a freshly-derived seed durably BEFORE the streams run. A seed was derived
+        // this run iff the writer had nothing stored for that stream but we now hold a value
+        // (config TABLE_HWM or the live MAX(update_col) bootstrap). Without this, a first run where
+        // both streams end up writing nothing would lose the in-memory seed, and the next run would
+        // re-seed from a newer MAX — skipping any completions that landed in between. A run that
+        // read a STORED watermark derives no seed, so this stays silent (no spurious commits). The
+        // H-2026-07-11-1 has_data guard above already bailed for a non-empty table lacking an insert
+        // watermark, so this only fires on genuine first runs (or an explicit config seed).
+        let insert_freshly_seeded = !insert_was_stored && hwm_id.is_some();
+        let update_freshly_seeded = !update_was_stored && update_hwm.is_some();
+        if insert_freshly_seeded || update_freshly_seeded {
+            info!(
+                table = table_name,
+                hwm_insert_id = ?hwm_id,
+                hwm_updated_at = ?update_hwm.as_ref().map(|h| h.updated_at.as_str()),
+                "two-stream: persisting first-run seed via HWM-only commit (D3)"
+            );
+            self.writer
+                .commit_hwm_only(table_name, hwm_id, update_hwm.clone())
+                .await?;
         }
 
         // ---- Stream A: new rows by insert cursor (append) ----
@@ -895,6 +924,17 @@ mod tests {
                 }
             });
 
+        // D3: the live-MAX bootstrap seed is now persisted immediately via an HWM-only commit,
+        // BEFORE the streams run, so it survives a run where both streams write nothing.
+        writer_mock
+            .expect_commit_hwm_only()
+            .withf(|_, insert_id, update| {
+                insert_id.is_none()
+                    && update.as_ref().map(|h| h.updated_at.as_str())
+                        == Some("2026-06-01T00:00:00.000000")
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(()));
         writer_mock
             .expect_append_two_stream()
             .times(0)
@@ -981,6 +1021,17 @@ mod tests {
                 }
             });
 
+        // D3: both watermarks are freshly seeded from the config TABLE_HWM, so they are persisted
+        // immediately via an HWM-only commit carrying the seeded insert id + update timestamp.
+        writer_mock
+            .expect_commit_hwm_only()
+            .withf(|_, insert_id, update| {
+                *insert_id == Some(500)
+                    && update.as_ref().map(|h| h.updated_at.as_str())
+                        == Some("2026-05-01T00:00:00.000000")
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(()));
         writer_mock
             .expect_append_two_stream()
             .times(0)

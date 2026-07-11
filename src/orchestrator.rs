@@ -91,6 +91,14 @@ pub trait DeltaWrite: Send + Sync {
         insert_id: Option<i64>,
         update_hwm: Option<Hwm>,
     ) -> Result<()>;
+    /// D3: persist the two-stream watermarks with a metadata-only (zero-data-action) commit,
+    /// so a first-run seed survives even when both streams write nothing this run.
+    async fn commit_hwm_only(
+        &self,
+        table_name: &str,
+        insert_id: Option<i64>,
+        update_hwm: Option<Hwm>,
+    ) -> Result<()>;
 }
 
 #[cfg_attr(test, mockall::automock)]

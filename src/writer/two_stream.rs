@@ -9,7 +9,8 @@ use deltalake::datafusion::execution::disk_manager::{DiskManagerBuilder, DiskMan
 use deltalake::datafusion::execution::memory_pool::FairSpillPool;
 use deltalake::datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use deltalake::datafusion::prelude::{SessionConfig, SessionContext};
-use deltalake::protocol::SaveMode;
+use deltalake::kernel::transaction::CommitBuilder;
+use deltalake::protocol::{DeltaOperation, SaveMode};
 use tracing::info;
 
 impl DeltaWriter {
@@ -160,6 +161,50 @@ impl DeltaWriter {
             .await?;
 
         info!(table = table_name, rows = total_rows, "two-stream insert appended");
+        Ok(())
+    }
+
+    /// D3: persist the two-stream watermarks with a commit that carries NO data actions — a
+    /// metadata-only commitInfo entry. On a first run where both streams write nothing (insert
+    /// loaded everything, no completions yet), the freshly-derived update-HWM seed lives only in
+    /// memory and is otherwise never committed; the NEXT run then re-seeds from a NEWER
+    /// MAX(update_col), skipping any completions that arrived between the two runs. Persisting the
+    /// seed immediately closes that silent-loss window.
+    ///
+    /// `CommitData::new` auto-inserts a `CommitInfo` action even with zero data actions and
+    /// flattens the watermark metadata into it, so `read_hwm`/`read_insert_hwm` (which read the
+    /// latest commit's `commitInfo.info`) round-trip the values back. The table must already
+    /// exist (caller runs `ensure_table` first).
+    pub async fn commit_hwm_only(
+        &self,
+        table_name: &str,
+        insert_id: Option<i64>,
+        update_hwm: Option<&super::Hwm>,
+    ) -> Result<()> {
+        let table = self.open_table(table_name).await?;
+        let commit_properties = build_two_stream_commit_properties(insert_id, update_hwm);
+        let snapshot = table.snapshot()?;
+        let log_store = table.log_store();
+        // A no-data-action Write commit: the watermark metadata rides in commitInfo. Mirrors
+        // delta-rs's own `flush_and_commit` shape, minus the Add actions.
+        CommitBuilder::from(commit_properties)
+            .with_actions(Vec::new())
+            .build(
+                Some(snapshot),
+                log_store,
+                DeltaOperation::Write {
+                    mode: SaveMode::Append,
+                    partition_by: None,
+                    predicate: None,
+                },
+            )
+            .await?;
+        info!(
+            table = table_name,
+            hwm_insert_id = ?insert_id,
+            hwm_updated_at = ?update_hwm.map(|h| h.updated_at.as_str()),
+            "two-stream: persisted HWM-only commit (no data actions)"
+        );
         Ok(())
     }
 

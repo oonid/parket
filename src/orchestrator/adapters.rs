@@ -230,6 +230,17 @@ impl DeltaWrite for DeltaWriterAdapter {
             .append_two_stream(table_name, batches, insert_id, update_hwm.as_ref())
             .await
     }
+
+    async fn commit_hwm_only(
+        &self,
+        table_name: &str,
+        insert_id: Option<i64>,
+        update_hwm: Option<Hwm>,
+    ) -> Result<()> {
+        self.inner
+            .commit_hwm_only(table_name, insert_id, update_hwm.as_ref())
+            .await
+    }
 }
 
 pub struct LocalDeltaWriterAdapter {
@@ -324,6 +335,17 @@ impl DeltaWrite for LocalDeltaWriterAdapter {
     ) -> Result<()> {
         self.inner
             .append_two_stream(table_name, batches, insert_id, update_hwm.as_ref())
+            .await
+    }
+
+    async fn commit_hwm_only(
+        &self,
+        table_name: &str,
+        insert_id: Option<i64>,
+        update_hwm: Option<Hwm>,
+    ) -> Result<()> {
+        self.inner
+            .commit_hwm_only(table_name, insert_id, update_hwm.as_ref())
             .await
     }
 }

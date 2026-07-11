@@ -588,6 +588,69 @@ async fn incremental_nullable_cursor_excludes_null_rows_but_succeeds() {
     );
 }
 
+/// D3 STEP 1: validate the primitive itself. delta-rs 0.32.4 must be able to commit a
+/// metadata-only (ZERO data-action) commit carrying the two-stream watermarks, and
+/// `read_hwm`/`read_insert_hwm` must read them back. This is the mechanism
+/// `process_two_stream` relies on to persist a first-run seed durably even when both
+/// streams write nothing. If this fails, the HWM-only-commit approach is not viable on
+/// this delta-rs version and the fix must fall back to a different persistence strategy.
+#[tokio::test]
+#[serial_test::serial]
+async fn commit_hwm_only_round_trips_watermarks_on_fresh_table() {
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let env = TestEnv::new(vec!["seedonly"]).await;
+
+    let writer = DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    );
+
+    let schema = std::sync::Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+        deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+        deltalake::arrow::datatypes::Field::new("updated_at", deltalake::arrow::datatypes::DataType::Utf8, false),
+    ]));
+    writer.ensure_table("seedonly", schema).await.expect("ensure_table failed");
+
+    // Fresh empty table — no watermark of either kind yet.
+    assert!(writer.read_hwm("seedonly").await.unwrap().is_none(), "fresh table: no update HWM");
+    assert!(writer.read_insert_hwm("seedonly").await.unwrap().is_none(), "fresh table: no insert HWM");
+
+    let seed = parket::writer::Hwm {
+        updated_at: "2026-06-01T12:00:00.000000".to_string(),
+        last_id: i64::MAX,
+    };
+    writer
+        .commit_hwm_only("seedonly", Some(42), Some(&seed))
+        .await
+        .expect("commit_hwm_only must succeed on delta-rs 0.32.4 (zero-data-action commit)");
+
+    // Both watermarks round-trip from the metadata-only commit.
+    let insert_hwm = writer.read_insert_hwm("seedonly").await.unwrap();
+    assert_eq!(insert_hwm, Some(42), "insert HWM must round-trip from the HWM-only commit");
+    let update_hwm = writer
+        .read_hwm("seedonly")
+        .await
+        .unwrap()
+        .expect("update HWM must round-trip from the HWM-only commit");
+    assert_eq!(update_hwm.updated_at, "2026-06-01T12:00:00.000000");
+    assert_eq!(update_hwm.last_id, i64::MAX);
+
+    // The commit carried no data actions — the table stays empty.
+    assert_eq!(
+        count_delta_rows(&env, "seedonly").await,
+        0,
+        "an HWM-only commit must not add any data rows"
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn crash_recovery_hwm_advances_and_only_new_rows_appended() {
@@ -681,6 +744,109 @@ async fn crash_recovery_hwm_advances_and_only_new_rows_appended() {
         hwm2.updated_at,
     );
     assert_eq!(hwm2.last_id, 5, "run 2: HWM last_id should be 5");
+}
+
+/// D3: a two-stream first run seeds the update watermark from MAX(completed_at). That seed
+/// must be persisted durably so a completion arriving AFTER the run-1 seed (but before run 2)
+/// is caught by the `completed_at > stored_seed` window instead of being skipped by a re-seed
+/// to a newer MAX. Run 1 loads everything via the insert stream and derives the seed (the
+/// HWM-only commit persists it before the streams run); run 2 then captures the late
+/// completion. End-to-end correctness lock (the both-streams-write-nothing isolation is
+/// covered by the `two_stream_seeds_update_hwm_when_none_stored` unit test + the STEP-1
+/// round-trip test above).
+#[tokio::test]
+#[serial_test::serial]
+async fn two_stream_first_run_seed_persists_so_later_completion_is_not_skipped() {
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let mut env = TestEnv::new(vec!["tasks"]).await;
+    env.config
+        .table_insert_cursor
+        .insert("tasks".to_string(), "id".to_string());
+    env.config
+        .table_update_cursor
+        .insert("tasks".to_string(), "completed_at".to_string());
+
+    sqlx::query(
+        "CREATE TABLE tasks (\
+            id BIGINT PRIMARY KEY, \
+            name VARCHAR(255), \
+            completed_at DATETIME(6) NULL\
+        )",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create tasks table");
+
+    // Run 1: 3 already-completed rows; MAX(completed_at) = 2026-01-03 becomes the update seed and
+    // the update stream finds nothing beyond it. The insert stream loads all 3.
+    sqlx::query(
+        "INSERT INTO tasks (id, name, completed_at) VALUES \
+            (1, 'a', '2026-01-01 10:00:00.000000'), \
+            (2, 'b', '2026-01-02 10:00:00.000000'), \
+            (3, 'c', '2026-01-03 10:00:00.000000')",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert run-1 rows");
+
+    let mut run1 = env.make_orchestrator();
+    assert!(matches!(run1.run().await, ExitCode::Success), "run 1 must succeed");
+    assert_eq!(count_delta_rows(&env, "tasks").await, 3, "run 1: insert stream loads all 3 rows");
+
+    let writer = DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    );
+    // D3: the run-1 seed is persisted — even though the update stream wrote nothing.
+    let hwm1 = writer
+        .read_hwm("tasks")
+        .await
+        .expect("run 1: read_hwm failed")
+        .expect("run 1: the first-run update seed must be persisted");
+    assert!(
+        hwm1.updated_at.starts_with("2026-01-03"),
+        "run 1: persisted seed should be MAX(completed_at)=2026-01-03, got {}",
+        hwm1.updated_at
+    );
+
+    // A completion arrives after run 1's seed but before run 2: row 2 completes at 2026-01-04.
+    sqlx::query(
+        "UPDATE tasks SET name = 'b-done', completed_at = '2026-01-04 10:00:00.000000' WHERE id = 2",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to apply completion");
+
+    let mut run2 = env.make_orchestrator();
+    assert!(matches!(run2.run().await, ExitCode::Success), "run 2 must succeed");
+
+    // The completion is captured (not skipped) and not duplicated: still 3 distinct rows, and
+    // row 2 now reflects the mutation.
+    assert_eq!(count_delta_rows(&env, "tasks").await, 3, "run 2: no duplication");
+    assert_eq!(
+        count_matching(&env, "tasks", "id = 2 AND name = 'b-done'").await,
+        1,
+        "run 2 must capture the late completion on row 2 (D3: seed persisted, window not skipped)"
+    );
+    // And the update watermark advanced to the completion's timestamp.
+    let hwm2 = writer
+        .read_hwm("tasks")
+        .await
+        .expect("run 2: read_hwm failed")
+        .expect("run 2: HWM should be set");
+    assert!(
+        hwm2.updated_at.starts_with("2026-01-04"),
+        "run 2: HWM should advance to the completion timestamp, got {}",
+        hwm2.updated_at
+    );
 }
 
 /// Two-stream (insert + update MERGE) end-to-end across two runs:
