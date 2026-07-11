@@ -58,7 +58,7 @@ isolation, and exact set-equality beyond the aggregate fingerprints.
 | R2 | `313ba2b` | HWM no-progress guard (incremental + two-stream update) — residual: N7 |
 | V7 (value path) | `9c0f384` | Delta value aggregates HWM-scoped symmetric with source — key path still open (VA6) |
 | N2+N3 | `2399b50` | insert-stream progress guard (bail before append); extract_id_as_i64 widened to Int8/16 + UInt8/16, UInt64 overflow → None; real integer-PK threaded through incremental (fallback `id`); early actionable bail when cursor/key dropped from select_columns (both modes) |
-| N6 | `54bbf45` | examples call sites fixed; `cargo clippy --all-targets -- -D warnings` green — gate widened |
+| N6 | `54bbf45` (+ ci.yml) | examples call sites fixed; local gate widened to `cargo clippy --all-targets -- -D warnings`; **CI workflow's Clippy step updated to `--all-targets`** so the widening is enforced in CI, not just locally |
 | T1–T5 | `108d9e3` | Docker verify tests committed + strengthened: corruption→Discrepancy (both paths), post-HWM scope exclusion, NULL + multibyte rows; ran green under real MariaDB+MinIO (Opus-reviewed) |
 | N4 (+N1 mappings) | `36c485c`, `3a3059d` | DATE/MEDIUMINT/VARBINARY/JSON mapped instead of `todo!()` panic; [connector_arrow#79](https://github.com/aljazerzen/connector_arrow/pull/79) **merged upstream** (v0.12.1) — submodule back on aljazerzen |
 | O2/R4, R3, R5 | `6978d6c`, `52aa55a` | interrupted runs exit PartialFailure + table state "interrupted" (never "success"); shutdown mid-full-refresh after chunk 0 bails as a failure naming the partial rewrite; SIGTERM joins SIGINT (second signal → exit 130); state.json fsync (file before rename, dir after) — residual: O2-r stage-and-swap |
