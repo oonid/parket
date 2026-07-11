@@ -38,6 +38,18 @@ where
                 crate::writer::Hwm { updated_at: ua.clone(), last_id: *id }
             }),
         };
+        // H-2026-07-11-1: no watermark resolved (nothing stored, no config seed) but the
+        // Delta table already holds data — re-extracting from scratch with APPEND would
+        // duplicate every row (e.g. after a full-refresh rebuild wiped HWM visibility, or
+        // a no-HWM commit shadowed it). Refuse loudly instead.
+        if current_hwm.is_none() && self.writer.has_data(table_name).await? {
+            anyhow::bail!(
+                "table `{table_name}` already has data in Delta but no stored HWM — refusing to \
+                 re-extract from scratch with append (every row would be duplicated). Set \
+                 TABLE_HWM_{table_name} to the snapshot's max cursor, or full-refresh the table"
+            );
+        }
+
         let mut total_rows = 0u64;
         let mut batch_index: u64 = 0;
 
@@ -156,6 +168,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock
@@ -257,6 +270,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock
@@ -365,6 +379,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock
@@ -441,6 +456,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock
@@ -497,6 +513,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock
@@ -555,6 +572,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock
@@ -632,6 +650,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock
@@ -709,6 +728,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock
@@ -749,5 +769,89 @@ mod tests {
         let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
         let result = orch.run().await;
         assert!(matches!(result, ExitCode::Fatal));
+    }
+
+    #[tokio::test]
+    async fn incremental_bails_when_delta_has_data_but_no_hwm() {
+        // H-2026-07-11-1: nothing stored, no config seed, but the Delta table already
+        // holds data (e.g. a full-refresh rebuild wiped HWM visibility). Re-extracting
+        // from scratch with APPEND would duplicate every row — must fail fast, before
+        // any extract call.
+        let dir = TempDir::new().unwrap();
+        let config = make_config(vec!["orders".to_string()]);
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        // NOTE: deliberately overriding the blanket Ok(false): this table HAS data.
+        writer_mock.expect_has_data().returning(|_| Ok(true));
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| crate::state::AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(vec![]));
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        writer_mock.expect_ensure_table().returning(|_, _| Ok(()));
+        writer_mock.expect_get_schema().returning(|_| Ok(None));
+        writer_mock.expect_read_hwm().returning(|_| Ok(None));
+        // The guard must fire BEFORE any extraction or write:
+        extract_mock.expect_extract().times(0);
+        writer_mock.expect_append_batch().times(0);
+        state_mock.expect_update_table().returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Fatal), "sole table must fail: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn incremental_proceeds_when_no_hwm_and_delta_empty() {
+        // First run: table freshly created by ensure_table, zero data files — the
+        // H-2026-07-11-1 guard must NOT fire; extraction proceeds from scratch.
+        let dir = TempDir::new().unwrap();
+        let config = make_config(vec!["orders".to_string()]);
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| crate::state::AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(vec![]));
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        extract_mock.expect_batch_size().returning(|| 10000);
+        writer_mock.expect_ensure_table().returning(|_, _| Ok(()));
+        writer_mock.expect_get_schema().returning(|_| Ok(None));
+        writer_mock.expect_read_hwm().returning(|_| Ok(None));
+        extract_mock
+            .expect_extract()
+            .returning(|_| Ok(crate::extractor::Extraction { batches: vec![], truncated: false }));
+        state_mock.expect_update_table().returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success), "fresh empty table must proceed: {result:?}");
     }
 }

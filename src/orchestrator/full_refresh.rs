@@ -292,6 +292,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock
@@ -358,6 +359,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock.expect_load_or_default().returning(|_| crate::state::AppState::default());
@@ -409,6 +411,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock.expect_load_or_default().returning(|_| crate::state::AppState::default());
@@ -466,6 +469,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock.expect_load_or_default().returning(|_| crate::state::AppState::default());
@@ -523,6 +527,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock.expect_load_or_default().returning(|_| crate::state::AppState::default());
@@ -579,6 +584,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock.expect_load_or_default().returning(|_| crate::state::AppState::default());
@@ -609,6 +615,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock.expect_load_or_default().returning(|_| crate::state::AppState::default());
@@ -661,6 +668,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock
@@ -715,6 +723,7 @@ mod tests {
         let schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let state_mock = MockStateManage::new();
         let (tx, rx) = watch::channel(false);
 
@@ -880,6 +889,7 @@ mod tests {
         let schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let state_mock = MockStateManage::new();
         let (_tx, rx) = watch::channel(false);
 

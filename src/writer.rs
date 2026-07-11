@@ -124,6 +124,27 @@ impl DeltaWriter {
         }
     }
 
+    /// Whether the Delta table exists AND holds at least one data file. Used by the
+    /// no-HWM guards (audit H-2026-07-11-1): an incremental / two-stream run that has
+    /// no stored watermark must not re-extract from scratch with APPEND onto a table
+    /// that already has data — that duplicates every row. A genuinely missing table
+    /// (first run) is `false`, as is a freshly created empty one (ensure_table runs
+    /// before extraction, so the first run sees zero files here).
+    pub async fn has_data(&self, table_name: &str) -> Result<bool> {
+        let table = match self.open_table(table_name).await {
+            Ok(t) => t,
+            Err(e) => {
+                if is_missing_table_error(&e) {
+                    return Ok(false);
+                }
+                return Err(e).context(format!(
+                    "has_data: could not open Delta table `{table_name}`"
+                ));
+            }
+        };
+        Ok(table.get_file_uris()?.next().is_some())
+    }
+
     pub async fn open_table(&self, table_name: &str) -> Result<DeltaTable> {
         let url = self.table_url(table_name)?;
         let mut table = deltalake::DeltaTableBuilder::from_url(url)?

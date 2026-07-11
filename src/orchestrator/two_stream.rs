@@ -47,6 +47,16 @@ where
             hwm_id = Some(*last_id);
         }
 
+        // H-2026-07-11-1: no insert watermark resolved but the Delta table already holds
+        // data — the insert stream would re-append every row from id 0. Refuse loudly.
+        if hwm_id.is_none() && self.writer.has_data(table_name).await? {
+            anyhow::bail!(
+                "table `{table_name}` already has data in Delta but no stored insert watermark — \
+                 refusing to re-run the insert stream from the beginning (every row would be \
+                 duplicated). Set TABLE_HWM_{table_name}, or full-refresh the table"
+            );
+        }
+
         // Bootstrap seeding: on first run (no stored update HWM), seed from the current
         // MAX(update_col) so the update stream only catches completions after the bootstrap
         // (the insert stream already loaded every row's current state). Avoids the redundant
@@ -236,6 +246,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock
@@ -325,6 +336,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock
@@ -459,6 +471,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock
@@ -555,6 +568,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock
@@ -691,6 +705,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock
@@ -810,6 +825,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock
@@ -897,6 +913,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock
@@ -977,6 +994,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock
@@ -1059,6 +1077,7 @@ mod tests {
         let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
         let mut state_mock = MockStateManage::new();
 
         state_mock
@@ -1145,5 +1164,47 @@ mod tests {
         unsafe { std::env::remove_var("UPDATE_STRATEGY"); }
 
         assert!(matches!(result, ExitCode::Success));
+    }
+
+    #[tokio::test]
+    async fn two_stream_bails_when_delta_has_data_but_no_insert_hwm() {
+        // H-2026-07-11-1: stored insert watermark missing (e.g. shadowed by a no-HWM
+        // commit) but the Delta table already holds data — the insert stream would
+        // re-append every row from the beginning. Must fail fast before any extract.
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_insert_cursor.insert("orders".to_string(), "id".to_string());
+        config.table_update_cursor.insert("orders".to_string(), "updated_at".to_string());
+
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        // Deliberately overrides the blanket Ok(false): this table HAS data.
+        writer_mock.expect_has_data().returning(|_| Ok(true));
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| crate::state::AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        writer_mock.expect_ensure_table().returning(|_, _| Ok(()));
+        writer_mock.expect_get_schema().returning(|_| Ok(None));
+        writer_mock.expect_read_insert_hwm().returning(|_| Ok(None));
+        writer_mock.expect_read_hwm().returning(|_| Ok(None));
+        extract_mock.expect_extract().times(0);
+        writer_mock.expect_append_two_stream().times(0);
+        state_mock.expect_update_table().returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Fatal), "sole table must fail: {result:?}");
     }
 }

@@ -175,6 +175,10 @@ impl DeltaWrite for DeltaWriterAdapter {
         self.inner.read_hwm(table_name).await
     }
 
+    async fn has_data(&self, table_name: &str) -> Result<bool> {
+        self.inner.has_data(table_name).await
+    }
+
     async fn get_schema(&self, table_name: &str) -> Result<Option<SchemaRef>> {
         get_schema_impl(&self.inner, table_name).await
     }
@@ -265,6 +269,10 @@ impl DeltaWrite for LocalDeltaWriterAdapter {
 
     async fn read_hwm(&self, table_name: &str) -> Result<Option<Hwm>> {
         self.inner.read_hwm(table_name).await
+    }
+
+    async fn has_data(&self, table_name: &str) -> Result<bool> {
+        self.inner.has_data(table_name).await
     }
 
     async fn get_schema(&self, table_name: &str) -> Result<Option<SchemaRef>> {
