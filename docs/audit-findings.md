@@ -104,8 +104,7 @@ isolation, and exact set-equality beyond the aggregate fingerprints.
 - **O8** — **done** (`ee09a7f`).
 - **R3, R5** — **done** (`6978d6c`). Minor tidiness follow-up: a failed write still leaves a stale `.tmp` (pre-existing; overwritten on next success).
 - **D1** — new source columns silently dropped forever by evolution filter (`orchestrator/schema.rs:84-96`); also feeds N3. Additive evolution or fail loudly.
-- **D2** — `WHERE ts IS NOT NULL` permanently drops NULL-cursor rows (`query.rs:31,36`) with no backfill (pairs with O3).
-- **D3** — two-stream first-run seed not persisted; completions between two seeds can be skipped forever (`orchestrator/two_stream.rs:34-44`). Persist via HWM-only commit.
+- **D2, D3** — **done** (`9bc09a6`, `3e39029`, + discriminating test; Opus-reviewed). D3: freshly-derived two-stream seed persisted immediately via a validated zero-action HWM-only commit (delta-rs 0.32.4 supports it). Reachability note: the genuine data-loss window is a config-TABLE_HWM first run where both streams write nothing, then TABLE_HWM removed before the next run — the fix is sound defense-in-depth for it.
 - **M4** — `TARGET_MEMORY_MB` has no RAM-relative ceiling (`config.rs:83-88`); 64 GB on an 8 GB box OOMs at runtime, not config load.
 - **CF1, CF2** — **done** (`4c89bd7`, Codex).
 - **S1** — `#[derive(Debug)]` on `Config` prints `database_url` + S3 secret verbatim (`config.rs:12`); hand-write Debug/Secret newtype.
