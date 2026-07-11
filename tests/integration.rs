@@ -1728,3 +1728,88 @@ async fn table_with_time_year_bit_columns_syncs_with_columns_skipped() {
         "row 2's surviving columns must round-trip intact"
     );
 }
+
+// D3 (discriminating): the review found the sibling test above still passes when
+// commit_hwm_only is neutralized, because run 1's insert stream loads every row and its
+// APPEND carries the seed. This test forces BOTH streams to write nothing on run 1 — a
+// config TABLE_HWM whose last_id and timestamp sit ABOVE the table's current max — so the
+// seed can ONLY reach Delta via commit_hwm_only. Without the D3 fix, run 1 makes zero
+// commits carrying watermarks and read_hwm/read_insert_hwm return None → this test fails.
+#[tokio::test]
+#[serial_test::serial]
+async fn two_stream_config_seed_persists_when_both_streams_write_nothing() {
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let mut env = TestEnv::new(vec!["seeded"]).await;
+    env.config
+        .table_insert_cursor
+        .insert("seeded".to_string(), "id".to_string());
+    env.config
+        .table_update_cursor
+        .insert("seeded".to_string(), "completed_at".to_string());
+    // Seed both watermarks ABOVE the table: last_id 100 > max id 3, and a 2026-06 timestamp
+    // after every completed_at. So `WHERE id > 100` and `WHERE completed_at > '2026-06-...'`
+    // both return nothing — neither stream writes a single row on run 1.
+    env.config.table_initial_hwm.insert(
+        "seeded".to_string(),
+        ("2026-06-01 00:00:00.000000".to_string(), 100),
+    );
+
+    sqlx::query(
+        "CREATE TABLE seeded (\
+            id BIGINT PRIMARY KEY, \
+            name VARCHAR(255), \
+            completed_at DATETIME(6) NULL\
+        )",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create seeded table");
+    sqlx::query(
+        "INSERT INTO seeded (id, name, completed_at) VALUES \
+            (1, 'a', '2026-01-01 10:00:00.000000'), \
+            (2, 'b', '2026-01-02 10:00:00.000000'), \
+            (3, 'c', '2026-01-03 10:00:00.000000')",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert rows");
+
+    let mut run1 = env.make_orchestrator();
+    assert!(matches!(run1.run().await, ExitCode::Success), "run 1 must succeed");
+    // Both streams wrote nothing — the table holds zero data rows after run 1.
+    assert_eq!(
+        count_delta_rows(&env, "seeded").await,
+        0,
+        "both streams are seeded past the data, so no rows should be written"
+    );
+
+    let writer = DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    );
+    // The ONLY way these are non-None is commit_hwm_only (no stream write happened).
+    let update_hwm = writer
+        .read_hwm("seeded")
+        .await
+        .expect("read_hwm failed")
+        .expect("D3: the config update seed must be persisted even though no stream wrote");
+    assert!(
+        update_hwm.updated_at.starts_with("2026-06-01"),
+        "persisted update seed should be the config value, got {}",
+        update_hwm.updated_at
+    );
+    let insert_hwm = writer
+        .read_insert_hwm("seeded")
+        .await
+        .expect("read_insert_hwm failed")
+        .expect("D3: the config insert seed must be persisted even though no stream wrote");
+    assert_eq!(insert_hwm, 100, "persisted insert seed should be the config last_id");
+}
