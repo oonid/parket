@@ -9,7 +9,7 @@ mod mask;
 use parse::*;
 pub use mask::{mask_database_url, mask_secret};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub database_url: String,
     pub s3_bucket: String,
@@ -32,6 +32,38 @@ pub struct Config {
     pub table_timestamp_col: HashMap<String, String>,
     pub table_insert_cursor: HashMap<String, String>,
     pub table_update_cursor: HashMap<String, String>,
+}
+
+// S1: a derived Debug would print `database_url` (with password) and
+// `s3_secret_access_key` verbatim through any `{config:?}`/`dbg!`/anyhow context.
+// Hand-write Debug so those two fields are masked while everything else is shown
+// normally.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("database_url", &mask_database_url(&self.database_url))
+            .field("s3_bucket", &self.s3_bucket)
+            .field("s3_access_key_id", &self.s3_access_key_id)
+            .field(
+                "s3_secret_access_key",
+                &mask_secret(&self.s3_secret_access_key),
+            )
+            .field("tables", &self.tables)
+            .field("target_memory_mb", &self.target_memory_mb)
+            .field("merge_memory_mb", &self.merge_memory_mb)
+            .field("merge_spill_dir", &self.merge_spill_dir)
+            .field("s3_endpoint", &self.s3_endpoint)
+            .field("s3_region", &self.s3_region)
+            .field("s3_prefix", &self.s3_prefix)
+            .field("default_batch_size", &self.default_batch_size)
+            .field("rust_log", &self.rust_log)
+            .field("table_modes", &self.table_modes)
+            .field("table_initial_hwm", &self.table_initial_hwm)
+            .field("table_timestamp_col", &self.table_timestamp_col)
+            .field("table_insert_cursor", &self.table_insert_cursor)
+            .field("table_update_cursor", &self.table_update_cursor)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1067,6 +1099,49 @@ mod tests {
             !display.contains("minioadmin") || display.contains("****"),
             "display_safe should mask S3 secret, got: {display}"
         );
+    }
+
+    // S1: `{config:?}` must not leak the DB password or the raw S3 secret. The
+    // hand-written Debug masks database_url + s3_secret_access_key while still
+    // printing the non-secret fields.
+    #[test]
+    #[serial]
+    fn debug_masks_database_password_and_s3_secret() {
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            // A recognizable password and secret we can assert are absent.
+            env::set_var(
+                "DATABASE_URL",
+                "mysql://admin:sup3rs3cr3tpw@dbhost:3306/mydb",
+            );
+            env::set_var("S3_SECRET_ACCESS_KEY", "RAWSECRETVALUE12345");
+            env::set_var("S3_REGION", "eu-west-1");
+        }
+        let config = Config::load().expect("load should succeed");
+        let debug = format!("{config:?}");
+
+        assert!(
+            !debug.contains("sup3rs3cr3tpw"),
+            "debug must not contain DB password, got: {debug}"
+        );
+        assert!(
+            !debug.contains("RAWSECRETVALUE12345"),
+            "debug must not contain raw S3 secret, got: {debug}"
+        );
+        // Masked forms present.
+        assert!(
+            debug.contains("****:****@dbhost:3306"),
+            "debug should contain masked database_url, got: {debug}"
+        );
+        assert!(
+            debug.contains("****2345"),
+            "debug should contain masked S3 secret tail, got: {debug}"
+        );
+        // Non-secret fields still shown.
+        assert!(debug.contains("data-lake"), "bucket should be shown: {debug}");
+        assert!(debug.contains("eu-west-1"), "region should be shown: {debug}");
+        assert!(debug.contains("minioadmin"), "access_key_id should be shown: {debug}");
     }
 
     #[test]
