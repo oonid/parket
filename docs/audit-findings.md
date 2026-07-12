@@ -108,9 +108,9 @@ isolation, and exact set-equality beyond the aggregate fingerprints.
 - **D2, D3** — **done** (`9bc09a6`, `3e39029`, + discriminating test; Opus-reviewed). D3: freshly-derived two-stream seed persisted immediately via a validated zero-action HWM-only commit (delta-rs 0.32.4 supports it). Reachability note: the genuine data-loss window is a config-TABLE_HWM first run where both streams write nothing, then TABLE_HWM removed before the next run — the fix is sound defense-in-depth for it.
 - **M4** — `TARGET_MEMORY_MB` has no RAM-relative ceiling (`config.rs:83-88`); 64 GB on an 8 GB box OOMs at runtime, not config load.
 - **CF1, CF2** — **done** (`4c89bd7`, Codex).
-- **S1** — `#[derive(Debug)]` on `Config` prints `database_url` + S3 secret verbatim (`config.rs:12`); hand-write Debug/Secret newtype.
-- **S2** — identifiers not backtick-escaped (embedded `` ` `` breaks out) and HWM value string-interpolated (`query.rs:1-3,31`).
-- **S3** — `mask_secret` byte-slices the last 4 bytes → panic on multibyte secrets (`config/mask.rs:23`).
+- **S1** — **done** (`7240d15`): hand-written `Config` Debug masks `database_url` + `s3_secret_access_key`; all non-secret fields shown; regression test asserts the raw password/secret never appear.
+- **S2** — **done for the extraction path** (`5f752bc`): `backtick` doubles embedded backticks; HWM `updated_at` doubles single quotes; tested. **S2-r (Low)**: verify's SQL builders (`verify/source.rs`, `verify/delta.rs`) already `.bind()`/escape all VALUES but still inline ~58 backtick-identifier sites — deferred (a large mechanical sweep, no unit coverage, and identifiers there are the same config/schema-derived names).
+- **S3** — **done** (`cc20fd6`): `mask_secret` is char-based (no panic on multibyte secrets); multibyte + short-value regression tests added.
 - **P1** — per-batch `mysql::Conn::new` + per-write full Delta `load()` (`extractor.rs:47-51`; `writer.rs:166-169` etc.) — pool the connection; keep a table handle.
 - **pf1** — **done** (folded into O3, `e3395da`): the arm is now a real "nullable <ts> (unsafe cursor)" reason; remaining unreachable!()s verified genuinely unreachable.
 - **V5** — verify schema check compares column *names* only; types read but unused.
