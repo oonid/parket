@@ -10,6 +10,7 @@ use deltalake::datafusion::execution::memory_pool::FairSpillPool;
 use deltalake::datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use deltalake::datafusion::prelude::{SessionConfig, SessionContext};
 use deltalake::kernel::transaction::CommitBuilder;
+use deltalake::operations::write::SchemaMode;
 use deltalake::protocol::{DeltaOperation, SaveMode};
 use tracing::info;
 
@@ -20,6 +21,15 @@ impl DeltaWriter {
     ///
     /// Deduplicates the source by `key_col` before merging to prevent MERGE cardinality
     /// violations when the source contains duplicate keys.
+    ///
+    /// D1 scope note: unlike the append paths (`append_batch`, `append_two_stream`,
+    /// `delete_then_append`), this `table.merge(...)` op does NOT carry `SchemaMode::Merge`,
+    /// so it does not evolve the schema. Additive schema evolution under the
+    /// `UPDATE_STRATEGY=merge` opt-out is out of scope: a new source column reaching a table
+    /// synced this way requires a one-off full refresh to pick it up (full refresh rebuilds
+    /// the Delta schema every run). `schema_evolution_check` would still include the new
+    /// column in the SELECT, but the MERGE's INSERT/UPDATE clauses only touch known columns,
+    /// so the extra data is dropped rather than persisted here.
     pub async fn merge_batch(
         &self,
         table_name: &str,
@@ -157,6 +167,9 @@ impl DeltaWriter {
         table
             .write(batches)
             .with_save_mode(SaveMode::Append)
+            // D1: additive schema evolution (see `DeltaWriter::append_batch`). The batch schema
+            // is a superset of the table's, so Merge adds any new column; a no-op otherwise.
+            .with_schema_mode(SchemaMode::Merge)
             .with_commit_properties(commit_properties)
             .await?;
 
@@ -336,6 +349,9 @@ impl DeltaWriter {
         table
             .write(deduped_batches)
             .with_save_mode(SaveMode::Append)
+            // D1: additive schema evolution (see `DeltaWriter::append_batch`). The batch schema
+            // is a superset of the table's, so Merge adds any new column; a no-op otherwise.
+            .with_schema_mode(SchemaMode::Merge)
             .with_commit_properties(commit_properties)
             .await?;
         info!(table = table_name, rows = total_rows, "delete_then_append: appended new versions");

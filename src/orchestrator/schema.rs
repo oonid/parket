@@ -5,7 +5,7 @@ use deltalake::arrow::array::Array;
 use deltalake::arrow::compute::{CastOptions, cast_with_options};
 use deltalake::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use deltalake::arrow::record_batch::RecordBatch;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::discovery::ColumnInfo;
 
@@ -211,14 +211,30 @@ pub(crate) fn schema_evolution_check(
         anyhow::bail!("schema evolution error: {}", errors.join(", "));
     }
 
+    // D1: additive schema evolution. A column present in Delta is selected as before. A
+    // column that is NEW to the source (absent from Delta) is INCLUDED in the SELECT when it
+    // is extractable — its `mariadb_type_to_arrow` succeeds, equivalently it is in the
+    // discovery allowlist that already gatekeeps every path into this function. The append
+    // writers issue the write with `SchemaMode::Merge`, so the batch (whose schema is then a
+    // superset of the Delta table's) grows the Delta table by that column; pre-existing rows
+    // read back NULL. A new column that is NON-extractable stays excluded and warned,
+    // consistent with the allowlist: parket never captures a type it cannot map, and the
+    // drop-column / type-change bails above have already fired for the only-bailing cases.
     let mut select_columns: Vec<String> = Vec::new();
     for col in mariadb_columns {
         if delta_names.contains(col.name.as_str()) {
             select_columns.push(col.name.clone());
+        } else if mariadb_type_to_arrow(&col.data_type, &col.column_type).is_ok() {
+            info!(
+                column = %col.name,
+                "new column will be added to Delta via schema merge"
+            );
+            select_columns.push(col.name.clone());
         } else {
             warn!(
                 column = %col.name,
-                "column exists in MariaDB but not in Delta, excluding from SELECT"
+                data_type = %col.data_type,
+                "new column has a non-extractable type, excluding from SELECT"
             );
         }
     }
@@ -253,11 +269,32 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn schema_evolution_column_addition_warns_and_excludes() {
+    fn schema_evolution_new_extractable_column_is_included() {
+        // D1: a column new to the source (absent from Delta) whose type is extractable is
+        // now INCLUDED in the SELECT so it gets captured; SchemaMode::Merge grows the Delta
+        // table by it. (Before D1 this was silently excluded + warned.)
         let mariadb_cols = vec![
             ColumnInfo { name: "id".into(), data_type: "bigint".into(), column_type: "bigint(20)".into(), nullable: false },
             ColumnInfo { name: "name".into(), data_type: "varchar".into(), column_type: "varchar(255)".into(), nullable: false },
             ColumnInfo { name: "email".into(), data_type: "varchar".into(), column_type: "varchar(255)".into(), nullable: false },
+        ];
+        let delta_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        let result = schema_evolution_check(&mariadb_cols, &delta_schema).unwrap();
+        assert_eq!(result, vec!["id", "name", "email"]);
+    }
+
+    #[test]
+    fn schema_evolution_new_non_extractable_column_is_excluded() {
+        // D1: a NEW source column whose type parket cannot map stays excluded (and warned) —
+        // it is not in the allowlist, so it never becomes part of the merged Delta schema.
+        let mariadb_cols = vec![
+            ColumnInfo { name: "id".into(), data_type: "bigint".into(), column_type: "bigint(20)".into(), nullable: false },
+            ColumnInfo { name: "name".into(), data_type: "varchar".into(), column_type: "varchar(255)".into(), nullable: false },
+            ColumnInfo { name: "shape".into(), data_type: "geometry".into(), column_type: "geometry".into(), nullable: false },
         ];
         let delta_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),

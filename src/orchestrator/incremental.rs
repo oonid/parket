@@ -739,10 +739,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incremental_fails_fast_when_delta_schema_missing_cursor_column() {
-        // N3: when the schema-evolution filter drops the cursor column (Delta schema
-        // predates it), fail immediately with an actionable message instead of
-        // extracting a full batch and only then discovering the HWM can't be read.
+    async fn incremental_additively_includes_cursor_column_missing_from_delta() {
+        // D1 (reverses the old N3 fail-fast): when the Delta schema predates an EXTRACTABLE
+        // cursor column, additive schema evolution now INCLUDES it in the SELECT (rather than
+        // dropping it and failing). The run proceeds — the extracted SQL carries `updated_at`,
+        // and the append writes it with SchemaMode::Merge so Delta gains the column. (The N3
+        // fail-fast guard remains for a cursor that is genuinely un-selectable, e.g. a default
+        // cursor name absent from the source columns entirely.)
         let dir = TempDir::new().unwrap();
         let config = make_config(vec!["orders".to_string()]);
         let mut schema_mock = MockSchemaInspect::new();
@@ -766,9 +769,12 @@ mod tests {
         extract_mock
             .expect_calculate_batch_size()
             .returning(|_| 10000);
+        extract_mock.expect_batch_size().returning(|| 10000);
+        // The cursor column absent from Delta is now selected (D1): the query must carry it.
         extract_mock
             .expect_extract()
-            .times(0)
+            .times(1)
+            .withf(|sql: &str| sql.contains("updated_at") && sql.contains("id") && sql.contains("name"))
             .returning(|_| ok_batches(vec![]));
         writer_mock
             .expect_ensure_table()
@@ -781,14 +787,15 @@ mod tests {
                     deltalake::arrow::datatypes::Field::new("name", deltalake::arrow::datatypes::DataType::Utf8, false),
                 ]))))
             });
+        writer_mock.expect_read_hwm().returning(|_| Ok(None));
         state_mock
             .expect_update_table()
-            .withf(|_, state, _| state.last_run_status.as_deref() == Some("failed"))
+            .withf(|_, state, _| state.last_run_status.as_deref() == Some("success"))
             .returning(|_, _, _| Ok(()));
 
         let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
         let result = orch.run().await;
-        assert!(matches!(result, ExitCode::Fatal));
+        assert!(matches!(result, ExitCode::Success), "expected additive-evolution Success, got {result:?}");
     }
 
     #[tokio::test]

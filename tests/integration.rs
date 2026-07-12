@@ -996,9 +996,116 @@ async fn two_stream_inserts_and_merges_mutations_across_runs() {
     run_two_stream_upsert_scenario(Some("merge")).await;
 }
 
+/// D1 STEP 1: validate the append + `SchemaMode::Merge` mechanism against a REAL Delta table
+/// on MinIO, through the exact writer path production uses (`DeltaWriter::append_batch`),
+/// before relying on it for the orchestrator flow. Creates a {id, name} table, appends a row,
+/// then appends a superset {id, name, extra} batch and asserts the column is added cleanly:
+/// (a) the Delta schema gains `extra`; (b) the pre-existing row reads `extra = NULL`;
+/// (c) the new row's `extra` is populated; (d) `id`/`name` are undisturbed.
 #[tokio::test]
 #[serial_test::serial]
-async fn schema_evolution_add_column_warns_and_skips() {
+async fn append_batch_schema_merge_adds_new_column_to_delta() {
+    use deltalake::arrow::array::{Int64Array, StringArray};
+    use deltalake::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use deltalake::arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let env = TestEnv::new(vec!["schema_merge_probe"]).await;
+    let writer = DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    );
+
+    // Create the table with {id, name} and append one row.
+    let schema_v1 = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    writer
+        .ensure_table("schema_merge_probe", schema_v1.clone())
+        .await
+        .expect("ensure_table failed");
+    let batch_v1 = RecordBatch::try_new(
+        schema_v1,
+        vec![
+            Arc::new(Int64Array::from(vec![1i64])),
+            Arc::new(StringArray::from(vec!["alpha"])),
+        ],
+    )
+    .unwrap();
+    writer
+        .append_batch("schema_merge_probe", vec![batch_v1], None)
+        .await
+        .expect("first append failed");
+
+    // Append a SECOND batch whose schema is a superset: {id, name, extra}.
+    let schema_v2 = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("extra", DataType::Utf8, true),
+    ]));
+    let batch_v2 = RecordBatch::try_new(
+        schema_v2,
+        vec![
+            Arc::new(Int64Array::from(vec![2i64])),
+            Arc::new(StringArray::from(vec!["beta"])),
+            Arc::new(StringArray::from(vec!["populated"])),
+        ],
+    )
+    .unwrap();
+    writer
+        .append_batch("schema_merge_probe", vec![batch_v2], None)
+        .await
+        .expect("second append (schema merge) failed");
+
+    // (a) the Delta schema now carries `extra` alongside the originals.
+    let mut table = env.open_delta_table("schema_merge_probe").await;
+    table.load().await.expect("failed to load delta table");
+    let kernel_schema = table.snapshot().unwrap().schema();
+    let arrow_schema: deltalake::arrow::datatypes::Schema =
+        deltalake::kernel::engine::arrow_conversion::TryIntoArrow::try_into_arrow(
+            kernel_schema.as_ref(),
+        )
+        .expect("failed to convert schema");
+    let field_names: Vec<&str> = arrow_schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert!(field_names.contains(&"extra"), "Delta schema must gain `extra`, got {field_names:?}");
+    assert!(field_names.contains(&"id"), "`id` must remain, got {field_names:?}");
+    assert!(field_names.contains(&"name"), "`name` must remain, got {field_names:?}");
+
+    // Total rows undisturbed: exactly the two written.
+    assert_eq!(count_delta_rows(&env, "schema_merge_probe").await, 2, "expected exactly 2 rows");
+
+    // (b) pre-existing row reads back extra = NULL; (d) id/name undisturbed.
+    assert_eq!(
+        count_matching(&env, "schema_merge_probe", "id = 1 AND name = 'alpha' AND extra IS NULL").await,
+        1,
+        "pre-existing row must keep id=1,name='alpha' and read extra as NULL"
+    );
+    // (c) the new row's extra is populated; (d) id/name intact.
+    assert_eq!(
+        count_matching(&env, "schema_merge_probe", "id = 2 AND name = 'beta' AND extra = 'populated'").await,
+        1,
+        "new row must carry id=2,name='beta',extra='populated'"
+    );
+}
+
+/// D1 STEP 5 (was `schema_evolution_add_column_warns_and_skips`, whose old premise — silently
+/// dropping the new column forever — is the bug D1 fixes). End-to-end additive evolution:
+/// sync incrementally, `ALTER TABLE ... ADD COLUMN`, insert a NEW row (higher cursor) carrying
+/// the new column, resync, and assert the Delta table GAINS the column, pre-existing rows read
+/// it back NULL, and the new rows carry the value.
+#[tokio::test]
+#[serial_test::serial]
+async fn incremental_picks_up_new_column_via_schema_merge() {
     let _guard = tracing_subscriber::fmt()
         .with_env_filter("parket=debug")
         .with_test_writer()
@@ -1075,7 +1182,7 @@ async fn schema_evolution_add_column_warns_and_skips() {
     let exit_code_run2 = orchestrator_run2.run().await;
     assert!(
         matches!(exit_code_run2, ExitCode::Success),
-        "run 2: expected Success (warn+skip), got {exit_code_run2:?}"
+        "run 2: expected Success (additive merge), got {exit_code_run2:?}"
     );
 
     let row_count_run2 = count_delta_rows(&env, "orders").await;
@@ -1099,6 +1206,7 @@ async fn schema_evolution_add_column_warns_and_skips() {
     );
     assert_eq!(hwm.last_id, 5, "run 2: HWM last_id should be 5");
 
+    // D1: the Delta schema now CARRIES `color` (added via SchemaMode::Merge on the append).
     let mut table = env.open_delta_table("orders").await;
     table.load().await.expect("failed to load delta table after run 2");
     let kernel_schema = table.snapshot().unwrap().schema();
@@ -1109,8 +1217,25 @@ async fn schema_evolution_add_column_warns_and_skips() {
         .expect("failed to convert schema");
     let field_names_run2: Vec<&str> = arrow_schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert!(
-        !field_names_run2.contains(&"color"),
-        "run 2: Delta schema should still not contain 'color' (warn+skip)"
+        field_names_run2.contains(&"color"),
+        "run 2: Delta schema should now contain 'color' (added via schema merge), got {field_names_run2:?}"
+    );
+
+    // The 3 pre-existing rows read `color` back as NULL; the 2 new rows carry their values.
+    assert_eq!(
+        count_matching(&env, "orders", "color IS NULL").await,
+        3,
+        "the 3 pre-D1 rows must read color as NULL"
+    );
+    assert_eq!(
+        count_matching(&env, "orders", "color = 'red'").await,
+        1,
+        "the 'thingamajig' row must carry color='red'"
+    );
+    assert_eq!(
+        count_matching(&env, "orders", "color = 'blue'").await,
+        1,
+        "the 'whatchamacallit' row must carry color='blue'"
     );
 }
 

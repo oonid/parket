@@ -8,6 +8,7 @@ use deltalake::arrow::array::{Int64Array, StringArray};
 use deltalake::arrow::datatypes::{DataType, Schema as ArrowSchema};
 use deltalake::arrow::record_batch::RecordBatch;
 use deltalake::DeltaTable;
+use deltalake::operations::write::SchemaMode;
 use deltalake::protocol::SaveMode;
 use tracing::{info, warn};
 use url::Url;
@@ -221,6 +222,12 @@ impl DeltaWriter {
 
         table.write(batches)
             .with_save_mode(SaveMode::Append)
+            // D1: additive schema evolution. `schema_evolution_check` guarantees this batch's
+            // schema is a SUPERSET of the Delta table's (new extractable source columns are
+            // included; drops and type changes still bail before we get here), so Merge grows
+            // the table by any new column and old rows read that column back as NULL. When the
+            // batch schema already equals the table's (the normal case) Merge is a no-op.
+            .with_schema_mode(SchemaMode::Merge)
             .with_commit_properties(commit_properties)
             .await?;
 
