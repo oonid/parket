@@ -17,10 +17,11 @@ pub fn mask_database_url(url: &str) -> String {
 }
 
 pub fn mask_secret(secret: &str) -> String {
-    if secret.len() <= 4 {
+    let char_count = secret.chars().count();
+    if char_count <= 4 {
         "****".to_string()
     } else {
-        let visible = &secret[secret.len() - 4..];
+        let visible: String = secret.chars().skip(char_count - 4).collect();
         format!("****{visible}")
     }
 }
@@ -77,5 +78,20 @@ mod tests {
     #[test]
     fn mask_secret_five_chars() {
         assert_eq!(mask_secret("abcde"), "****bcde");
+    }
+
+    // S3 regression: byte-slicing the last 4 bytes panics when a byte boundary
+    // lands inside a multibyte char. The char-based tail must not panic and must
+    // reveal the last 4 CHARS verbatim.
+    #[test]
+    fn mask_secret_multibyte_tail_does_not_panic() {
+        // 8 chars: a b c d é ۹ 世 界 — the last 4 are all multibyte.
+        assert_eq!(mask_secret("abcdé۹世界"), "****é۹世界");
+    }
+
+    #[test]
+    fn mask_secret_multibyte_short_value() {
+        // 3 chars, all multibyte → fully masked, no panic.
+        assert_eq!(mask_secret("é世界"), "****");
     }
 }
