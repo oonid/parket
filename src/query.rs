@@ -1,5 +1,14 @@
+/// Quote a MySQL/MariaDB identifier. A backtick is a legal character inside an
+/// identifier and is escaped by doubling it (S2) so an embedded backtick cannot
+/// break out of the quoting.
 fn backtick(ident: &str) -> String {
-    format!("`{ident}`")
+    format!("`{}`", ident.replace('`', "``"))
+}
+
+/// Escape a value for inline single-quoted SQL string literals by doubling embedded
+/// single quotes (S2). Used for HWM values interpolated into the WHERE clause.
+fn sql_str_literal(v: &str) -> String {
+    v.replace('\'', "''")
 }
 
 fn format_columns(columns: &[String]) -> String {
@@ -37,6 +46,7 @@ impl QueryBuilder {
 
         match (hwm_updated_at, hwm_last_id) {
             (Some(updated_at), Some(last_id)) => {
+                let updated_at = sql_str_literal(updated_at);
                 format!(
                     "SELECT {col_list} FROM {quoted_table} WHERE {ts} IS NOT NULL AND (({ts} = '{updated_at}' AND {key} > {last_id}) OR ({ts} > '{updated_at}')) ORDER BY {ts} ASC, {key} ASC LIMIT {batch_size}"
                 )
@@ -318,6 +328,47 @@ mod tests {
     fn backtick_helper() {
         assert_eq!(backtick("orders"), "`orders`");
         assert_eq!(backtick("select"), "`select`");
+    }
+
+    // S2: an identifier containing a backtick (legal in MySQL/MariaDB) must not
+    // break out of the quoting — the embedded backtick is doubled.
+    #[test]
+    fn backtick_escapes_embedded_backtick() {
+        assert_eq!(backtick("a`b"), "`a``b`");
+        // A lone backtick doubles to ``, wrapped in `…` → four backticks total.
+        assert_eq!(backtick("`"), "````");
+    }
+
+    #[test]
+    fn backtick_escaped_column_in_query() {
+        let sql = QueryBuilder::build_full_refresh_query("weird`table", &["od`d".to_string()]);
+        assert_eq!(sql, "SELECT `od``d` FROM `weird``table`");
+    }
+
+    // S2: the interpolated HWM `updated_at` value must have single quotes doubled so
+    // a value containing a `'` cannot break out of the string literal.
+    #[test]
+    fn incremental_hwm_value_escapes_single_quote() {
+        let sql = QueryBuilder::build_incremental_query(
+            "orders",
+            &["id".to_string()],
+            "updated_at",
+            "id",
+            Some("2026-01-01' OR '1'='1"),
+            Some(42),
+            5000,
+        );
+
+        // The single quotes in the value are doubled, so the literal stays intact.
+        assert!(
+            sql.contains("= '2026-01-01'' OR ''1''=''1'"),
+            "HWM single quotes must be doubled, got: {sql}"
+        );
+        // No lone (un-doubled) injection-breakout remains.
+        assert!(
+            !sql.contains("2026-01-01' OR '1'='1"),
+            "raw un-escaped value must not appear, got: {sql}"
+        );
     }
 
     #[test]
