@@ -131,6 +131,7 @@ impl Config {
         if merge_memory_mb == 0 {
             bail!("MERGE_MEMORY_MB must be greater than 0");
         }
+        validate_memory_budget(target_memory_mb, merge_memory_mb, detect_total_ram_mb())?;
         let merge_spill_dir = std::env::var("MERGE_SPILL_DIR")
             .ok()
             .filter(|s| !s.is_empty())
@@ -222,6 +223,7 @@ impl Config {
         if merge_memory_mb == 0 {
             bail!("MERGE_MEMORY_MB must be greater than 0");
         }
+        validate_memory_budget(target_memory_mb, merge_memory_mb, detect_total_ram_mb())?;
         let merge_spill_dir = std::env::var("MERGE_SPILL_DIR")
             .ok()
             .filter(|s| !s.is_empty())

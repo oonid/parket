@@ -158,3 +158,98 @@ pub(crate) fn parse_table_update_cursor(tables: &[String]) -> HashMap<String, St
     }
     map
 }
+
+/// Detect total physical RAM in MB by reading `/proc/meminfo` (`MemTotal:  N kB`).
+/// Returns None on any failure or non-Linux platform, so callers never block when
+/// RAM is unknowable. NOTE: in a container this reports the HOST total, not the
+/// cgroup limit — acceptable for the VM target; cgroup-aware detection is a future nicety.
+pub(crate) fn detect_total_ram_mb() -> Option<u64> {
+    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb / 1024);
+        }
+    }
+    None
+}
+
+/// Reject a memory budget that cannot physically fit in RAM (M4). `total_ram_mb`
+/// is passed in (None = undetectable → no check) so this stays unit-testable.
+/// The circuit breaker admits up to 2x TARGET_MEMORY_MB resident (up to ~4x for
+/// unsigned-heavy tables post-widening), so a budget near/over RAM OOMs at runtime.
+pub(crate) fn validate_memory_budget(
+    target_memory_mb: u64,
+    merge_memory_mb: u64,
+    total_ram_mb: Option<u64>,
+) -> Result<()> {
+    let Some(total) = total_ram_mb else { return Ok(()) };
+    if target_memory_mb > total {
+        bail!(
+            "TARGET_MEMORY_MB ({target_memory_mb}) exceeds detected system RAM ({total} MB); \
+             the extract memory budget cannot be larger than physical RAM. Set it to at most \
+             half of RAM (~{} MB) to leave headroom for the 2x circuit-breaker ceiling.",
+            total / 2
+        );
+    }
+    if merge_memory_mb > total {
+        bail!(
+            "MERGE_MEMORY_MB ({merge_memory_mb}) exceeds detected system RAM ({total} MB); \
+             the MERGE spill-pool budget cannot be larger than physical RAM."
+        );
+    }
+    // Not impossible, but the breaker's 2x resident ceiling would exceed RAM → likely OOM.
+    if target_memory_mb.saturating_mul(2) > total {
+        tracing::warn!(
+            target_memory_mb,
+            total_ram_mb = total,
+            "TARGET_MEMORY_MB is more than half of detected RAM; the circuit breaker admits up \
+             to 2x this budget resident (up to ~4x for unsigned-heavy tables), so OOM is likely. \
+             Consider a budget of ~{} MB or less.",
+            total / 4
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_memory_budget_ok_when_under_ram() {
+        assert!(validate_memory_budget(512, 512, Some(8192)).is_ok());
+    }
+
+    #[test]
+    fn validate_memory_budget_ok_at_exactly_ram_boundary() {
+        assert!(validate_memory_budget(8192, 8192, Some(8192)).is_ok());
+    }
+
+    #[test]
+    fn validate_memory_budget_ok_when_ram_undetectable() {
+        assert!(validate_memory_budget(65536, 65536, None).is_ok());
+    }
+
+    #[test]
+    fn validate_memory_budget_bails_when_target_exceeds_ram() {
+        let result = validate_memory_budget(65536, 512, Some(8192));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("TARGET_MEMORY_MB"),
+            "error should mention TARGET_MEMORY_MB, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_memory_budget_bails_when_merge_exceeds_ram() {
+        let result = validate_memory_budget(512, 65536, Some(8192));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("MERGE_MEMORY_MB"),
+            "error should mention MERGE_MEMORY_MB, got: {err}"
+        );
+    }
+}
