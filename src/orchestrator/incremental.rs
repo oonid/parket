@@ -114,16 +114,33 @@ where
                 .last()
                 .and_then(|b| extract_hwm_from_batch(b, ts_col, key_col));
 
-            if batch_rows == batch_size {
-                match batch_hwm.as_ref() {
-                    None => bail!(
-                        "incremental batch for table `{table_name}` could not extract HWM from a full batch"
-                    ),
-                    Some(next_hwm) if !hwm_has_advanced(current_hwm.as_ref(), next_hwm) => bail!(
-                        "incremental batch for table `{table_name}` did not advance HWM on a full batch"
-                    ),
-                    Some(_) => {}
-                }
+            // N2-r: a non-empty batch we are about to APPEND but from which no HWM can be
+            // extracted — cursor `{ts_col}`/`{key_col}` present by name but of an
+            // unextractable Arrow type (or a BIGINT UNSIGNED key past i64::MAX) — would
+            // leave the stored watermark unadvanced, re-extracting and duplicating these
+            // rows on every subsequent run. The incremental query filters `{ts_col} IS NOT
+            // NULL`, so a non-empty batch here always has a non-NULL cursor; None means an
+            // unextractable type. Unsafe on ANY chunk (full or terminal-partial) → bail.
+            if batch_hwm.is_none() {
+                bail!(
+                    "incremental batch for table `{table_name}` could not extract a HWM from a \
+                     non-empty batch — cursor `{ts_col}`/`{key_col}` is present but not an \
+                     extractable type (or the key overflowed i64); appending would duplicate \
+                     rows on the next run. Fix the cursor column type or run this table as \
+                     full_refresh"
+                );
+            }
+            // N2/R2: a FULL batch whose HWM did not advance means keyset pagination is stuck —
+            // bail before appending. A terminal partial chunk may legitimately sit at the
+            // boundary, so this stays gated to full batches.
+            if batch_rows == batch_size
+                && batch_hwm
+                    .as_ref()
+                    .is_some_and(|next_hwm| !hwm_has_advanced(current_hwm.as_ref(), next_hwm))
+            {
+                bail!(
+                    "incremental batch for table `{table_name}` did not advance HWM on a full batch"
+                );
             }
 
             self.writer
@@ -463,6 +480,75 @@ mod tests {
         let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
         let result = orch.run().await;
         assert!(matches!(result, ExitCode::Fatal));
+    }
+
+    #[tokio::test]
+    async fn incremental_partial_batch_without_hwm_bails_before_append() {
+        // N2-r: a terminal PARTIAL batch (rows < batch_size) whose cursor column is present
+        // by name but of an unextractable Arrow type (here: Boolean — not one of the types
+        // `extract_timestamp_as_strings`/`extract_hwm_from_batch` understand) must NOT be
+        // silently appended. Previously the HWM-extraction guard only fired when
+        // `batch_rows == batch_size`, so this terminal-partial case slipped through and
+        // would append the batch without advancing the stored watermark, re-extracting and
+        // duplicating these rows on every subsequent run. Drives `process_incremental`
+        // directly (bypassing `run()`/`process_table` dispatch) so the returned `Err` message
+        // can be inspected.
+        let dir = TempDir::new().unwrap();
+        let config = make_config(vec!["orders".to_string()]);
+        let schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
+        writer_mock.expect_read_hwm().returning(|_| Ok(None));
+        writer_mock
+            .expect_append_batch()
+            .times(0)
+            .returning(|_, _, _| Ok(()));
+
+        // batch_size = 10 but the extractor returns a single 1-row batch: rows < batch_size,
+        // i.e. a terminal partial chunk — the case the old `batch_rows == batch_size` guard
+        // missed.
+        extract_mock.expect_batch_size().returning(|| 10);
+        extract_mock.expect_extract().returning(|_| {
+            let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+                // Boolean: present by name, but not an extractable timestamp/cursor type.
+                deltalake::arrow::datatypes::Field::new(
+                    "updated_at",
+                    deltalake::arrow::datatypes::DataType::Boolean,
+                    false,
+                ),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(deltalake::arrow::array::Int64Array::from(vec![1i64])),
+                    Arc::new(deltalake::arrow::array::BooleanArray::from(vec![true])),
+                ],
+            )
+            .unwrap();
+            ok_batches(vec![batch])
+        });
+
+        let columns = vec!["id".to_string(), "name".to_string(), "updated_at".to_string()];
+        let schema = schema_from_columns(&make_columns());
+
+        let mut orch = make_orchestrator(
+            config,
+            schema_mock,
+            extract_mock,
+            writer_mock,
+            MockStateManage::new(),
+            dir.path().to_path_buf(),
+        );
+        let result = orch
+            .process_incremental("orders", &columns, "updated_at", "id", &schema, false)
+            .await;
+        let err = result.expect_err("must bail on a non-empty partial batch with an unextractable HWM");
+        assert!(
+            err.to_string().contains("could not extract a HWM from a non-empty batch"),
+            "unexpected error message: {err}"
+        );
     }
 
     #[tokio::test]

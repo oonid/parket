@@ -47,12 +47,63 @@ pub fn extract_hwm_from_batch(batch: &RecordBatch, timestamp_col: &str, key_col:
     })
 }
 
+/// Parse a HWM timestamp string into chronologically-orderable integer components
+/// (N7). Accepts `YYYY-MM-DD`, optionally followed by a ` ` or `T` separator and
+/// `HH:MM:SS` with an optional `.fraction`. The fraction is right-padded / truncated
+/// to 9 digits (nanoseconds) so `.5` and `.500` compare equal. Returns None if the
+/// shape is unrecognized, so the caller can fall back to raw string comparison.
+fn ts_components(s: &str) -> Option<(i64, i64, i64, i64, i64, i64, i64)> {
+    let s = s.trim();
+    let (date, rest) = match s.find([' ', 'T']) {
+        Some(i) => (&s[..i], &s[i + 1..]),
+        None => (s, ""),
+    };
+    let mut d = date.split('-');
+    let year: i64 = d.next()?.trim().parse().ok()?;
+    let month: i64 = d.next()?.parse().ok()?;
+    let day: i64 = d.next()?.parse().ok()?;
+    if d.next().is_some() {
+        return None;
+    }
+    let (hour, min, sec, nanos) = if rest.is_empty() {
+        (0, 0, 0, 0)
+    } else {
+        let (time, frac) = rest.split_once('.').unwrap_or((rest, ""));
+        let mut t = time.split(':');
+        let hour: i64 = t.next()?.parse().ok()?;
+        let min: i64 = t.next()?.parse().ok()?;
+        let sec: i64 = t.next().unwrap_or("0").parse().ok()?;
+        if t.next().is_some() {
+            return None;
+        }
+        let mut frac9 = frac.to_string();
+        frac9.truncate(9);
+        while frac9.len() < 9 {
+            frac9.push('0');
+        }
+        // frac may be empty → "000000000" → 0
+        let nanos: i64 = if frac.is_empty() { 0 } else { frac9.parse().ok()? };
+        (hour, min, sec, nanos)
+    };
+    Some((year, month, day, hour, min, sec, nanos))
+}
+
 pub fn hwm_has_advanced(current: Option<&Hwm>, next: &Hwm) -> bool {
     match current {
         None => true,
         Some(current) => {
-            next.updated_at > current.updated_at
-                || (next.updated_at == current.updated_at && next.last_id > current.last_id)
+            // N7: order by PARSED timestamp components so the date/time separator
+            // (space vs 'T') and fractional-second width can't distort ordering.
+            // Fall back to raw string comparison if either side is unparseable.
+            let ts_ord = match (ts_components(&next.updated_at), ts_components(&current.updated_at)) {
+                (Some(n), Some(c)) => n.cmp(&c),
+                _ => next.updated_at.as_str().cmp(current.updated_at.as_str()),
+            };
+            match ts_ord {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Less => false,
+                std::cmp::Ordering::Equal => next.last_id > current.last_id,
+            }
         }
     }
 }
@@ -681,5 +732,62 @@ mod tests {
     fn build_commit_properties_without_hwm() {
         let props = build_commit_properties(None);
         let _ = props;
+    }
+
+    fn hwm(ts: &str, id: i64) -> Hwm {
+        Hwm { updated_at: ts.to_string(), last_id: id }
+    }
+
+    #[test]
+    fn advanced_none_current_is_true() {
+        assert!(hwm_has_advanced(None, &hwm("2024-01-01 00:00:00", 1)));
+    }
+
+    #[test]
+    fn advanced_space_vs_t_separator_same_instant() {
+        // Same instant, space vs 'T' separator, equal id — NOT advanced.
+        assert!(!hwm_has_advanced(
+            Some(&hwm("2024-01-15T10:30:00", 5)),
+            &hwm("2024-01-15 10:30:00", 5)
+        ));
+        // Same timestamps, higher next id — tie-break advances.
+        assert!(hwm_has_advanced(
+            Some(&hwm("2024-01-15T10:30:00", 5)),
+            &hwm("2024-01-15 10:30:00", 6)
+        ));
+    }
+
+    #[test]
+    fn advanced_fractional_width_equal() {
+        // .5 vs .500 at same instant/id — equal, not advanced.
+        assert!(!hwm_has_advanced(
+            Some(&hwm("2024-01-15 10:30:00.500", 5)),
+            &hwm("2024-01-15 10:30:00.5", 5)
+        ));
+    }
+
+    #[test]
+    fn advanced_by_timestamp() {
+        // Later ts wins despite a lower id.
+        assert!(hwm_has_advanced(
+            Some(&hwm("2024-01-15 10:30:00", 5)),
+            &hwm("2024-01-15 10:30:01", 1)
+        ));
+    }
+
+    #[test]
+    fn advanced_fraction_ordering() {
+        // 0.9 > 0.10 numerically — raw lexicographic string comparison would get
+        // this WRONG since "10" < "9".
+        assert!(hwm_has_advanced(
+            Some(&hwm("2024-01-15 10:30:00.10", 1)),
+            &hwm("2024-01-15 10:30:00.9", 1)
+        ));
+    }
+
+    #[test]
+    fn advanced_unparseable_falls_back_to_string() {
+        // Both unparseable — falls back to raw string comparison ("zzzz" > "zzz").
+        assert!(hwm_has_advanced(Some(&hwm("zzz", 1)), &hwm("zzzz", 1)));
     }
 }

@@ -146,16 +146,25 @@ where
             let chunk_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
             let arrow_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
             let new_max = batches.iter().filter_map(|b| extract_max_id(b, insert_col)).max();
-            if chunk_rows == batch_size {
-                match new_max {
-                    None => bail!(
-                        "two-stream insert batch for table `{table_name}` could not extract max `{insert_col}` from a full chunk; `{insert_col}` must be a supported integer type (check for an unsupported column type or a missing column)"
-                    ),
-                    Some(m) if hwm_id.is_some_and(|current| m <= current) => bail!(
-                        "two-stream insert batch for table `{table_name}` did not advance insert cursor `{insert_col}` on a full chunk"
-                    ),
-                    Some(_) => {}
-                }
+            // N2-r: appending a non-empty chunk whose insert cursor `{insert_col}` yields no
+            // max (present by name but an unextractable integer type, or BIGINT UNSIGNED past
+            // i64::MAX) leaves `hwm_id` unadvanced → the same rows re-append and duplicate on
+            // the next run. Unsafe on ANY chunk (full or terminal-partial).
+            if new_max.is_none() {
+                bail!(
+                    "two-stream insert batch for table `{table_name}` could not extract max \
+                     `{insert_col}` from a non-empty chunk; `{insert_col}` must be a supported \
+                     integer type (check for an unsupported column type or a missing column) — \
+                     appending would duplicate rows on the next run"
+                );
+            }
+            if chunk_rows == batch_size
+                && new_max.is_some_and(|m| hwm_id.is_some_and(|current| m <= current))
+            {
+                bail!(
+                    "two-stream insert batch for table `{table_name}` did not advance insert \
+                     cursor `{insert_col}` on a full chunk"
+                );
             }
             if self.progress { info!(table = table_name, rows = chunk_rows, extract_ms, "two-stream insert: extracted, appending"); }
             let t_write = Instant::now();
@@ -215,16 +224,27 @@ where
             let new_hwm = batches
                 .last()
                 .and_then(|b| extract_hwm_from_batch(b, update_col, insert_col));
-            if chunk_rows == batch_size {
-                match new_hwm.as_ref() {
-                    None => bail!(
-                        "two-stream update batch for table `{table_name}` could not extract HWM from a full batch"
-                    ),
-                    Some(next_hwm) if !hwm_has_advanced(update_hwm.as_ref(), next_hwm) => bail!(
-                        "two-stream update batch for table `{table_name}` did not advance HWM on a full batch"
-                    ),
-                    Some(_) => {}
-                }
+            // N2-r: same watermark-advancement invariant as the insert stream / incremental
+            // path. The update query filters `{update_col} IS NOT NULL`, so a non-empty batch
+            // with no extractable HWM means an unextractable cursor/key type; proceeding would
+            // re-process the same window on every run (and duplicate on the append path).
+            if new_hwm.is_none() {
+                bail!(
+                    "two-stream update batch for table `{table_name}` could not extract a HWM \
+                     from a non-empty batch — cursor `{update_col}`/`{insert_col}` is present but \
+                     not an extractable type; re-processing would repeat on the next run. Fix the \
+                     cursor column type or full_refresh the table"
+                );
+            }
+            if chunk_rows == batch_size
+                && new_hwm
+                    .as_ref()
+                    .is_some_and(|next_hwm| !hwm_has_advanced(update_hwm.as_ref(), next_hwm))
+            {
+                bail!(
+                    "two-stream update batch for table `{table_name}` did not advance HWM on a \
+                     full batch"
+                );
             }
             if self.progress { info!(table = table_name, rows = chunk_rows, extract_ms, "two-stream update: extracted, merging"); }
             let t_write = Instant::now();
