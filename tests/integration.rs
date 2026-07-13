@@ -1938,3 +1938,106 @@ async fn two_stream_config_seed_persists_when_both_streams_write_nothing() {
         .expect("D3: the config insert seed must be persisted even though no stream wrote");
     assert_eq!(insert_hwm, 100, "persisted insert seed should be the config last_id");
 }
+
+// P1-r-a: `BatchExtractor` now reuses one pooled MySQL connection across a table's batch
+// windows instead of opening a fresh `mysql::Conn` per `extract()` call. This test drives a
+// real keyset-pagination loop against a live MariaDB container across MANY windows (5000
+// rows / batch_size 500 => 10 windows) on a single `BatchExtractor`, proving the pooled
+// connection is neither dropped nor corrupted by sequential reuse: every row is read exactly
+// once (no drops from a stale/dead reused connection, no duplicates from a connection handed
+// back mid-result).
+#[tokio::test]
+async fn extractor_reuses_pooled_connection_across_windows() {
+    use deltalake::arrow::array::Int64Array;
+    use parket::extractor::BatchExtractor;
+
+    let db = Mariadb::default()
+        .with_env_var("MARIADB_ROOT_PASSWORD", "testpwd")
+        .with_env_var("MARIADB_DATABASE", "parket")
+        .start()
+        .await
+        .expect("MariaDB container failed to start");
+
+    let db_host = db.get_host().await.unwrap();
+    let db_port = db.get_host_port_ipv4(3306).await.unwrap();
+    let db_url = format!("mysql://root:testpwd@{db_host}:{db_port}/parket");
+
+    let pool = MySqlPool::connect(&db_url)
+        .await
+        .expect("failed to connect to MariaDB");
+
+    sqlx::query(
+        "CREATE TABLE reuse_probe (\
+            id BIGINT AUTO_INCREMENT PRIMARY KEY, \
+            val VARCHAR(50) NOT NULL\
+        )",
+    )
+    .execute(&pool)
+    .await
+    .expect("failed to create reuse_probe table");
+
+    const TOTAL_ROWS: usize = 5000;
+    const INSERT_CHUNK: usize = 500;
+    for chunk_start in (0..TOTAL_ROWS).step_by(INSERT_CHUNK) {
+        let chunk_end = (chunk_start + INSERT_CHUNK).min(TOTAL_ROWS);
+        let values: Vec<String> = (chunk_start..chunk_end)
+            .map(|i| format!("('row-{i}')"))
+            .collect();
+        let sql = format!("INSERT INTO reuse_probe (val) VALUES {}", values.join(", "));
+        sqlx::query(&sql)
+            .execute(&pool)
+            .await
+            .expect("failed to insert reuse_probe seed chunk");
+    }
+
+    // Small default_batch_size (500) with no avg_row_length hint => calculate_batch_size(None)
+    // falls back to default_batch_size, forcing 5000 rows across 10 windows on ONE extractor.
+    let mut extractor = BatchExtractor::new(&db_url, 512, 500);
+    extractor.calculate_batch_size(None);
+    let window_size = extractor.batch_size();
+    assert_eq!(window_size, 500, "sanity: batch size should be the configured default");
+
+    let mut last_id: i64 = 0;
+    let mut total_rows: usize = 0;
+    let mut windows: usize = 0;
+
+    loop {
+        let sql = format!(
+            "SELECT id, val FROM reuse_probe WHERE id > {last_id} ORDER BY id ASC LIMIT {window_size}"
+        );
+        let extraction = extractor
+            .extract(&sql)
+            .expect("extract failed on a pooled/reused connection");
+        windows += 1;
+
+        if extraction.batches.is_empty() {
+            break;
+        }
+
+        for batch in &extraction.batches {
+            total_rows += batch.num_rows();
+            let id_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column should decode as Int64Array");
+            for v in id_col.iter().flatten() {
+                if v > last_id {
+                    last_id = v;
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        total_rows, TOTAL_ROWS,
+        "reuse across {windows} windows on one pooled connection must read every row exactly \
+         once (no drops, no duplicates)"
+    );
+    assert!(
+        windows > 1,
+        "expected multiple windows to actually exercise connection reuse, got {windows}"
+    );
+
+    pool.close().await;
+}

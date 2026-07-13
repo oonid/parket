@@ -18,6 +18,11 @@ pub struct BatchExtractor {
     default_batch_size: u64,
     batch_size: u64,
     adapted: bool,
+    /// P1: a pooled MySQL connection reused across batch windows. Taken out on each extract,
+    /// returned to the pool ONLY after a clean (non-truncated, error-free) window; dropped on
+    /// truncation or error so the next call opens fresh (identical to the old fresh-conn-per-call,
+    /// preserving M2 breaker semantics).
+    conn: Option<connector_arrow::mysql::MySQLConnection<mysql::Conn>>,
 }
 
 impl BatchExtractor {
@@ -28,6 +33,7 @@ impl BatchExtractor {
             default_batch_size,
             batch_size: default_batch_size,
             adapted: false,
+            conn: None,
         }
     }
 
@@ -49,34 +55,71 @@ impl BatchExtractor {
         self.batch_size
     }
 
-    pub fn extract(&mut self, sql: &str) -> Result<Extraction> {
-        use connector_arrow::api::{Connector, Statement};
-        use connector_arrow::mysql::MySQLConnection;
-
+    fn open_connection(&self) -> Result<connector_arrow::mysql::MySQLConnection<mysql::Conn>> {
         let opts = mysql::Opts::from_url(&self.database_url)
             .map_err(|e| anyhow::anyhow!("invalid database url: {e}"))?;
         let conn = mysql::Conn::new(opts)
             .map_err(|e| anyhow::anyhow!("MySQL connection failed: {e}"))?;
-        let mut ca_conn = MySQLConnection::new(conn);
-        let mut stmt = ca_conn.query(sql)
-            .map_err(|e| anyhow::anyhow!("query prepare failed: {e}"))?;
-        let reader = stmt.start([])
-            .map_err(|e| anyhow::anyhow!("query start failed: {e}"))?;
+        Ok(connector_arrow::mysql::MySQLConnection::new(conn))
+    }
 
-        // M2: iterate the connector_arrow reader INCREMENTALLY (no intermediate collect) so
-        // the mid-stream circuit breaker in extract_from_stream_ca can observe cumulative
-        // window bytes as batches arrive and stop consuming before an unexpectedly fat window
-        // (stale AVG_ROW_LENGTH, wide rows) is fully resident. `TrackErrors` adapts the
-        // reader's `Iterator<Item = Result<RecordBatch, ConnectorError>>` into a plain
-        // `Iterator<Item = RecordBatch>` that stops at the first read error and stashes it,
-        // so extract_from_stream_ca can stay a plain-RecordBatch consumer shared with tests.
-        let mut tracked = TrackErrors { inner: reader, err: None };
-        let extraction = self.extract_from_stream_ca(&mut tracked)?;
-        if let Some(e) = tracked.err {
+    pub fn extract(&mut self, sql: &str) -> Result<Extraction> {
+        // Try the pooled connection; if it was a REUSED one and failed, the server may have
+        // closed it — drop it and retry ONCE with a fresh connection (robustness parity with the
+        // old always-fresh behavior). A genuine query error simply fails again on the retry.
+        let had_pooled = self.conn.is_some();
+        match self.extract_once(sql) {
+            Ok(x) => Ok(x),
+            Err(e) if had_pooled => {
+                self.conn = None;
+                tracing::warn!(error = %e, "pooled MySQL connection failed; retrying once with a fresh connection");
+                self.extract_once(sql)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn extract_once(&mut self, sql: &str) -> Result<Extraction> {
+        use connector_arrow::api::{Connector, Statement};
+
+        // Take the pooled connection out (keeping it a LOCAL so the streaming borrow doesn't
+        // collide with the `&mut self` call into extract_from_stream_ca), or open fresh.
+        let mut ca_conn = match self.conn.take() {
+            Some(c) => c,
+            None => self.open_connection()?,
+        };
+
+        let extraction;
+        let read_err;
+        {
+            let mut stmt = ca_conn.query(sql)
+                .map_err(|e| anyhow::anyhow!("query prepare failed: {e}"))?;
+            let reader = stmt.start([])
+                .map_err(|e| anyhow::anyhow!("query start failed: {e}"))?;
+
+            // M2: iterate the connector_arrow reader INCREMENTALLY (no intermediate collect) so
+            // the mid-stream circuit breaker in extract_from_stream_ca can observe cumulative
+            // window bytes as batches arrive and stop consuming before an unexpectedly fat window
+            // (stale AVG_ROW_LENGTH, wide rows) is fully resident. `TrackErrors` adapts the
+            // reader's `Iterator<Item = Result<RecordBatch, ConnectorError>>` into a plain
+            // `Iterator<Item = RecordBatch>` that stops at the first read error and stashes it,
+            // so extract_from_stream_ca can stay a plain-RecordBatch consumer shared with tests.
+            let mut tracked = TrackErrors { inner: reader, err: None };
+            extraction = self.extract_from_stream_ca(&mut tracked)?;
+            read_err = tracked.err;
+        }
+
+        if let Some(e) = read_err {
+            // ca_conn drops here (NOT returned to the pool) — a mid-stream failure leaves it dirty.
             return Err(anyhow::anyhow!("batch read failed: {e}"));
         }
-        // `stmt`/reader are dropped here (end of scope) — each extract() call opens a fresh
-        // connection, so dropping mid-stream on a breaker truncation is safe and cheap.
+
+        // Discard-on-truncation: a truncated window left the server mid-result, so dropping the
+        // connection (server aborts on socket close) mirrors the old fresh-conn-per-call and keeps
+        // M2 safe. A cleanly-drained full window leaves the connection reusable → pool it.
+        if !extraction.truncated {
+            self.conn = Some(ca_conn);
+        }
         Ok(extraction)
     }
 
