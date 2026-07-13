@@ -378,7 +378,19 @@ pub fn resolve_ts_col_and_mode(
 ) -> Result<(String, ExtractionMode)> {
     let ts_col = match config.table_timestamp_col.get(table) {
         Some(ovr) => {
-            validate_timestamp_col(columns, ovr)?;
+            // O11: an explicitly-configured TABLE_TIMESTAMP is fail-fast validated UNLESS the
+            // table is EXPLICITLY configured for a mode that never reads it — TABLE_MODE=full_refresh
+            // or two-stream (which uses its own update cursor). Validating (and failing) a vestigial
+            // cursor on such a table is spurious. NOTE: an auto-detected full_refresh caused BY an
+            // invalid/absent cursor is deliberately NOT exempted — that validation failure is the
+            // helpful signal that the configured cursor is broken (see the orchestrator test
+            // `explicit_timestamp_cursor_on_filtered_time_column_bails_actionably`).
+            let cursor_unused_by_explicit_mode =
+                matches!(config.table_modes.get(table), Some(ExtractionMode::FullRefresh))
+                    || config.two_stream(table).is_some();
+            if !cursor_unused_by_explicit_mode {
+                validate_timestamp_col(columns, ovr)?;
+            }
             ovr.clone()
         }
         None => detect_timestamp_col(columns).unwrap_or_else(|| "updated_at".to_string()),
@@ -1339,5 +1351,81 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("two-stream requires BOTH"));
+    }
+
+    // O11: an explicitly-configured TABLE_TIMESTAMP is validated unconditionally BEFORE mode
+    // is known, so a vestigial/unused cursor on a table explicitly configured for
+    // full_refresh or two-stream (neither of which reads it) spuriously fails the run. The
+    // gate is knowable from config alone: skip validation iff TABLE_MODE=full_refresh is
+    // explicitly set, or two-stream cursors are configured. An invalid cursor that would
+    // otherwise leave the table auto-detected-incremental-eligible must still fail fast (see
+    // orchestrator's `explicit_timestamp_cursor_on_filtered_time_column_bails_actionably`,
+    // which pins the non-exempt case with no TABLE_MODE override).
+
+    #[test]
+    fn resolve_ts_col_and_mode_invalid_timestamp_with_explicit_full_refresh_is_ok() {
+        // No timestamp column at all, an override pointing at a nonexistent column, but the
+        // table is EXPLICITLY configured full_refresh — the vestigial invalid cursor must not
+        // fail the table.
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("name", "varchar", "varchar(255)"),
+        ];
+        let mut config = test_config();
+        config
+            .table_timestamp_col
+            .insert("t".to_string(), "does_not_exist".to_string());
+        config
+            .table_modes
+            .insert("t".to_string(), ExtractionMode::FullRefresh);
+        let result = resolve_ts_col_and_mode(&columns, &config, "t");
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        let (_, mode) = result.unwrap();
+        assert_eq!(mode, ExtractionMode::FullRefresh);
+    }
+
+    #[test]
+    fn resolve_ts_col_and_mode_invalid_timestamp_with_two_stream_is_ok() {
+        // No timestamp column matching the override, but the table is EXPLICITLY configured
+        // two-stream (which uses its own insert/update cursors, not TABLE_TIMESTAMP) — the
+        // vestigial invalid cursor must not fail the table.
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("user_id", "bigint", "bigint(20)"),
+            col("name", "varchar", "varchar(255)"),
+            col("updated_at", "timestamp", "timestamp"),
+        ];
+        let mut config = test_config();
+        config
+            .table_timestamp_col
+            .insert("t".to_string(), "does_not_exist".to_string());
+        config
+            .table_insert_cursor
+            .insert("t".to_string(), "user_id".to_string());
+        config
+            .table_update_cursor
+            .insert("t".to_string(), "updated_at".to_string());
+        let result = resolve_ts_col_and_mode(&columns, &config, "t");
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        let (_, mode) = result.unwrap();
+        assert_eq!(mode, ExtractionMode::TwoStream);
+    }
+
+    #[test]
+    fn resolve_ts_col_and_mode_invalid_timestamp_without_override_still_errors() {
+        // No TABLE_MODE override, no two-stream configured — an invalid TABLE_TIMESTAMP must
+        // still fail fast (the table would otherwise be incremental-eligible; an
+        // auto-detected full_refresh caused by the broken cursor is exactly the misconfiguration
+        // the user needs to hear about).
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("name", "varchar", "varchar(255)"),
+        ];
+        let mut config = test_config();
+        config
+            .table_timestamp_col
+            .insert("t".to_string(), "does_not_exist".to_string());
+        let result = resolve_ts_col_and_mode(&columns, &config, "t");
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 }

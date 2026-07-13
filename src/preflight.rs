@@ -5,7 +5,7 @@ use object_store::ObjectStore;
 use tracing::{error, info};
 
 use crate::config::Config;
-use crate::discovery::{detect_mode, filter_unsupported_columns, ColumnInfo, SchemaInspector};
+use crate::discovery::{filter_unsupported_columns, ColumnInfo, SchemaInspector};
 
 #[cfg_attr(test, mockall::automock)]
 #[allow(async_fn_in_trait)]
@@ -86,28 +86,7 @@ where
     async fn check_table(&self, table_name: &str) -> Result<()> {
         let columns = self.inspect.discover_columns(table_name).await?;
         let columns = filter_unsupported_columns(&columns);
-        let ts_col = match self.config.table_timestamp_col.get(table_name) {
-            Some(ovr) => {
-                crate::discovery::validate_timestamp_col(&columns, ovr)?;
-                ovr.clone()
-            }
-            None => crate::discovery::detect_timestamp_col(&columns)
-                .unwrap_or_else(|| "updated_at".to_string()),
-        };
-
-        // Resolve TwoStream mode from configuration
-        let has_insert = self.config.table_insert_cursor.contains_key(table_name);
-        let has_update = self.config.table_update_cursor.contains_key(table_name);
-        if has_insert ^ has_update {
-            anyhow::bail!("two-stream requires BOTH TABLE_INSERT_CURSOR_{table_name} and TABLE_UPDATE_CURSOR_{table_name}");
-        }
-        let mode = if let Some((ins, upd)) = self.config.two_stream(table_name) {
-            crate::discovery::validate_two_stream_cursors(&columns, &ins, &upd)?;
-            crate::config::ExtractionMode::TwoStream
-        } else {
-            let mode_override = self.config.table_modes.get(table_name);
-            detect_mode(&columns, mode_override, &ts_col)
-        };
+        let (ts_col, mode) = crate::discovery::resolve_ts_col_and_mode(&columns, &self.config, table_name)?;
 
         if !matches!(mode, crate::config::ExtractionMode::Incremental | crate::config::ExtractionMode::TwoStream)
             && self.config.table_initial_hwm.contains_key(table_name)
