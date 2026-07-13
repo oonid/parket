@@ -41,11 +41,7 @@ impl DeltaWriter {
         if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
             return Ok(());
         }
-        let url = self.table_url(table_name)?;
-        let mut table = deltalake::DeltaTableBuilder::from_url(url)?
-            .with_storage_options(self.storage_options.clone())
-            .build()?;
-        table.load().await?;
+        let table = self.take_cached_table(table_name).await?;
 
         let schema = batches[0].schema();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -117,7 +113,7 @@ impl DeltaWriter {
         let predicate = col(format!("target.{key_col}")).eq(col(format!("source.{key_col}")));
         let commit_properties = build_two_stream_commit_properties(insert_id, update_hwm);
 
-        table
+        let (table, _metrics) = table
             .merge(source, predicate)
             .with_source_alias("source")
             .with_target_alias("target")
@@ -139,6 +135,7 @@ impl DeltaWriter {
             .await?;
 
         info!(table = table_name, rows = total_rows, "merge committed");
+        self.cache_store(table_name, table).await;
         Ok(())
     }
 
@@ -155,16 +152,12 @@ impl DeltaWriter {
         if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
             return Ok(());
         }
-        let url = self.table_url(table_name)?;
-        let mut table = deltalake::DeltaTableBuilder::from_url(url)?
-            .with_storage_options(self.storage_options.clone())
-            .build()?;
-        table.load().await?;
+        let table = self.take_cached_table(table_name).await?;
 
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         let commit_properties = build_two_stream_commit_properties(insert_id, update_hwm);
 
-        table
+        let table = table
             .write(batches)
             .with_save_mode(SaveMode::Append)
             // D1: additive schema evolution (see `DeltaWriter::append_batch`). The batch schema
@@ -174,6 +167,7 @@ impl DeltaWriter {
             .await?;
 
         info!(table = table_name, rows = total_rows, "two-stream insert appended");
+        self.cache_store(table_name, table).await;
         Ok(())
     }
 
@@ -266,11 +260,7 @@ impl DeltaWriter {
         if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
             return Ok(());
         }
-        let url = self.table_url(table_name)?;
-        let mut table = deltalake::DeltaTableBuilder::from_url(url)?
-            .with_storage_options(self.storage_options.clone())
-            .build()?;
-        table.load().await?;
+        let mut table = self.take_cached_table(table_name).await?;
 
         // Dedup the incoming batches by key_col (same pattern as merge_batch).
         let schema = batches[0].schema();
@@ -346,7 +336,7 @@ impl DeltaWriter {
         // 2) APPEND the deduplicated versions; the watermarks ride on this commit.
         let total_rows: usize = deduped_batches.iter().map(|b| b.num_rows()).sum();
         let commit_properties = build_two_stream_commit_properties(insert_id, update_hwm);
-        table
+        let table = table
             .write(deduped_batches)
             .with_save_mode(SaveMode::Append)
             // D1: additive schema evolution (see `DeltaWriter::append_batch`). The batch schema
@@ -355,6 +345,7 @@ impl DeltaWriter {
             .with_commit_properties(commit_properties)
             .await?;
         info!(table = table_name, rows = total_rows, "delete_then_append: appended new versions");
+        self.cache_store(table_name, table).await;
         Ok(())
     }
 }

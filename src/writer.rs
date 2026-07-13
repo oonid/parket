@@ -10,6 +10,7 @@ use deltalake::arrow::record_batch::RecordBatch;
 use deltalake::DeltaTable;
 use deltalake::operations::write::SchemaMode;
 use deltalake::protocol::SaveMode;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 use url::Url;
 
@@ -55,6 +56,11 @@ pub struct DeltaWriter {
     merge_memory_mb: u64,
     /// Optional spill dir for the MERGE external sort; None = system temp.
     merge_spill_dir: Option<std::path::PathBuf>,
+    /// P1: per-table DeltaTable handle reuse across the per-batch write loop, so each
+    /// commit doesn't rebuild + full-`load()` the handle from the `_delta_log`. Arc so the
+    /// writer can be shared; the handle is TAKEN on acquire and the post-commit handle
+    /// STORED back (single-writer-per-table ⇒ always current, no incremental update needed).
+    table_cache: std::sync::Arc<Mutex<HashMap<String, DeltaTable>>>,
 }
 
 impl DeltaWriter {
@@ -83,6 +89,7 @@ impl DeltaWriter {
             use_local_fs: false,
             merge_memory_mb: 512,
             merge_spill_dir: None,
+            table_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -94,6 +101,7 @@ impl DeltaWriter {
             use_local_fs: true,
             merge_memory_mb: 512,
             merge_spill_dir: None,
+            table_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -155,6 +163,22 @@ impl DeltaWriter {
         Ok(table)
     }
 
+    /// P1: take the cached handle for `table_name` (removing it so a consuming write op can
+    /// own it), or fresh-load one. Structured so the mutex guard is never held across the
+    /// `open_table` await.
+    async fn take_cached_table(&self, table_name: &str) -> Result<DeltaTable> {
+        let cached = self.table_cache.lock().await.remove(table_name);
+        match cached {
+            Some(t) => Ok(t),
+            None => self.open_table(table_name).await,
+        }
+    }
+
+    /// P1: store the post-commit handle so the next write in the loop reuses it.
+    async fn cache_store(&self, table_name: &str, table: DeltaTable) {
+        self.table_cache.lock().await.insert(table_name.to_string(), table);
+    }
+
     pub async fn ensure_table(
         &self,
         table_name: &str,
@@ -212,15 +236,12 @@ impl DeltaWriter {
 
         let commit_properties = build_commit_properties(hwm);
 
-        let url = self.table_url(table_name)?;
-        let mut table = deltalake::DeltaTableBuilder::from_url(url)?
-            .with_storage_options(self.storage_options.clone())
-            .build()?;
-        table.load().await?;
+        let table = self.take_cached_table(table_name).await?;
 
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
-        table.write(batches)
+        let table = table
+            .write(batches)
             .with_save_mode(SaveMode::Append)
             // D1: additive schema evolution. `schema_evolution_check` guarantees this batch's
             // schema is a SUPERSET of the Delta table's (new extractable source columns are
@@ -238,6 +259,7 @@ impl DeltaWriter {
             hwm_last_id = ?hwm.as_ref().map(|h| h.last_id),
             "batch committed"
         );
+        self.cache_store(table_name, table).await;
         Ok(())
     }
 
@@ -514,6 +536,105 @@ mod tests {
         let table = writer.open_table("test_table").await.unwrap();
         let files: Vec<_> = table.get_file_uris().unwrap().collect();
         assert_eq!(files.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn append_batch_multiple_calls_preserve_all_rows() {
+        // P1: proves the per-table DeltaTable handle cache (take-on-acquire, store-back
+        // post-commit) is coherent across a sequence of appends — three separate calls to
+        // `append_batch`, each reusing the cached handle from the previous call, must neither
+        // drop nor duplicate rows.
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+
+        writer
+            .ensure_table("test_table", schema.clone())
+            .await
+            .unwrap();
+
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2i64])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+        let hwm1 = Hwm {
+            updated_at: "2026-03-28 09:00:00".to_string(),
+            last_id: 2,
+        };
+        writer
+            .append_batch("test_table", vec![batch1], Some(&hwm1))
+            .await
+            .unwrap();
+
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![3i64, 4i64])),
+                Arc::new(StringArray::from(vec!["c", "d"])),
+            ],
+        )
+        .unwrap();
+        let hwm2 = Hwm {
+            updated_at: "2026-03-28 10:00:00".to_string(),
+            last_id: 4,
+        };
+        writer
+            .append_batch("test_table", vec![batch2], Some(&hwm2))
+            .await
+            .unwrap();
+
+        let batch3 = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![5i64, 6i64])),
+                Arc::new(StringArray::from(vec!["e", "f"])),
+            ],
+        )
+        .unwrap();
+        let hwm3 = Hwm {
+            updated_at: "2026-03-28 11:00:00".to_string(),
+            last_id: 6,
+        };
+        writer
+            .append_batch("test_table", vec![batch3], Some(&hwm3))
+            .await
+            .unwrap();
+
+        // Fresh-load (a brand new handle, bypassing the writer's cache) and verify all 6 rows
+        // are present exactly once each.
+        let table = writer.open_table("test_table").await.unwrap();
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        let provider = table.table_provider().await.unwrap();
+        ctx.register_table("test_table", provider).unwrap();
+        let result = ctx
+            .sql("SELECT COUNT(*) AS c, COUNT(DISTINCT id) AS d FROM test_table")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let b = &result[0];
+        let count = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let distinct = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(count, 6, "all 3 cached appends' rows must be present");
+        assert_eq!(distinct, 6, "no row should be duplicated across cached appends");
     }
 
     #[tokio::test]
