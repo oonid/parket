@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use tracing::{warn, info};
 use sqlx::MySqlPool;
 
+use crate::config::Config;
 use crate::config::ExtractionMode;
 
 /// Common timestamp cursor column names, in priority order. Used to auto-detect an
@@ -365,6 +366,38 @@ pub fn detect_mode(
     }
 }
 
+/// Shared mode + timestamp-cursor resolver (O7/O12): the SINGLE source of truth for turning a
+/// table's discovered columns + config into its `(ts_col, ExtractionMode)`. Both the extraction
+/// run (orchestrator) and `--verify` call this so they can never disagree about a table's mode
+/// (O12: a third divergent copy in the verify path previously verified auto-detected-incremental
+/// tables as Basic). Behavior-preserving extraction of the orchestrator's prior inline logic.
+pub fn resolve_ts_col_and_mode(
+    columns: &[ColumnInfo],
+    config: &Config,
+    table: &str,
+) -> Result<(String, ExtractionMode)> {
+    let ts_col = match config.table_timestamp_col.get(table) {
+        Some(ovr) => {
+            validate_timestamp_col(columns, ovr)?;
+            ovr.clone()
+        }
+        None => detect_timestamp_col(columns).unwrap_or_else(|| "updated_at".to_string()),
+    };
+
+    let has_insert = config.table_insert_cursor.contains_key(table);
+    let has_update = config.table_update_cursor.contains_key(table);
+    if has_insert ^ has_update {
+        bail!("two-stream requires BOTH TABLE_INSERT_CURSOR_{table} and TABLE_UPDATE_CURSOR_{table}");
+    }
+    let mode = if let Some((ins, upd)) = config.two_stream(table) {
+        validate_two_stream_cursors(columns, &ins, &upd)?;
+        ExtractionMode::TwoStream
+    } else {
+        detect_mode(columns, config.table_modes.get(table), &ts_col)
+    };
+    Ok((ts_col, mode))
+}
+
 pub fn validate_timestamp_col(columns: &[ColumnInfo], timestamp_col: &str) -> anyhow::Result<()> {
     let ok = columns.iter().any(|c| c.name == timestamp_col
         && (c.data_type == "timestamp" || c.data_type == "datetime"));
@@ -451,6 +484,34 @@ struct MySqlIndexRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    /// Minimal `Config` builder for `resolve_ts_col_and_mode` unit tests. `Config` has no
+    /// test-only constructor and none is added here (config.rs is not touched) — all fields
+    /// are `pub`, so this is just a struct literal with the fields the resolver reads left
+    /// as their empty/default values, mirroring `tests/integration.rs`'s `make_config`.
+    fn test_config() -> Config {
+        Config {
+            database_url: String::new(),
+            s3_bucket: String::new(),
+            s3_access_key_id: String::new(),
+            s3_secret_access_key: String::new(),
+            tables: Vec::new(),
+            target_memory_mb: 64,
+            merge_memory_mb: 64,
+            merge_spill_dir: None,
+            s3_endpoint: None,
+            s3_region: String::new(),
+            s3_prefix: String::new(),
+            default_batch_size: 10_000,
+            rust_log: String::new(),
+            table_modes: HashMap::new(),
+            table_initial_hwm: HashMap::new(),
+            table_timestamp_col: HashMap::new(),
+            table_insert_cursor: HashMap::new(),
+            table_update_cursor: HashMap::new(),
+        }
+    }
 
     fn col(name: &str, data_type: &str, column_type: &str) -> ColumnInfo {
         ColumnInfo {
@@ -1193,5 +1254,90 @@ mod tests {
         let cols_a = vec![col("id", "int", "int(11)")];
         let cols_b = vec![col("id", "int", "int(20)")];
         assert_ne!(compute_schema_hash(&cols_a), compute_schema_hash(&cols_b));
+    }
+
+    // O12: `resolve_ts_col_and_mode` is the shared resolver both the orchestrator run and
+    // `--verify` now call, so they can never disagree about a table's mode. These tests cover
+    // the resolver's own logic (auto-detected incremental, no-id full_refresh, explicit
+    // override honored, two-stream, and the has-one-of-two-cursors error) directly, in
+    // addition to the pre-existing `detect_mode`/`detect_timestamp_col` unit tests it composes.
+
+    #[test]
+    fn resolve_ts_col_and_mode_auto_detects_incremental() {
+        // id + a non-null updated_at, no explicit TABLE_MODE — this is exactly the O12 case:
+        // the run auto-detects Incremental, and verify must resolve identically instead of
+        // reading explicit table_modes only (which would see None and fall back to Basic).
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("updated_at", "timestamp", "timestamp"),
+        ];
+        let config = test_config();
+        let (ts_col, mode) = resolve_ts_col_and_mode(&columns, &config, "orders").unwrap();
+        assert_eq!(ts_col, "updated_at");
+        assert_eq!(mode, ExtractionMode::Incremental);
+    }
+
+    #[test]
+    fn resolve_ts_col_and_mode_no_id_is_full_refresh() {
+        let columns = vec![
+            col("name", "varchar", "varchar(255)"),
+            col("updated_at", "timestamp", "timestamp"),
+        ];
+        let config = test_config();
+        let (_, mode) = resolve_ts_col_and_mode(&columns, &config, "orders").unwrap();
+        assert_eq!(mode, ExtractionMode::FullRefresh);
+    }
+
+    #[test]
+    fn resolve_ts_col_and_mode_explicit_full_refresh_override_honored() {
+        // id + updated_at would auto-detect Incremental, but an explicit TABLE_MODE override
+        // must win.
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("updated_at", "timestamp", "timestamp"),
+        ];
+        let mut config = test_config();
+        config
+            .table_modes
+            .insert("orders".to_string(), ExtractionMode::FullRefresh);
+        let (_, mode) = resolve_ts_col_and_mode(&columns, &config, "orders").unwrap();
+        assert_eq!(mode, ExtractionMode::FullRefresh);
+    }
+
+    #[test]
+    fn resolve_ts_col_and_mode_two_stream_when_both_cursors_configured() {
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("user_id", "bigint", "bigint(20)"),
+            col("updated_at", "timestamp", "timestamp"),
+        ];
+        let mut config = test_config();
+        config
+            .table_insert_cursor
+            .insert("orders".to_string(), "user_id".to_string());
+        config
+            .table_update_cursor
+            .insert("orders".to_string(), "updated_at".to_string());
+        let (_, mode) = resolve_ts_col_and_mode(&columns, &config, "orders").unwrap();
+        assert_eq!(mode, ExtractionMode::TwoStream);
+    }
+
+    #[test]
+    fn resolve_ts_col_and_mode_one_sided_two_stream_cursor_errors() {
+        // Only TABLE_INSERT_CURSOR set, no TABLE_UPDATE_CURSOR — must error, not silently
+        // treat it as non-two-stream.
+        let columns = vec![
+            col("id", "int", "int(11)"),
+            col("user_id", "bigint", "bigint(20)"),
+            col("updated_at", "timestamp", "timestamp"),
+        ];
+        let mut config = test_config();
+        config
+            .table_insert_cursor
+            .insert("orders".to_string(), "user_id".to_string());
+        let result = resolve_ts_col_and_mode(&columns, &config, "orders");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("two-stream requires BOTH"));
     }
 }

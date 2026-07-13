@@ -1775,6 +1775,138 @@ async fn verify_key_set_works_with_non_id_primary_key() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn verify_auto_detected_incremental_scopes_to_hwm_not_basic() {
+    // O12: a table with `id` + a NOT NULL timestamp cursor, but NO explicit TABLE_MODE, is
+    // auto-detected as Incremental by the run (`discovery::detect_mode`). Before this fix,
+    // `--verify` resolved mode from `config.table_modes` ONLY — since no TABLE_MODE is set
+    // here, it saw `None` and fell back to `VerifyMode::Basic`, a full unscoped comparison.
+    //
+    // The discriminator: after syncing, we insert additional rows into the SOURCE with
+    // `updated_at` strictly AFTER the stored HWM, without re-running the pipeline, so Delta
+    // does NOT have them. We resolve mode via the ACTUAL shared resolver
+    // (`discovery::resolve_ts_col_and_mode`, the same one `--verify` now calls) and assert it
+    // picks Incremental for this no-TABLE_MODE table — proving verify no longer silently
+    // falls through to Basic for it. Using that resolved Incremental mode, verify scopes the
+    // comparison to `updated_at <= HWM`, correctly excluding the post-HWM rows, and reports
+    // Clean via an exact, confirmed Pass (schema + key-stats + value-aggregates all match
+    // within the HWM window).
+    //
+    // (Note on the OLD Basic path: verify.rs's `key_stats_outcome` deliberately treats a
+    // source-grew-past-sync row-count mismatch as a non-blocking `Drift`, not `Discrepancy`
+    // — by design, to avoid false alarms on legitimately-growing tables — so `VerifyVerdict`
+    // alone doesn't flip to Discrepancy under old Basic for this exact scenario either.
+    // Crucially, `run_one_table` only runs the deeper per-column value-aggregate check when
+    // the row/key-stats check itself is an exact `Pass` (see verify.rs: `if
+    // matches!(outcome, TableOutcome::Pass)`) — so under old Basic, that Drift short-circuits
+    // BEFORE any value check runs, meaning real corruption in the already-synced rows would
+    // go completely unverified. The real O12 "false confidence" is exactly this: Basic can
+    // never get past the unscoped count mismatch to actually confirm the synced rows are
+    // correct, whereas the fixed Incremental scoping does the full confirming comparison. The
+    // resolved-mode assertion below is what proves the run/verify divergence is closed.)
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let env = TestEnv::new(vec!["events"]).await;
+
+    sqlx::query(
+        "CREATE TABLE events (id BIGINT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(50) NOT NULL, updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6))",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create events table");
+
+    sqlx::query(
+        "INSERT INTO events (name, updated_at) VALUES ('alpha', '2026-01-01 00:00:00.000000'), ('bravo', '2026-01-02 00:00:00.000000')",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert initial events rows");
+
+    // No TABLE_MODE_events is configured (make_config's table_modes is empty) — the run must
+    // auto-detect Incremental from id + non-null updated_at.
+    let mut orchestrator = env.make_orchestrator();
+    let exit_code = orchestrator.run().await;
+    assert!(
+        matches!(exit_code, ExitCode::Success),
+        "expected Success exit code, got {exit_code:?}"
+    );
+
+    let writer_for_hwm = DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    );
+    let hwm = writer_for_hwm
+        .read_hwm("events")
+        .await
+        .expect("read_hwm failed for events")
+        .expect("auto-detected incremental events table should have an HWM after sync");
+
+    // Insert rows strictly AFTER the stored HWM directly into the source, without
+    // re-running the pipeline, so Delta does NOT have them.
+    sqlx::query(
+        "INSERT INTO events (name, updated_at) VALUES ('post-hwm-1', '2026-01-05 00:00:00.000000'), ('post-hwm-2', '2026-01-06 00:00:00.000000')",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert post-HWM events rows");
+
+    // Resolve mode via the ACTUAL shared resolver (the same one `--verify` now calls in
+    // src/main.rs), not a hand-authored VerifyMode — this is what proves the resolver itself
+    // detects Incremental for this auto-detected table instead of falling back to Basic.
+    let inspector = parket::discovery::SchemaInspector::new(env.pool.clone(), "parket".to_string());
+    let raw_columns = inspector
+        .discover_columns("events")
+        .await
+        .expect("discover_columns failed for events");
+    let columns = parket::discovery::filter_unsupported_columns(&raw_columns);
+    let (ts_col, mode) = parket::discovery::resolve_ts_col_and_mode(&columns, &env.config, "events")
+        .expect("resolve_ts_col_and_mode failed for events");
+    assert_eq!(ts_col, "updated_at");
+    assert_eq!(
+        mode,
+        parket::config::ExtractionMode::Incremental,
+        "auto-detected mode for events (id + non-null updated_at, no TABLE_MODE override) must \
+         be Incremental — this is the exact table shape O12 mis-verified as Basic"
+    );
+
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let verdict = VerifyCommand::new(source, delta, vec!["events".to_string()])
+        .with_table_plans(vec![TablePlan {
+            table: "events".to_string(),
+            mode: VerifyMode::Incremental {
+                cursor_col: ts_col,
+                hwm: Some(hwm),
+            },
+        }])
+        .with_deep(true)
+        .run()
+        .await
+        .expect("verify should succeed for auto-detected incremental events table");
+
+    assert_eq!(
+        verdict,
+        VerifyVerdict::Clean,
+        "incremental-scoped verify must exclude the post-HWM source rows and report Clean — \
+         proving --verify resolved this auto-detected table as Incremental, not Basic"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn table_with_time_year_bit_columns_syncs_with_columns_skipped() {
     // N1/O8: TIME/YEAR/BIT are not in discovery::EXTRACTABLE_DATA_TYPES. Pre-fix, `t`
     // (TIME) and `y` (YEAR) would reach the vendored connector_arrow's `create_field`

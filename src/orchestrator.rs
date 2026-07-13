@@ -9,7 +9,7 @@ use tracing::{error, info};
 
 use crate::config::{Config, ExtractionMode};
 use crate::discovery::{
-    ColumnInfo, IndexInfo, compute_schema_hash, detect_mode, filter_unsupported_columns,
+    ColumnInfo, IndexInfo, compute_schema_hash, filter_unsupported_columns,
 };
 use crate::state::{AppState, TableState};
 use crate::writer::Hwm;
@@ -262,28 +262,7 @@ where
         // longer present in `columns` at all, so `validate_timestamp_col` bails
         // actionably ("missing or not a timestamp/datetime column") — a per-table
         // error, not a panic and not silent (N1/O8 consequence check).
-        let ts_col = match self.config.table_timestamp_col.get(table_name) {
-            Some(ovr) => {
-                crate::discovery::validate_timestamp_col(&columns, ovr)?;
-                ovr.clone()
-            }
-            None => crate::discovery::detect_timestamp_col(&columns)
-                .unwrap_or_else(|| "updated_at".to_string()),
-        };
-
-        // Resolve TwoStream mode from configuration
-        let has_insert = self.config.table_insert_cursor.contains_key(table_name);
-        let has_update = self.config.table_update_cursor.contains_key(table_name);
-        if has_insert ^ has_update {
-            anyhow::bail!("two-stream requires BOTH TABLE_INSERT_CURSOR_{table_name} and TABLE_UPDATE_CURSOR_{table_name}");
-        }
-        let mode = if let Some((ins, upd)) = self.config.two_stream(table_name) {
-            crate::discovery::validate_two_stream_cursors(&columns, &ins, &upd)?;
-            ExtractionMode::TwoStream
-        } else {
-            let mode_override = self.config.table_modes.get(table_name);
-            detect_mode(&columns, mode_override, &ts_col)
-        };
+        let (ts_col, mode) = crate::discovery::resolve_ts_col_and_mode(&columns, &self.config, table_name)?;
 
         let mode_str = match mode {
             ExtractionMode::Incremental => "incremental",

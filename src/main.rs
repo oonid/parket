@@ -99,6 +99,7 @@ fn log_startup_banner(config: &config::Config, local_dir: Option<&std::path::Pat
 async fn build_verify_table_plans(
     config: &config::Config,
     writer: &DeltaWriter,
+    inspector: &parket::discovery::SchemaInspector,
     tables: &[String],
 ) -> anyhow::Result<Vec<parket::verify::TablePlan>> {
     let mut plans = Vec::with_capacity(tables.len());
@@ -119,25 +120,38 @@ async fn build_verify_table_plans(
                 update_hwm,
                 insert_hwm,
             }
-        } else if matches!(
-            config.table_modes.get(table),
-            Some(config::ExtractionMode::Incremental)
-        ) {
-            let hwm = writer
-                .read_hwm(table)
-                .await
-                .with_context(|| format!("read HWM for verify table `{table}`"))?;
-            parket::verify::VerifyMode::Incremental {
-                cursor_col: config.timestamp_col(table).to_string(),
-                hwm,
-            }
-        } else if matches!(
-            config.table_modes.get(table),
-            Some(config::ExtractionMode::FullRefresh)
-        ) {
-            parket::verify::VerifyMode::FullRefresh
         } else {
-            parket::verify::VerifyMode::Basic
+            // O12: resolve mode exactly as the run does, instead of reading explicit
+            // TABLE_MODE only (which mis-verified auto-detected-incremental tables as Basic).
+            match inspector.discover_columns(table).await {
+                Ok(raw_columns) => {
+                    let columns = parket::discovery::filter_unsupported_columns(&raw_columns);
+                    match parket::discovery::resolve_ts_col_and_mode(&columns, config, table) {
+                        Ok((ts_col, config::ExtractionMode::Incremental)) => {
+                            let hwm = writer
+                                .read_hwm(table)
+                                .await
+                                .with_context(|| format!("read HWM for verify table `{table}`"))?;
+                            parket::verify::VerifyMode::Incremental { cursor_col: ts_col, hwm }
+                        }
+                        Ok((_, config::ExtractionMode::FullRefresh)) => {
+                            parket::verify::VerifyMode::FullRefresh
+                        }
+                        // TwoStream is handled by the branch above (config.two_stream was None here);
+                        // Auto is never returned by detect_mode. Either would be a config/logic
+                        // anomaly — fall back to a basic check rather than mis-scope.
+                        Ok(_) => parket::verify::VerifyMode::Basic,
+                        Err(e) => {
+                            tracing::warn!(table = %table, error = %e, "verify: mode resolution failed; falling back to basic checks");
+                            parket::verify::VerifyMode::Basic
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(table = %table, error = %e, "verify: column discovery failed; falling back to basic checks");
+                    parket::verify::VerifyMode::Basic
+                }
+            }
         };
 
         plans.push(parket::verify::TablePlan {
@@ -162,6 +176,8 @@ async fn run_verify(
             return 2;
         }
     };
+    let database = extract_database_name(&config.database_url);
+    let inspector = parket::discovery::SchemaInspector::new(pool.clone(), database);
     let source = parket::verify::SourceProbeAdapter::new(pool);
     let writer = if let Some(dir) = local_dir {
         DeltaWriter::new_local(&dir.to_string_lossy())
@@ -175,7 +191,7 @@ async fn run_verify(
             &config.s3_secret_access_key,
         )
     };
-    let table_plans = match build_verify_table_plans(config, &writer, &tables).await {
+    let table_plans = match build_verify_table_plans(config, &writer, &inspector, &tables).await {
         Ok(plans) => plans,
         Err(e) => {
             eprintln!("verify failed: {e:#}");
