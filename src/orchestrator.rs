@@ -9,7 +9,7 @@ use tracing::{error, info};
 
 use crate::config::{Config, ExtractionMode};
 use crate::discovery::{
-    ColumnInfo, IndexInfo, compute_schema_hash, filter_unsupported_columns,
+    ColumnInfo, IndexInfo, filter_unsupported_columns,
 };
 use crate::state::{AppState, TableState};
 use crate::writer::Hwm;
@@ -211,7 +211,8 @@ where
                             last_run_rows: None,
                             last_run_duration_ms: None,
                             extraction_mode: None,
-                            schema_columns_hash: None,
+                            last_success_at: None,
+                            last_success_rows: None,
                         },
                         &self.state_path,
                     ) {
@@ -351,7 +352,6 @@ where
         };
 
         let elapsed = start.elapsed();
-        let hash = compute_schema_hash(&columns);
         // O2/R4: process_incremental/process_two_stream break their internal batch
         // loops silently on shutdown, so `rows` alone can't distinguish "genuinely
         // finished" from "cut short by the signal". Conservatively treat any shutdown
@@ -360,15 +360,24 @@ where
         // interrupted too, but a rerun is cheap and safe, whereas mislabeling a
         // truncated run as "success" (the bug this fixes) is not.
         let status = if self.check_shutdown() { "interrupted" } else { "success" };
+        let now = format_timestamp_now();
+        // O9: only a genuine success updates the sticky last-success metadata; an interrupted
+        // (partial) run leaves it None so update_table carries the prior success forward.
+        let (last_success_at, last_success_rows) = if status == "success" {
+            (Some(now.clone()), Some(rows))
+        } else {
+            (None, None)
+        };
         self.state_mgr.update_table(
             table_name,
             TableState {
-                last_run_at: Some(format_timestamp_now()),
+                last_run_at: Some(now),
                 last_run_status: Some(status.to_string()),
                 last_run_rows: Some(rows),
                 last_run_duration_ms: Some(elapsed.as_millis() as u64),
                 extraction_mode: Some(mode_str.to_string()),
-                schema_columns_hash: Some(hash),
+                last_success_at,
+                last_success_rows,
             },
             &self.state_path,
         )?;
@@ -750,7 +759,6 @@ mod tests {
                     && state.last_run_rows.is_none()
                     && state.last_run_duration_ms.is_none()
                     && state.extraction_mode.is_none()
-                    && state.schema_columns_hash.is_none()
                     && state.last_run_at.is_some()
             })
             .returning(|_, _, _| Ok(()));

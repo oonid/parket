@@ -551,7 +551,8 @@ mod tests {
             last_run_rows: Some(10),
             last_run_duration_ms: Some(5),
             extraction_mode: Some("full".to_string()),
-            schema_columns_hash: Some("abc".to_string()),
+            last_success_at: Some("2024-01-01T00:00:00Z".to_string()),
+            last_success_rows: Some(10),
         };
         adapter
             .update_table("orders", table_state, &path)

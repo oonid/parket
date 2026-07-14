@@ -14,7 +14,14 @@ pub struct TableState {
     pub last_run_rows: Option<u64>,
     pub last_run_duration_ms: Option<u64>,
     pub extraction_mode: Option<String>,
-    pub schema_columns_hash: Option<String>,
+    /// O9: sticky last-successful-sync metadata. Only a genuine `success` run updates these;
+    /// a failed/interrupted run carries them forward (see `update_table`), so the record of
+    /// the last clean sync is never erased by a later failure. `#[serde(default)]` keeps old
+    /// state.json files (written before these fields existed) loadable.
+    #[serde(default)]
+    pub last_success_at: Option<String>,
+    #[serde(default)]
+    pub last_success_rows: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -44,7 +51,16 @@ impl AppState {
         }
     }
 
-    pub fn update_table(&mut self, table_name: &str, state: TableState, path: &Path) -> Result<()> {
+    pub fn update_table(&mut self, table_name: &str, mut state: TableState, path: &Path) -> Result<()> {
+        // O9: last-success metadata is sticky. A failed/interrupted run records its own
+        // last_run_* but must NOT erase when the table last synced cleanly — carry the prior
+        // entry's last_success_* forward whenever this update doesn't itself carry them.
+        if state.last_success_at.is_none()
+            && let Some(prev) = self.tables.get(table_name)
+        {
+            state.last_success_at = prev.last_success_at.clone();
+            state.last_success_rows = prev.last_success_rows;
+        }
         self.tables.insert(table_name.to_string(), state);
         self.write_atomic(path)
     }
@@ -104,7 +120,8 @@ mod tests {
             last_run_rows: Some(50000),
             last_run_duration_ms: Some(3200),
             extraction_mode: Some("incremental".to_string()),
-            schema_columns_hash: Some("abc123".to_string()),
+            last_success_at: Some("2026-03-28T10:00:00Z".to_string()),
+            last_success_rows: Some(50000),
         }
     }
 
@@ -133,7 +150,6 @@ mod tests {
         assert_eq!(ts.last_run_status, Some("success".to_string()));
         assert_eq!(ts.last_run_rows, Some(50000));
         assert_eq!(ts.extraction_mode, Some("incremental".to_string()));
-        assert_eq!(ts.schema_columns_hash, Some("abc123".to_string()));
     }
 
     #[test]
@@ -213,7 +229,8 @@ mod tests {
             last_run_rows: None,
             last_run_duration_ms: None,
             extraction_mode: Some("incremental".to_string()),
-            schema_columns_hash: Some("abc123".to_string()),
+            last_success_at: None,
+            last_success_rows: None,
         };
         state.update_table("orders", failed_state, &path).unwrap();
 
@@ -240,7 +257,8 @@ mod tests {
             last_run_rows: Some(12000),
             last_run_duration_ms: Some(800),
             extraction_mode: Some("full_refresh".to_string()),
-            schema_columns_hash: Some("def456".to_string()),
+            last_success_at: Some("2026-03-28T10:05:00Z".to_string()),
+            last_success_rows: Some(12000),
         };
         state
             .update_table("customers", customer_state, &path)
@@ -315,5 +333,79 @@ mod tests {
 
         let state = AppState::load(&path).unwrap();
         assert!(state.tables.is_empty());
+    }
+
+    #[test]
+    fn update_table_preserves_last_success_on_failure() {
+        // O9: a failed run must not erase the record of when the table last synced
+        // cleanly — update_table carries the prior entry's last_success_* forward
+        // whenever the incoming state doesn't itself carry them.
+        let dir = TempDir::new().unwrap();
+        let path = state_path(&dir);
+
+        let mut state = AppState::default();
+        let success_state = TableState {
+            last_run_at: Some("T1".to_string()),
+            last_run_status: Some("success".to_string()),
+            last_run_rows: Some(100),
+            last_run_duration_ms: Some(500),
+            extraction_mode: Some("incremental".to_string()),
+            last_success_at: Some("T1".to_string()),
+            last_success_rows: Some(100),
+        };
+        state.update_table("orders", success_state, &path).unwrap();
+
+        let failed_state = TableState {
+            last_run_at: Some("T2".to_string()),
+            last_run_status: Some("failed".to_string()),
+            last_run_rows: None,
+            last_run_duration_ms: None,
+            extraction_mode: None,
+            last_success_at: None,
+            last_success_rows: None,
+        };
+        state.update_table("orders", failed_state, &path).unwrap();
+
+        let loaded = AppState::load(&path).unwrap();
+        let ts = loaded.tables.get("orders").unwrap();
+        assert_eq!(ts.last_run_status, Some("failed".to_string()));
+        assert_eq!(ts.last_success_at, Some("T1".to_string()));
+        assert_eq!(ts.last_success_rows, Some(100));
+    }
+
+    #[test]
+    fn update_table_success_sets_and_replaces_last_success() {
+        // A second genuine success must replace (not merge with) the prior
+        // last_success_* values.
+        let dir = TempDir::new().unwrap();
+        let path = state_path(&dir);
+
+        let mut state = AppState::default();
+        let first_success = TableState {
+            last_run_at: Some("T1".to_string()),
+            last_run_status: Some("success".to_string()),
+            last_run_rows: Some(100),
+            last_run_duration_ms: Some(500),
+            extraction_mode: Some("incremental".to_string()),
+            last_success_at: Some("T1".to_string()),
+            last_success_rows: Some(100),
+        };
+        state.update_table("orders", first_success, &path).unwrap();
+
+        let second_success = TableState {
+            last_run_at: Some("T2".to_string()),
+            last_run_status: Some("success".to_string()),
+            last_run_rows: Some(200),
+            last_run_duration_ms: Some(600),
+            extraction_mode: Some("incremental".to_string()),
+            last_success_at: Some("T2".to_string()),
+            last_success_rows: Some(200),
+        };
+        state.update_table("orders", second_success, &path).unwrap();
+
+        let loaded = AppState::load(&path).unwrap();
+        let ts = loaded.tables.get("orders").unwrap();
+        assert_eq!(ts.last_success_at, Some("T2".to_string()));
+        assert_eq!(ts.last_success_rows, Some(200));
     }
 }

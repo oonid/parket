@@ -1,6 +1,5 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tracing::{warn, info};
 use sqlx::MySqlPool;
 
@@ -79,9 +78,8 @@ pub struct ColumnInfo {
     pub name: String,
     pub data_type: String,
     pub column_type: String,
-    /// Whether the source column is `NULL`-able. Not fed into `compute_schema_hash`
-    /// (structural mapping only). Used by `detect_mode`/`detect_timestamp_col` to
-    /// refuse auto-selecting a nullable cursor (O3): the incremental query filters
+    /// Whether the source column is `NULL`-able. Used by `detect_mode`/`detect_timestamp_col`
+    /// to refuse auto-selecting a nullable cursor (O3): the incremental query filters
     /// `WHERE <cursor> IS NOT NULL`, so a nullable cursor silently skips NULL rows.
     pub nullable: bool,
 }
@@ -453,17 +451,6 @@ fn normalize_avg_row_length(avg_row_length: Option<u64>) -> Option<u64> {
     avg_row_length.filter(|v| *v > 0)
 }
 
-pub fn compute_schema_hash(columns: &[ColumnInfo]) -> String {
-    let mut hasher = Sha256::new();
-    for col in columns {
-        hasher.update(col.name.as_bytes());
-        hasher.update(col.data_type.as_bytes());
-        hasher.update(col.column_type.as_bytes());
-    }
-    let result = hasher.finalize();
-    format!("{result:x}")
-}
-
 #[derive(Debug, sqlx::FromRow)]
 struct MySqlColumnRow {
     column_name: String,
@@ -765,57 +752,6 @@ mod tests {
         ];
         let mode = detect_mode(&columns, Some(&ExtractionMode::Incremental), "updated_at");
         assert_eq!(mode, ExtractionMode::Incremental);
-    }
-
-    #[test]
-    fn compute_schema_hash_deterministic() {
-        let columns = vec![
-            col("id", "int", "int(11)"),
-            col("name", "varchar", "varchar(255)"),
-        ];
-        let hash1 = compute_schema_hash(&columns);
-        let hash2 = compute_schema_hash(&columns);
-        assert_eq!(hash1, hash2);
-    }
-
-    #[test]
-    fn compute_schema_hash_changes_with_columns() {
-        let cols_a = vec![
-            col("id", "int", "int(11)"),
-            col("name", "varchar", "varchar(255)"),
-        ];
-        let cols_b = vec![
-            col("id", "int", "int(11)"),
-            col("email", "varchar", "varchar(255)"),
-        ];
-        assert_ne!(compute_schema_hash(&cols_a), compute_schema_hash(&cols_b));
-    }
-
-    #[test]
-    fn compute_schema_hash_changes_with_types() {
-        let cols_a = vec![col("id", "int", "int(11)")];
-        let cols_b = vec![col("id", "bigint", "bigint(20)")];
-        assert_ne!(compute_schema_hash(&cols_a), compute_schema_hash(&cols_b));
-    }
-
-    #[test]
-    fn compute_schema_hash_empty_columns() {
-        let columns: Vec<ColumnInfo> = vec![];
-        let hash = compute_schema_hash(&columns);
-        assert!(!hash.is_empty());
-    }
-
-    #[test]
-    fn compute_schema_hash_order_matters() {
-        let cols_a = vec![
-            col("id", "int", "int(11)"),
-            col("name", "varchar", "varchar(255)"),
-        ];
-        let cols_b = vec![
-            col("name", "varchar", "varchar(255)"),
-            col("id", "int", "int(11)"),
-        ];
-        assert_ne!(compute_schema_hash(&cols_a), compute_schema_hash(&cols_b));
     }
 
     // N1/O8: `UNSUPPORTED_DATA_TYPES` (a geometry-only blocklist) was replaced by the
@@ -1258,14 +1194,6 @@ mod tests {
         assert!(filtered.iter().any(|c| c.name == "text"));
         assert!(!filtered.iter().any(|c| c.name == "bounds"));
         assert!(!filtered.iter().any(|c| c.name == "path"));
-    }
-
-    #[test]
-    fn compute_schema_hash_column_type_matters() {
-        // Different column_type (same name/data_type) should produce different hash.
-        let cols_a = vec![col("id", "int", "int(11)")];
-        let cols_b = vec![col("id", "int", "int(20)")];
-        assert_ne!(compute_schema_hash(&cols_a), compute_schema_hash(&cols_b));
     }
 
     // O12: `resolve_ts_col_and_mode` is the shared resolver both the orchestrator run and
