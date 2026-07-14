@@ -9,7 +9,7 @@ use parket::orchestrator::{
     SchemaInspectorAdapter, SignalHandler, StateManageAdapter,
 };
 use parket::preflight::{
-    NoopPreflightStorage, PreflightCheck, PreflightHwmAdapter, PreflightInspectAdapter,
+    LocalPreflightStorage, PreflightCheck, PreflightHwmAdapter, PreflightInspectAdapter,
     PreflightStorageAdapter,
 };
 use anyhow::Context;
@@ -334,7 +334,7 @@ async fn async_main() {
 
         if let Some(ref dir) = local_dir {
             let hwm = PreflightHwmAdapter::new_local(dir);
-            let check = PreflightCheck::new(config, inspect, NoopPreflightStorage, hwm);
+            let check = PreflightCheck::new(config, inspect, LocalPreflightStorage::new(dir), hwm);
             if let Err(e) = check.run().await {
                 eprintln!("pre-flight check failed: {e}");
                 std::process::exit(2);

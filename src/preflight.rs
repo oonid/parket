@@ -1,6 +1,5 @@
 use anyhow::{bail, Result};
 use object_store::aws::AmazonS3Builder;
-use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use tracing::{error, info};
 
@@ -59,9 +58,9 @@ where
     pub async fn run(&self) -> Result<()> {
         if let Some(ref storage) = self.storage {
             storage.check_writable().await?;
-            info!("S3 bucket connectivity check passed");
+            info!("storage writability check passed");
         } else {
-            info!("S3 connectivity check skipped (local mode)");
+            info!("storage writability check skipped");
         }
 
         println!("{:<30} {:<15} {:<10} {:<15} {:<20} {:<15}", "TABLE", "MODE", "COLUMNS", "AVG_ROW_LEN", "KEY", "HWM");
@@ -190,6 +189,18 @@ impl PreflightInspect for PreflightInspectAdapter {
 pub struct PreflightStorageAdapter {
     s3_builder: AmazonS3Builder,
     bucket: String,
+    prefix: String,
+}
+
+/// Health-check object path — written UNDER `s3_prefix` (O7) so the probe exercises the same
+/// key space as real data (`{prefix}/{table}/...`), catching prefix-scoped IAM misconfig that a
+/// bucket-root probe would miss. An empty prefix falls back to the bucket root.
+fn health_check_path(prefix: &str) -> object_store::path::Path {
+    if prefix.is_empty() {
+        object_store::path::Path::from(".parket-health-check")
+    } else {
+        object_store::path::Path::from(format!("{prefix}/.parket-health-check"))
+    }
 }
 
 impl PreflightStorageAdapter {
@@ -208,6 +219,7 @@ impl PreflightStorageAdapter {
         Self {
             s3_builder: builder,
             bucket: config.s3_bucket.clone(),
+            prefix: config.s3_prefix.clone(),
         }
     }
 }
@@ -215,7 +227,7 @@ impl PreflightStorageAdapter {
 impl PreflightStorage for PreflightStorageAdapter {
     async fn check_writable(&self) -> Result<()> {
         let store = self.s3_builder.clone().build()?;
-        let test_path = ObjectPath::from(".parket-health-check");
+        let test_path = health_check_path(&self.prefix);
         let test_data = object_store::PutPayload::from(b"parket-preflight-check".to_vec());
 
         store
@@ -228,6 +240,32 @@ impl PreflightStorage for PreflightStorageAdapter {
             .await
             .map_err(|e| anyhow::anyhow!("failed to delete from S3 bucket '{}': {e}", self.bucket))?;
 
+        Ok(())
+    }
+}
+
+/// Local-filesystem storage probe (O7): `--check --local <dir>` must actually verify the local
+/// Delta base directory is writable, not silently pass. Creates the dir if needed, then writes and
+/// deletes a probe file — the local analog of the S3 bucket/prefix write check.
+pub struct LocalPreflightStorage {
+    base_dir: std::path::PathBuf,
+}
+
+impl LocalPreflightStorage {
+    pub fn new(base_dir: &std::path::Path) -> Self {
+        Self { base_dir: base_dir.to_path_buf() }
+    }
+}
+
+impl PreflightStorage for LocalPreflightStorage {
+    async fn check_writable(&self) -> Result<()> {
+        std::fs::create_dir_all(&self.base_dir)
+            .map_err(|e| anyhow::anyhow!("local storage dir '{}' is not creatable: {e}", self.base_dir.display()))?;
+        let probe = self.base_dir.join(".parket-health-check");
+        std::fs::write(&probe, b"parket-preflight-check")
+            .map_err(|e| anyhow::anyhow!("local storage dir '{}' is not writable: {e}", self.base_dir.display()))?;
+        std::fs::remove_file(&probe)
+            .map_err(|e| anyhow::anyhow!("failed to clean up probe file in '{}': {e}", self.base_dir.display()))?;
         Ok(())
     }
 }
@@ -1003,5 +1041,36 @@ mod tests {
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn health_check_path_includes_prefix() {
+        assert_eq!(health_check_path("parket").as_ref(), "parket/.parket-health-check");
+        assert_eq!(health_check_path("").as_ref(), ".parket-health-check");
+    }
+
+    #[tokio::test]
+    async fn local_preflight_storage_probes_writable_dir() {
+        let tempdir = tempfile::tempdir().expect("create tempdir");
+        let storage = LocalPreflightStorage::new(tempdir.path());
+        let result = storage.check_writable().await;
+        assert!(result.is_ok(), "expected writable dir to pass: {result:?}");
+
+        let probe = tempdir.path().join(".parket-health-check");
+        assert!(!probe.exists(), "probe file should be cleaned up after check");
+    }
+
+    #[tokio::test]
+    async fn local_preflight_storage_errors_on_unwritable_path() {
+        // Point base_dir at a path whose PARENT is a regular file, so
+        // std::fs::create_dir_all can never succeed in creating it.
+        let tempdir = tempfile::tempdir().expect("create tempdir");
+        let file_path = tempdir.path().join("not_a_dir");
+        std::fs::write(&file_path, b"i am a file, not a directory").expect("write blocking file");
+        let base_dir = file_path.join("sub");
+
+        let storage = LocalPreflightStorage::new(&base_dir);
+        let result = storage.check_writable().await;
+        assert!(result.is_err(), "expected unwritable path to fail: {result:?}");
     }
 }
