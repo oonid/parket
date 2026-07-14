@@ -8,8 +8,11 @@ use deltalake::arrow::array::{Int64Array, StringArray};
 use deltalake::arrow::datatypes::{DataType, Schema as ArrowSchema};
 use deltalake::arrow::record_batch::RecordBatch;
 use deltalake::DeltaTable;
+use deltalake::kernel::Action;
+use deltalake::kernel::transaction::CommitBuilder;
 use deltalake::operations::write::SchemaMode;
-use deltalake::protocol::SaveMode;
+use deltalake::protocol::{DeltaOperation, SaveMode};
+use deltalake::writer::{DeltaWriter as _, RecordBatchWriter};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 use url::Url;
@@ -47,6 +50,19 @@ pub struct Hwm {
     pub last_id: i64,
 }
 
+/// O2-r CP1: state for one in-flight staged-overwrite session on a single table. Holds the
+/// `RecordBatchWriter` across multiple `stage_overwrite_chunk` calls (each `flush()` writes
+/// buffered rows to parquet FILES without committing) and accumulates the resulting `Add`
+/// actions until `commit_overwrite` folds them, plus every current file's `Remove`, into one
+/// atomic commit.
+struct OverwriteSession {
+    writer: RecordBatchWriter,
+    /// Loaded handle for the table being overwritten; used at commit time for the current
+    /// snapshot's file list (the Removes) and the log store.
+    table: DeltaTable,
+    adds: Vec<deltalake::kernel::Add>,
+}
+
 pub struct DeltaWriter {
     bucket: String,
     prefix: String,
@@ -61,6 +77,9 @@ pub struct DeltaWriter {
     /// writer can be shared; the handle is TAKEN on acquire and the post-commit handle
     /// STORED back (single-writer-per-table ⇒ always current, no incremental update needed).
     table_cache: std::sync::Arc<Mutex<HashMap<String, DeltaTable>>>,
+    /// O2-r CP1: per-table staged-overwrite sessions (`begin_overwrite` / `stage_overwrite_chunk`
+    /// / `commit_overwrite`). Additive; not yet driven by production code in this checkpoint.
+    overwrite_sessions: std::sync::Arc<Mutex<HashMap<String, OverwriteSession>>>,
 }
 
 impl DeltaWriter {
@@ -90,6 +109,7 @@ impl DeltaWriter {
             merge_memory_mb: 512,
             merge_spill_dir: None,
             table_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            overwrite_sessions: std::sync::Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -102,6 +122,7 @@ impl DeltaWriter {
             merge_memory_mb: 512,
             merge_spill_dir: None,
             table_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            overwrite_sessions: std::sync::Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -292,6 +313,121 @@ impl DeltaWriter {
             table = table_name,
             rows = total_rows,
             "table overwritten in Delta Lake"
+        );
+        Ok(())
+    }
+
+    /// O2-r CP1: start a staged-overwrite session for `table_name`. Loads the table's current
+    /// handle fresh and builds a `RecordBatchWriter` from its schema; the caller streams chunks
+    /// through `stage_overwrite_chunk` (parquet files written, nothing committed) and finishes
+    /// with `commit_overwrite` (one atomic commit swaps the whole snapshot). The table must
+    /// already exist (callers run `ensure_table` first, as full-refresh does today). Replaces
+    /// any stale session for this table (e.g. from a prior aborted run).
+    pub async fn begin_overwrite(&self, table_name: &str) -> Result<()> {
+        let table = self.open_table(table_name).await?;
+        let writer = RecordBatchWriter::for_table(&table)?;
+
+        self.overwrite_sessions.lock().await.insert(
+            table_name.to_string(),
+            OverwriteSession {
+                writer,
+                table,
+                adds: Vec::new(),
+            },
+        );
+
+        info!(table = table_name, "begin_overwrite: staged-overwrite session started");
+        Ok(())
+    }
+
+    /// O2-r CP1: write one chunk's rows to parquet FILES in the table's storage, WITHOUT
+    /// committing — `flush()` returns the resulting `Add` actions, which are accumulated on the
+    /// session for the final `commit_overwrite`. Requires a session started by `begin_overwrite`.
+    pub async fn stage_overwrite_chunk(
+        &self,
+        table_name: &str,
+        batches: Vec<RecordBatch>,
+    ) -> Result<()> {
+        let mut sessions = self.overwrite_sessions.lock().await;
+        let session = sessions.get_mut(table_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "stage_overwrite_chunk: no overwrite session in progress for table `{table_name}` (call begin_overwrite first)"
+            )
+        })?;
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        for b in batches {
+            session.writer.write(b).await?;
+        }
+        let adds = session.writer.flush().await?;
+        session.adds.extend(adds);
+
+        info!(
+            table = table_name,
+            rows = total_rows,
+            "stage_overwrite_chunk: chunk written to parquet (not committed)"
+        );
+        Ok(())
+    }
+
+    /// O2-r CP1: finish the staged-overwrite session for `table_name` with ONE atomic commit —
+    /// `Remove` actions for every file in the table's CURRENT snapshot, plus `Add` actions for
+    /// every chunk staged since `begin_overwrite`. The Delta transaction log commit IS the
+    /// atomic swap: the prior snapshot stays fully readable until this commit lands; an
+    /// interruption before it leaves the staged parquet orphaned (vacuum-able) with the live
+    /// table untouched. Evicts the P1 table_cache entry afterward — the overwrite advanced the
+    /// version outside that cached handle.
+    pub async fn commit_overwrite(&self, table_name: &str, hwm: Option<&Hwm>) -> Result<()> {
+        let session = {
+            let mut sessions = self.overwrite_sessions.lock().await;
+            sessions.remove(table_name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "commit_overwrite: no overwrite session in progress for table `{table_name}` (call begin_overwrite first)"
+                )
+            })?
+        };
+        let OverwriteSession { table, adds, .. } = session;
+
+        // Current file list, synchronously from the already-loaded (eager) snapshot — no new
+        // I/O and no async stream needed. Every current file becomes a Remove; on a brand-new
+        // table with zero files this is simply empty.
+        let snapshot = table.snapshot()?;
+        let mut actions: Vec<Action> = snapshot
+            .log_data()
+            .iter()
+            .map(|file_view| Action::Remove(file_view.remove_action(true)))
+            .collect();
+        let removed_files = actions.len();
+        let added_files = adds.len();
+        actions.extend(adds.into_iter().map(Action::Add));
+
+        let commit_properties = build_commit_properties(hwm);
+        let log_store = table.log_store();
+        let finalized = CommitBuilder::from(commit_properties)
+            .with_actions(actions)
+            .build(
+                Some(snapshot),
+                log_store,
+                DeltaOperation::Write {
+                    mode: SaveMode::Overwrite,
+                    partition_by: None,
+                    predicate: None,
+                },
+            )
+            .await?;
+
+        // P1's per-table handle cache is now stale (the overwrite advanced the version behind
+        // its back) — evict so the next write op re-loads instead of reusing it.
+        self.table_cache.lock().await.remove(table_name);
+
+        info!(
+            table = table_name,
+            version = finalized.version(),
+            files_removed = removed_files,
+            files_added = added_files,
+            hwm_updated_at = ?hwm.as_ref().map(|h| h.updated_at.as_str()),
+            hwm_last_id = ?hwm.as_ref().map(|h| h.last_id),
+            "commit_overwrite: atomic overwrite committed (single commit swaps entire snapshot)"
         );
         Ok(())
     }
@@ -884,5 +1020,157 @@ mod tests {
 
         let result = writer.read_hwm("nonexistent").await;
         assert!(result.is_err());
+    }
+
+    /// O2-r CP1 de-risker: proves the staged-overwrite session is a single atomic commit, not
+    /// per-chunk commits — begin/stage/stage/commit must advance the table version by EXACTLY
+    /// 1 and leave EXACTLY the newly-staged rows (the prior snapshot's rows are gone).
+    #[tokio::test]
+    async fn atomic_overwrite_replaces_snapshot_in_one_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Utf8, false),
+        ]));
+
+        writer.ensure_table("t", schema.clone()).await.unwrap();
+
+        // Seed the initial snapshot: ids 1,2,3.
+        let seed = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2i64, 3i64])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+        writer.overwrite_table("t", vec![seed], None).await.unwrap();
+
+        let version_before = writer.open_table("t").await.unwrap().version().unwrap();
+
+        // Stage two chunks (ids 10,11 then 12,13) without ever committing per-chunk.
+        writer.begin_overwrite("t").await.unwrap();
+        let chunk1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![10i64, 11i64])),
+                Arc::new(StringArray::from(vec!["x", "y"])),
+            ],
+        )
+        .unwrap();
+        writer.stage_overwrite_chunk("t", vec![chunk1]).await.unwrap();
+
+        let chunk2 = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![12i64, 13i64])),
+                Arc::new(StringArray::from(vec!["z", "w"])),
+            ],
+        )
+        .unwrap();
+        writer.stage_overwrite_chunk("t", vec![chunk2]).await.unwrap();
+
+        writer.commit_overwrite("t", None).await.unwrap();
+
+        // Fresh-load (bypassing any cache) and verify the swap.
+        let table = writer.open_table("t").await.unwrap();
+        let version_after = table.version().unwrap();
+        assert_eq!(
+            version_after,
+            version_before + 1,
+            "commit_overwrite must be a SINGLE commit, not one per staged chunk"
+        );
+
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        let provider = table.table_provider().await.unwrap();
+        ctx.register_table("t", provider).unwrap();
+        let batches = ctx
+            .sql("SELECT id FROM t ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 4, "old rows [1,2,3] must be gone; only the 4 staged rows remain");
+        let ids: Vec<i64> = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        assert_eq!(ids, vec![10, 11, 12, 13]);
+    }
+
+    /// O2-r CP1 de-risker: an aborted staged-overwrite (staged but never committed) must leave
+    /// the live table completely untouched — the staged parquet files are orphaned, not
+    /// referenced by any commit, and readers still see the prior snapshot.
+    #[tokio::test]
+    async fn atomic_overwrite_abort_leaves_table_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Utf8, false),
+        ]));
+
+        writer.ensure_table("t", schema.clone()).await.unwrap();
+
+        let seed = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2i64, 3i64])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+        writer.overwrite_table("t", vec![seed], None).await.unwrap();
+        let version_before = writer.open_table("t").await.unwrap().version().unwrap();
+
+        // Begin + stage, but NEVER commit — simulates an interruption mid-rewrite.
+        writer.begin_overwrite("t").await.unwrap();
+        let chunk = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![99i64])),
+                Arc::new(StringArray::from(vec!["orphan"])),
+            ],
+        )
+        .unwrap();
+        writer.stage_overwrite_chunk("t", vec![chunk]).await.unwrap();
+        // ... abort here: no commit_overwrite call.
+
+        // Fresh-load (bypassing any cache) and verify the prior snapshot is intact.
+        let table = writer.open_table("t").await.unwrap();
+        assert_eq!(
+            table.version().unwrap(),
+            version_before,
+            "an uncommitted staged-overwrite must not advance the table version"
+        );
+
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        let provider = table.table_provider().await.unwrap();
+        ctx.register_table("t", provider).unwrap();
+        let batches = ctx
+            .sql("SELECT id FROM t ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 3, "prior snapshot [1,2,3] must be untouched by the aborted overwrite");
+        let ids: Vec<i64> = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 }
