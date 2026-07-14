@@ -6,34 +6,12 @@ use deltalake::arrow::datatypes::SchemaRef;
 use deltalake::arrow::record_batch::RecordBatch;
 use tracing::info;
 
-use crate::discovery::{ColumnInfo, IndexInfo};
+use crate::discovery::{ColumnInfo, IndexInfo, select_integer_pk};
 use crate::query::QueryBuilder;
 
 use super::Orchestrator;
 use super::schema::align_batches_to_schema;
 use super::{DeltaWrite, Extract, SchemaInspect, StateManage};
-
-fn is_integer_key_column(columns: &[ColumnInfo], key_col: &str) -> bool {
-    columns.iter().any(|column| {
-        column.name == key_col
-            && matches!(
-                column.data_type.as_str(),
-                "tinyint" | "smallint" | "mediumint" | "int" | "bigint"
-            )
-    })
-}
-
-/// Find the table's single-column integer PRIMARY key, if any — used both for
-/// full-refresh keyset pagination and (via the incremental/two-stream paths) as
-/// the default tiebreak/cursor key when no `id` column exists.
-pub(super) fn select_integer_pk(columns: &[ColumnInfo], indexes: &[IndexInfo]) -> Option<String> {
-    indexes
-        .iter()
-        .find(|index| index.name == "PRIMARY" && index.columns.len() == 1)
-        .and_then(|index| index.columns.first())
-        .filter(|key_col| is_integer_key_column(columns, key_col))
-        .cloned()
-}
 
 /// N8: string/text types whose default (often case-insensitive) collation can tie two distinct
 /// values, making an all-columns ORDER BY non-total across OFFSET pages. BINARY forces byte order.

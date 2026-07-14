@@ -9,7 +9,7 @@ use tracing::{error, info};
 
 use crate::config::{Config, ExtractionMode};
 use crate::discovery::{
-    ColumnInfo, IndexInfo, filter_unsupported_columns,
+    ColumnInfo, IndexInfo, filter_unsupported_columns, select_integer_pk,
 };
 use crate::state::{AppState, TableState};
 use crate::writer::Hwm;
@@ -26,7 +26,6 @@ pub use adapters::{DeltaWriterAdapter, ExtractorAdapter, LocalDeltaWriterAdapter
 pub(crate) use adapters::get_schema_impl;
 pub(crate) use schema::schema_evolution_check;
 use schema::mariadb_type_to_arrow;
-use full_refresh::select_integer_pk;
 use datetime::format_timestamp_now;
 
 #[cfg_attr(test, mockall::automock)]

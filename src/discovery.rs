@@ -408,6 +408,28 @@ pub fn resolve_ts_col_and_mode(
     Ok((ts_col, mode))
 }
 
+fn is_integer_key_column(columns: &[ColumnInfo], key_col: &str) -> bool {
+    columns.iter().any(|column| {
+        column.name == key_col
+            && matches!(
+                column.data_type.as_str(),
+                "tinyint" | "smallint" | "mediumint" | "int" | "bigint"
+            )
+    })
+}
+
+/// Find the table's single-column integer PRIMARY key, if any — used both for
+/// full-refresh keyset pagination and (via the incremental/two-stream paths) as
+/// the default tiebreak/cursor key when no `id` column exists.
+pub fn select_integer_pk(columns: &[ColumnInfo], indexes: &[IndexInfo]) -> Option<String> {
+    indexes
+        .iter()
+        .find(|index| index.name == "PRIMARY" && index.columns.len() == 1)
+        .and_then(|index| index.columns.first())
+        .filter(|key_col| is_integer_key_column(columns, key_col))
+        .cloned()
+}
+
 pub fn validate_timestamp_col(columns: &[ColumnInfo], timestamp_col: &str) -> anyhow::Result<()> {
     let ok = columns.iter().any(|c| c.name == timestamp_col
         && (c.data_type == "timestamp" || c.data_type == "datetime"));

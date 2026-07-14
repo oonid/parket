@@ -81,7 +81,7 @@ impl SourceProbe for SourceProbeAdapter {
             .collect())
     }
 
-    /// V3: mirrors `select_integer_pk` in `orchestrator/full_refresh.rs` — exactly one
+    /// V3: mirrors `select_integer_pk` in `discovery.rs` — exactly one
     /// column in the PRIMARY key, and that column is an integer type. Deliberately avoids
     /// selecting any numeric information_schema column (SEQ_IN_INDEX etc. are BIGINT
     /// UNSIGNED and need a CAST to decode via sqlx — simplest to just not select them).
