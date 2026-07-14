@@ -63,6 +63,36 @@ struct OverwriteSession {
     adds: Vec<deltalake::kernel::Add>,
 }
 
+/// O2-r: coerce a batch to `RecordBatchWriter`'s exact target schema. Unlike the old
+/// `table.write()` path (DataFusion, which casts + relabels the input to the table schema),
+/// `RecordBatchWriter` validates each batch's schema STRICTLY — so a NOT NULL source column
+/// (non-nullable Arrow field) or a narrower integer type is rejected. For each target field:
+/// find its column in the batch by NAME, cast it to the target type when they differ (a safe
+/// widening to the Delta type — e.g. Int16→Int32 as N5 intends), and rebuild under the target
+/// schema (which also aligns field nullability). Errors if a target column is absent from the batch.
+fn coerce_batch_to_schema(
+    batch: &RecordBatch,
+    target: &deltalake::arrow::datatypes::SchemaRef,
+) -> Result<RecordBatch> {
+    use deltalake::arrow::compute::cast;
+    let mut columns = Vec::with_capacity(target.fields().len());
+    for field in target.fields() {
+        let col = batch.column_by_name(field.name()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "atomic overwrite: column `{}` expected by the Delta schema is missing from the extracted batch",
+                field.name()
+            )
+        })?;
+        let coerced = if col.data_type() == field.data_type() {
+            col.clone()
+        } else {
+            cast(col, field.data_type())?
+        };
+        columns.push(coerced);
+    }
+    Ok(RecordBatch::try_new(target.clone(), columns)?)
+}
+
 pub struct DeltaWriter {
     bucket: String,
     prefix: String,
@@ -356,8 +386,13 @@ impl DeltaWriter {
         })?;
 
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        // O2-r: coerce each batch to RecordBatchWriter's exact target schema (see
+        // `coerce_batch_to_schema`) — the strict writer rejects a schema that the old tolerant
+        // `table.write()` path would have cast/relabelled.
+        let target_schema = session.writer.arrow_schema();
         for b in batches {
-            session.writer.write(b).await?;
+            let coerced = coerce_batch_to_schema(&b, &target_schema)?;
+            session.writer.write(coerced).await?;
         }
         let adds = session.writer.flush().await?;
         session.adds.extend(adds);
@@ -1103,6 +1138,63 @@ mod tests {
             .values()
             .to_vec();
         assert_eq!(ids, vec![10, 11, 12, 13]);
+    }
+
+    #[tokio::test]
+    async fn atomic_overwrite_coerces_non_nullable_source_batch() {
+        // O2-r regression: a NOT NULL source column arrives as a NON-nullable Arrow field, but the
+        // Delta table schema is all-nullable (column_info_to_v57_schema marks every column
+        // nullable). RecordBatchWriter validates nullability strictly, so without coercion staging
+        // rejects the batch ("RecordBatch schema does not match"). stage_overwrite_chunk coerces to
+        // the writer's target schema, so this succeeds (a safe non-null → nullable widening).
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        // Table schema: all NULLABLE (mirrors column_info_to_v57_schema).
+        let table_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("val", DataType::Utf8, true),
+        ]));
+        writer.ensure_table("t", table_schema).await.unwrap();
+
+        writer.begin_overwrite("t").await.unwrap();
+        // Batch built with a NON-nullable schema, as a NOT NULL source column would produce.
+        let non_nullable_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Utf8, false),
+        ]));
+        let chunk = RecordBatch::try_new(
+            non_nullable_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2i64])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+        writer
+            .stage_overwrite_chunk("t", vec![chunk])
+            .await
+            .expect("staging a non-nullable batch into the nullable table must be coerced, not rejected");
+        writer.commit_overwrite("t", None).await.unwrap();
+
+        let table = writer.open_table("t").await.unwrap();
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        let provider = table.table_provider().await.unwrap();
+        ctx.register_table("t", provider).unwrap();
+        let batches = ctx
+            .sql("SELECT id FROM t ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let ids: Vec<i64> = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        assert_eq!(ids, vec![1, 2], "the coerced non-nullable batch must persist");
     }
 
     /// O2-r CP1 de-risker: an aborted staged-overwrite (staged but never committed) must leave

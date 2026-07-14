@@ -151,6 +151,13 @@ where
             Vec::new()
         };
 
+        // O2-r CP2: stage every chunk's parquet without committing, then commit ONCE at the
+        // end. Nothing is visible to readers (the prior snapshot stays live) until the final
+        // `commit_overwrite`, so an interruption anywhere in the loop below is a clean,
+        // non-destructive abandonment of the staged files rather than a partial rewrite.
+        self.writer.begin_overwrite(table_name).await?;
+        let mut staged_chunks: u64 = 0;
+
         if let Some(key_col) = key_col.as_deref() {
             info!(table = table_name, key_col, "full refresh using keyset pagination");
         } else if let Some(unique_cols) = select_unique_ordering_index(source_columns, indexes) {
@@ -168,27 +175,17 @@ where
 
         loop {
             if self.check_shutdown() {
-                if chunk_index > 0 {
-                    // O2/R4: chunk 0 was already committed as an OVERWRITE, destroying
-                    // the previous complete snapshot; every chunk after that is a
-                    // partial rewrite sitting on top of it. Unlike incremental (whose
-                    // batches are safe, additive appends), breaking out here silently
-                    // used to record a truncated table as "success". Until full refresh
-                    // gets a proper stage-and-swap (write to a shadow location and
-                    // atomically publish only once the whole table is rebuilt —
-                    // registered as a follow-up), treat a shutdown mid-full-refresh as
-                    // a hard per-table failure so the truncation surfaces instead of
-                    // being silently accepted.
-                    bail!(
-                        "interrupted during full refresh: table `{table_name}` is partially \
-                         rewritten (chunk 0 overwrote the previous snapshot); rerun to rebuild \
-                         it completely"
-                    );
-                }
-                // Nothing was extracted or written yet — safe to stop cleanly. The
-                // caller (process_table) will mark this table "interrupted" rather
-                // than "success" once it observes the shutdown signal.
-                info!(table = table_name, "shutdown signal received during full refresh");
+                // O2-r CP2: nothing is committed until the final `commit_overwrite` after
+                // this loop, so a shutdown at ANY point here — before or after chunks were
+                // staged — is safe to just break on: the staged parquet (if any) is
+                // abandoned uncommitted and the previous snapshot is left fully intact. The
+                // caller (process_table) will mark this table "interrupted" rather than
+                // "success" once it observes the shutdown signal.
+                info!(
+                    table = table_name,
+                    "shutdown during full refresh; not committing — the staged overwrite is \
+                     abandoned and the previous snapshot is left intact"
+                );
                 break;
             }
 
@@ -261,15 +258,10 @@ where
                 None
             };
 
-            if chunk_index == 0 {
-                self.writer
-                    .overwrite_table(table_name, batches, None)
-                    .await?;
-            } else {
-                self.writer
-                    .append_batch(table_name, batches, None)
-                    .await?;
-            }
+            self.writer
+                .stage_overwrite_chunk(table_name, batches)
+                .await?;
+            staged_chunks += 1;
 
             total_rows += chunk_rows;
             chunk_index += 1;
@@ -316,6 +308,14 @@ where
                 }
                 last_key = Some(next_key);
             }
+        }
+
+        // O2-r CP2: commit only on a normal finish AND only if something was actually staged.
+        // An empty source must leave the table unchanged (matching the pre-CP2 behavior, where
+        // chunk 0 being empty meant `overwrite_table` was never called); on shutdown, skipping
+        // the commit is exactly what leaves the prior snapshot intact.
+        if !self.check_shutdown() && staged_chunks > 0 {
+            self.writer.commit_overwrite(table_name, None).await?;
         }
 
         Ok(total_rows)
@@ -385,8 +385,14 @@ mod tests {
                 ok_batches(vec![batch])
             });
         writer_mock
-            .expect_overwrite_table()
-            .returning(|_, _, _| Ok(()));
+            .expect_begin_overwrite()
+            .returning(|_| Ok(()));
+        writer_mock
+            .expect_stage_overwrite_chunk()
+            .returning(|_, _| Ok(()));
+        writer_mock
+            .expect_commit_overwrite()
+            .returning(|_, _| Ok(()));
         state_mock
             .expect_update_table()
             .withf(|_, state, _| {
@@ -442,8 +448,12 @@ mod tests {
             ok_batches(vec![batch])
         });
 
-        writer_mock.expect_overwrite_table().times(1).returning(|_, _, _| Ok(()));
-        writer_mock.expect_append_batch().times(2).returning(|_, _, _| Ok(()));
+        // O2-r CP2: three chunks (2, 2, 1 rows) are all staged via stage_overwrite_chunk
+        // (parquet written, not committed) and the whole rewrite becomes visible with a
+        // single commit_overwrite at the end.
+        writer_mock.expect_begin_overwrite().times(1).returning(|_| Ok(()));
+        writer_mock.expect_stage_overwrite_chunk().times(3).returning(|_, _| Ok(()));
+        writer_mock.expect_commit_overwrite().times(1).returning(|_, _| Ok(()));
         state_mock.expect_update_table().returning(|_, _, _| Ok(()));
 
         let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
@@ -500,8 +510,9 @@ mod tests {
             }
         });
 
-        writer_mock.expect_overwrite_table().times(1).returning(|_, _, _| Ok(()));
-        writer_mock.expect_append_batch().times(1).returning(|_, _, _| Ok(()));
+        writer_mock.expect_begin_overwrite().times(1).returning(|_| Ok(()));
+        writer_mock.expect_stage_overwrite_chunk().times(2).returning(|_, _| Ok(()));
+        writer_mock.expect_commit_overwrite().times(1).returning(|_, _| Ok(()));
         state_mock.expect_update_table().returning(|_, _, _| Ok(()));
 
         let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
@@ -561,8 +572,9 @@ mod tests {
             }
         });
 
-        writer_mock.expect_overwrite_table().times(1).returning(|_, _, _| Ok(()));
-        writer_mock.expect_append_batch().times(1).returning(|_, _, _| Ok(()));
+        writer_mock.expect_begin_overwrite().times(1).returning(|_| Ok(()));
+        writer_mock.expect_stage_overwrite_chunk().times(2).returning(|_, _| Ok(()));
+        writer_mock.expect_commit_overwrite().times(1).returning(|_, _| Ok(()));
         state_mock.expect_update_table().returning(|_, _, _| Ok(()));
 
         let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
@@ -621,8 +633,9 @@ mod tests {
             }
         });
 
-        writer_mock.expect_overwrite_table().times(1).returning(|_, _, _| Ok(()));
-        writer_mock.expect_append_batch().times(1).returning(|_, _, _| Ok(()));
+        writer_mock.expect_begin_overwrite().times(1).returning(|_| Ok(()));
+        writer_mock.expect_stage_overwrite_chunk().times(2).returning(|_, _| Ok(()));
+        writer_mock.expect_commit_overwrite().times(1).returning(|_, _| Ok(()));
         state_mock.expect_update_table().returning(|_, _, _| Ok(()));
 
         let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
@@ -649,6 +662,12 @@ mod tests {
         extract_mock.expect_batch_size().returning(|| 10000);
         writer_mock.expect_ensure_table().returning(|_, _| Ok(()));
         writer_mock.expect_get_schema().returning(|_| Ok(None));
+        // O2-r CP2: begin_overwrite always starts the session, but an empty source stages
+        // zero chunks, so stage_overwrite_chunk/commit_overwrite must never be called —
+        // no expectations registered for either means any call into them would panic,
+        // proving the table is left unchanged (matching the pre-CP2 behavior where an
+        // empty chunk 0 never called overwrite_table).
+        writer_mock.expect_begin_overwrite().returning(|_| Ok(()));
         extract_mock.expect_extract().returning(|_| ok_batches(vec![]));
         state_mock.expect_update_table()
             .withf(|_, state, _| {
@@ -699,9 +718,21 @@ mod tests {
             }
         });
 
-        writer_mock.expect_overwrite_table().times(1).returning(|_, _, _| Ok(()));
-        writer_mock.expect_append_batch().times(1)
-            .returning(|_, _, _| Err(anyhow::anyhow!("append failed")));
+        // O2-r CP2: the first chunk stages fine; the second chunk's stage_overwrite_chunk
+        // call fails — must propagate just like the old second-chunk append_batch failure
+        // did, and commit_overwrite must never be reached.
+        writer_mock.expect_begin_overwrite().times(1).returning(|_| Ok(()));
+        let stage_count = Arc::new(AtomicUsize::new(0));
+        let stage_count_clone = stage_count.clone();
+        writer_mock.expect_stage_overwrite_chunk().times(2).returning(move |_, _| {
+            let n = stage_count_clone.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("stage failed"))
+            }
+        });
+        writer_mock.expect_commit_overwrite().times(0);
         state_mock.expect_update_table()
             .withf(|_, state, _| state.last_run_status.as_deref() == Some("failed"))
             .returning(|_, _, _| Ok(()));
@@ -769,25 +800,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_refresh_shutdown_after_first_chunk_bails_with_partial_rewrite_message() {
-        // O2/R4: chunk 0 already committed as an OVERWRITE (destroying the previous
-        // snapshot) before the shutdown is observed on the next loop iteration. This
-        // must now bail instead of silently breaking, because the table is left in a
-        // partially-rewritten state — not a safe, resumable one. Call
-        // process_full_refresh directly so the exact error text can be asserted (the
-        // orchestrator-level "table failed" / Fatal-exit-code behavior for any Err
-        // from process_full_refresh is already covered by
-        // `full_refresh_second_chunk_append_failure_propagates`).
+    async fn full_refresh_shutdown_after_first_chunk_is_non_destructive() {
+        // O2-r CP2: this used to bail with a "partially rewritten" error, because chunk 0
+        // committed an OVERWRITE (destroying the previous snapshot) before the shutdown was
+        // observed on the next loop iteration. That's gone now — chunk 0 only STAGES parquet
+        // (stage_overwrite_chunk), nothing is committed until the final commit_overwrite, so
+        // a shutdown after the first staged chunk is a clean, non-destructive abandonment:
+        // the staged parquet is orphaned and the previous snapshot stays fully intact.
+        // Drive this through `process_table` (not `process_full_refresh` directly) so the
+        // real interrupted-status handling is exercised — mirrors
+        // `full_refresh_process_table_marks_interrupted_when_shutdown_before_any_chunk` in
+        // orchestrator.rs, just with a chunk actually staged before the signal fires.
         let dir = TempDir::new().unwrap();
         let config = make_config_with_full_refresh(vec!["products".to_string()]);
-        let schema_mock = MockSchemaInspect::new();
+        let mut schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
         let mut writer_mock = MockDeltaWrite::new();
         writer_mock.expect_has_data().returning(|_| Ok(false));
-        let state_mock = MockStateManage::new();
+        let mut state_mock = MockStateManage::new();
         let (tx, rx) = watch::channel(false);
 
+        schema_mock.expect_discover_columns().returning(move |_| Ok(make_full_refresh_columns()));
+        schema_mock.expect_discover_indexes().returning(|_| Ok(make_full_refresh_indexes()));
+        schema_mock.expect_get_avg_row_length().returning(|_| Ok(Some(100)));
+        extract_mock.expect_calculate_batch_size().returning(|_| 2);
         extract_mock.expect_batch_size().returning(|| 2);
+        writer_mock.expect_ensure_table().returning(|_, _| Ok(()));
+        writer_mock.expect_get_schema().returning(|_| Ok(None));
 
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
@@ -798,8 +837,8 @@ mod tests {
                 deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
             ]));
             if count == 0 {
-                // Full chunk (2 rows == batch_size 2): gets committed via
-                // overwrite_table, then the signal fires before the next iteration.
+                // Full chunk (2 rows == batch_size 2): staged (parquet written, NOT
+                // committed), then the signal fires before the next iteration.
                 let _ = tx_clone.send(true);
                 let batch = RecordBatch::try_new(
                     schema,
@@ -811,8 +850,21 @@ mod tests {
             }
         });
 
-        writer_mock.expect_overwrite_table().times(1).returning(|_, _, _| Ok(()));
-        writer_mock.expect_append_batch().times(0).returning(|_, _, _| Ok(()));
+        writer_mock.expect_begin_overwrite().times(1).returning(|_| Ok(()));
+        writer_mock.expect_stage_overwrite_chunk().times(1).returning(|_, _| Ok(()));
+        // The whole point of O2-r: the previous snapshot must stay intact, so the final
+        // commit must NEVER be reached when the run is interrupted mid-refresh.
+        writer_mock.expect_commit_overwrite().times(0);
+
+        state_mock
+            .expect_update_table()
+            .withf(|name, state, _| {
+                name == "products"
+                    && state.last_run_status.as_deref() == Some("interrupted")
+                    && state.last_run_rows == Some(2)
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(()));
 
         let mut orch = Orchestrator::new(
             config,
@@ -825,18 +877,10 @@ mod tests {
             false,
         );
 
-        let columns = make_full_refresh_columns();
-        let select_columns: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
-        let indexes = make_full_refresh_indexes();
-        let result = orch
-            .process_full_refresh("products", &select_columns, &columns, &indexes, &schema_from_columns(&columns))
-            .await;
-
-        let err = result.expect_err("shutdown after a chunk was already committed must bail");
-        assert!(
-            err.to_string().contains("partially rewritten"),
-            "expected the partial-rewrite message, got: {err}"
-        );
+        orch.process_table("products")
+            .await
+            .expect("process_table should return Ok even though the table was interrupted — the staged overwrite is simply abandoned, not a failure");
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -844,18 +888,21 @@ mod tests {
         // O2/R4 nuance: if the shutdown arrives before any chunk was extracted or
         // written, nothing was destroyed yet, so this must NOT bail — it should break
         // cleanly and let the caller (process_table) mark the table "interrupted".
-        // extract()/overwrite_table()/append_batch() have no expectations registered,
-        // so any call into them would panic — proving nothing was extracted or written.
+        // extract()/stage_overwrite_chunk()/commit_overwrite() have no expectations
+        // registered, so any call into them would panic — proving nothing was extracted
+        // or staged. begin_overwrite IS called unconditionally right before the loop
+        // (O2-r CP2), so it alone is mocked here.
         let dir = TempDir::new().unwrap();
         let config = make_config_with_full_refresh(vec!["products".to_string()]);
         let schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
-        let writer_mock = MockDeltaWrite::new();
+        let mut writer_mock = MockDeltaWrite::new();
         let state_mock = MockStateManage::new();
         let (tx, rx) = watch::channel(false);
         tx.send(true).unwrap();
 
         extract_mock.expect_batch_size().returning(|| 2);
+        writer_mock.expect_begin_overwrite().returning(|_| Ok(()));
 
         let mut orch = Orchestrator::new(
             config,
@@ -885,17 +932,19 @@ mod tests {
         // `batch_size` rows to compute the next chunk's offset; a breaker-truncated window
         // breaks that assumption, so it must bail with an actionable message instead of
         // silently corrupting pagination — and must bail BEFORE writing the truncated chunk
-        // (overwrite_table/append_batch have no expectations registered, so either being
-        // called would panic, proving nothing was written).
+        // (stage_overwrite_chunk/commit_overwrite have no expectations registered, so either
+        // being called would panic, proving nothing was written; begin_overwrite alone runs
+        // unconditionally before the loop, so it alone is mocked).
         let dir = TempDir::new().unwrap();
         let config = make_config_with_full_refresh(vec!["products".to_string()]);
         let schema_mock = MockSchemaInspect::new();
         let mut extract_mock = MockExtract::new();
-        let writer_mock = MockDeltaWrite::new();
+        let mut writer_mock = MockDeltaWrite::new();
         let state_mock = MockStateManage::new();
         let (_tx, rx) = watch::channel(false);
 
         extract_mock.expect_batch_size().returning(|| 5);
+        writer_mock.expect_begin_overwrite().returning(|_| Ok(()));
         extract_mock.expect_extract().returning(|_| {
             let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
                 deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
@@ -989,8 +1038,9 @@ mod tests {
             }
         });
 
-        writer_mock.expect_overwrite_table().times(1).returning(|_, _, _| Ok(()));
-        writer_mock.expect_append_batch().times(1).returning(|_, _, _| Ok(()));
+        writer_mock.expect_begin_overwrite().times(1).returning(|_| Ok(()));
+        writer_mock.expect_stage_overwrite_chunk().times(2).returning(|_, _| Ok(()));
+        writer_mock.expect_commit_overwrite().times(1).returning(|_, _| Ok(()));
 
         let mut orch = Orchestrator::new(
             config,

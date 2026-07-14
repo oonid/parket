@@ -177,6 +177,22 @@ impl DeltaWrite for DeltaWriterAdapter {
             .await
     }
 
+    async fn begin_overwrite(&self, table_name: &str) -> Result<()> {
+        self.inner.begin_overwrite(table_name).await
+    }
+
+    async fn stage_overwrite_chunk(
+        &self,
+        table_name: &str,
+        batches: Vec<deltalake::arrow::record_batch::RecordBatch>,
+    ) -> Result<()> {
+        self.inner.stage_overwrite_chunk(table_name, batches).await
+    }
+
+    async fn commit_overwrite(&self, table_name: &str, hwm: Option<&Hwm>) -> Result<()> {
+        self.inner.commit_overwrite(table_name, hwm).await
+    }
+
     async fn read_hwm(&self, table_name: &str) -> Result<Option<Hwm>> {
         self.inner.read_hwm(table_name).await
     }
@@ -282,6 +298,22 @@ impl DeltaWrite for LocalDeltaWriterAdapter {
         self.inner
             .overwrite_table(table_name, batches, hwm.as_ref())
             .await
+    }
+
+    async fn begin_overwrite(&self, table_name: &str) -> Result<()> {
+        self.inner.begin_overwrite(table_name).await
+    }
+
+    async fn stage_overwrite_chunk(
+        &self,
+        table_name: &str,
+        batches: Vec<deltalake::arrow::record_batch::RecordBatch>,
+    ) -> Result<()> {
+        self.inner.stage_overwrite_chunk(table_name, batches).await
+    }
+
+    async fn commit_overwrite(&self, table_name: &str, hwm: Option<&Hwm>) -> Result<()> {
+        self.inner.commit_overwrite(table_name, hwm).await
     }
 
     async fn read_hwm(&self, table_name: &str) -> Result<Option<Hwm>> {

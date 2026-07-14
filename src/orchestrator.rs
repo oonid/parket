@@ -63,6 +63,19 @@ pub trait DeltaWrite: Send + Sync {
         batches: Vec<deltalake::arrow::record_batch::RecordBatch>,
         hwm: Option<Hwm>,
     ) -> Result<()>;
+    /// O2-r CP2: start a staged-overwrite session for `table_name` (see `DeltaWriter::begin_overwrite`).
+    async fn begin_overwrite(&self, table_name: &str) -> Result<()>;
+    /// O2-r CP2: write one chunk to parquet WITHOUT committing (see `DeltaWriter::stage_overwrite_chunk`).
+    async fn stage_overwrite_chunk(
+        &self,
+        table_name: &str,
+        batches: Vec<deltalake::arrow::record_batch::RecordBatch>,
+    ) -> Result<()>;
+    /// O2-r CP2: finish the staged-overwrite session with ONE atomic commit (see `DeltaWriter::commit_overwrite`).
+    /// The lifetime is named (not elided) because `mockall::automock` requires it to generate
+    /// a correctly-typed mock for a by-reference, non-`&self` parameter on an async trait method.
+    #[allow(clippy::needless_lifetimes)]
+    async fn commit_overwrite<'a>(&self, table_name: &str, hwm: Option<&'a Hwm>) -> Result<()>;
     async fn read_hwm(&self, table_name: &str) -> Result<Option<Hwm>>;
     /// True when the Delta table exists and holds at least one data file — probe for
     /// the no-HWM duplication guard (audit H-2026-07-11-1).
@@ -1088,9 +1101,20 @@ mod tests {
                 .unwrap();
                 ok_batches(vec![batch])
             });
+        // O2-r CP2: full refresh now stages every chunk (parquet, uncommitted) and finishes
+        // with a single commit_overwrite — that final commit is where a Delta-write failure
+        // now surfaces (the old chunk-0 overwrite_table is gone).
         writer_mock
-            .expect_overwrite_table()
-            .returning(|_, _, _| Err(anyhow::anyhow!("overwrite failed")));
+            .expect_begin_overwrite()
+            .returning(|_| Ok(()));
+        writer_mock
+            .expect_stage_overwrite_chunk()
+            .times(1)
+            .returning(|_, _| Ok(()));
+        writer_mock
+            .expect_commit_overwrite()
+            .times(1)
+            .returning(|_, _| Err(anyhow::anyhow!("overwrite failed")));
         state_mock
             .expect_update_table()
             .withf(|_, state, _| state.last_run_status.as_deref() == Some("failed"))
@@ -1407,6 +1431,9 @@ mod tests {
         extract_mock.expect_batch_size().returning(|| 10000);
         writer_mock.expect_ensure_table().returning(|_, _| Ok(()));
         writer_mock.expect_get_schema().returning(|_| Ok(None));
+        // O2-r CP2: begin_overwrite now runs unconditionally right before the extraction
+        // loop, before the shutdown check inside the loop is ever reached.
+        writer_mock.expect_begin_overwrite().returning(|_| Ok(()));
 
         state_mock
             .expect_update_table()
