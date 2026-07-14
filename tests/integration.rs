@@ -324,6 +324,30 @@ async fn count_matching(env: &TestEnv, table_name: &str, where_clause: &str) -> 
         .value(0)
 }
 
+/// Count DISTINCT values of `column` in a Delta table (via datafusion over the table provider).
+/// Used by the N8 OFFSET-pagination test: every seeded row has a byte-unique value in that
+/// column, so `COUNT(DISTINCT column) == seeded row count` proves no row was skipped or
+/// duplicated across separate LIMIT/OFFSET page queries.
+async fn count_distinct(env: &TestEnv, table_name: &str, column: &str) -> i64 {
+    let t = env.open_delta_table(table_name).await;
+    let ctx = deltalake::datafusion::prelude::SessionContext::new();
+    let provider = t.table_provider().await.expect("table_provider failed");
+    ctx.register_table(table_name, provider).unwrap();
+    let batches = ctx
+        .sql(&format!("SELECT COUNT(DISTINCT {column}) AS c FROM {table_name}"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<deltalake::arrow::array::Int64Array>()
+        .expect("COUNT(DISTINCT ...) should be Int64")
+        .value(0)
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn graceful_shutdown_signal_skips_all_tables() {
@@ -453,6 +477,94 @@ async fn full_refresh_extraction_creates_delta_table_with_all_rows() {
 
     let row_count = count_delta_rows(&env, "products").await;
     assert_eq!(row_count, 2, "expected 2 rows in Delta table for products");
+}
+
+/// N8: a full-refresh table with NO primary/unique key falls back to OFFSET/LIMIT pagination
+/// ordered by all selected columns. Before the fix, ties under the column's default
+/// case-insensitive collation (e.g. `'Item0001'` vs `'ITEM0001'`) made that ORDER BY non-total,
+/// so separate LIMIT/OFFSET page queries could order tied rows inconsistently and skip or
+/// duplicate them. The fix wraps string columns in `BINARY`, restoring a total (byte-exact)
+/// order so the pages tile the table exactly once.
+///
+/// `label` holds many groups of byte-distinct, collation-equal values (Title/UPPER/lower case
+/// of the same word) and is never repeated verbatim, so `COUNT(DISTINCT label)` in the Delta
+/// output equals the seeded row count iff nothing was skipped or duplicated. `filler` is a
+/// large, identical-across-rows string whose only purpose is inflating AVG_ROW_LENGTH so a
+/// small `target_memory_mb` yields a `batch_size` well under the seeded row count, forcing
+/// several OFFSET pages instead of one.
+#[tokio::test]
+#[serial_test::serial]
+async fn full_refresh_pk_less_ci_collation_extracts_all_rows_once() {
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let mut env = TestEnv::new(vec!["items_no_key"]).await;
+
+    // No PRIMARY KEY, no UNIQUE index at all: this forces the all-columns OFFSET-fallback
+    // ordering path (N8 part B) rather than keyset pagination or a unique-index order.
+    sqlx::query(
+        "CREATE TABLE items_no_key (\
+            label VARCHAR(50) NOT NULL, \
+            filler VARCHAR(8000) NOT NULL\
+        ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create items_no_key table");
+
+    let filler = "x".repeat(8000);
+    let mut values = Vec::new();
+    for i in 1..=60u32 {
+        for label in [format!("Item{i:04}"), format!("ITEM{i:04}"), format!("item{i:04}")] {
+            values.push(format!("('{label}', '{filler}')"));
+        }
+    }
+    let total_rows = values.len();
+    let insert_sql = format!(
+        "INSERT INTO items_no_key (label, filler) VALUES {}",
+        values.join(", ")
+    );
+    sqlx::query(&insert_sql)
+        .execute(&env.pool)
+        .await
+        .expect("failed to seed items_no_key rows");
+
+    // Without this, AVG_ROW_LENGTH in information_schema reflects a stale pre-insert
+    // estimate rather than the real (filler-inflated) row size.
+    sqlx::query("ANALYZE TABLE items_no_key")
+        .execute(&env.pool)
+        .await
+        .expect("failed to analyze items_no_key");
+
+    // Shrink target_memory_mb so calculate_batch_size (driven by the now-large
+    // AVG_ROW_LENGTH) yields a batch_size well under `total_rows`, forcing several
+    // OFFSET/LIMIT pages instead of a single one. (target_memory_mb also floors the M2
+    // mid-stream circuit breaker's ceiling at 2 MiB, comfortably above this table's
+    // per-page Arrow footprint, so it does not trip and truncate a page.)
+    env.config.target_memory_mb = 1;
+
+    let mut orchestrator = env.make_orchestrator();
+    let exit_code = orchestrator.run().await;
+
+    assert!(
+        matches!(exit_code, ExitCode::Success),
+        "expected Success exit code, got {exit_code:?}"
+    );
+
+    let row_count = count_delta_rows(&env, "items_no_key").await;
+    assert_eq!(
+        row_count, total_rows,
+        "expected exactly {total_rows} rows (no skip/dup across OFFSET pages), got {row_count}"
+    );
+
+    let distinct_labels = count_distinct(&env, "items_no_key", "label").await;
+    assert_eq!(
+        distinct_labels, total_rows as i64,
+        "every seeded label is byte-unique; a skip or duplicate across OFFSET pages would \
+         surface as fewer than {total_rows} distinct labels, got {distinct_labels}"
+    );
 }
 
 #[tokio::test]

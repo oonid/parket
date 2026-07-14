@@ -35,6 +35,56 @@ pub(super) fn select_integer_pk(columns: &[ColumnInfo], indexes: &[IndexInfo]) -
         .cloned()
 }
 
+/// N8: string/text types whose default (often case-insensitive) collation can tie two distinct
+/// values, making an all-columns ORDER BY non-total across OFFSET pages. BINARY forces byte order.
+fn is_collated_string_type(data_type: &str) -> bool {
+    matches!(
+        data_type,
+        "varchar" | "char" | "text" | "tinytext" | "mediumtext" | "longtext" | "enum" | "set"
+    )
+}
+
+/// N8: a UNIQUE index over NOT-NULL columns gives a TOTAL order (no skip/dup) and lets the DB
+/// order by the index (no per-page filesort). Prefer PRIMARY, then any other unique index;
+/// every indexed column must be present and NOT NULL among the discovered columns (a UNIQUE
+/// index permits multiple NULLs, which would tie).
+fn select_unique_ordering_index(columns: &[ColumnInfo], indexes: &[IndexInfo]) -> Option<Vec<String>> {
+    let all_present_not_null = |cols: &[String]| {
+        !cols.is_empty()
+            && cols.iter().all(|name| columns.iter().any(|c| &c.name == name && !c.nullable))
+    };
+    indexes
+        .iter()
+        .find(|i| i.name == "PRIMARY" && all_present_not_null(&i.columns))
+        .or_else(|| indexes.iter().find(|i| i.unique && all_present_not_null(&i.columns)))
+        .map(|i| i.columns.clone())
+}
+
+/// N8: choose the OFFSET-path ORDER BY. Unique NOT-NULL index → plain terms (total + index-usable);
+/// else all columns with BINARY on string columns for a deterministic total order.
+fn build_offset_order_terms(
+    columns: &[String],
+    source_columns: &[ColumnInfo],
+    indexes: &[IndexInfo],
+) -> Vec<crate::query::OrderTerm> {
+    if let Some(unique_cols) = select_unique_ordering_index(source_columns, indexes) {
+        unique_cols
+            .into_iter()
+            .map(|column| crate::query::OrderTerm { column, binary: false })
+            .collect()
+    } else {
+        columns
+            .iter()
+            .map(|name| {
+                let binary = source_columns
+                    .iter()
+                    .any(|c| &c.name == name && is_collated_string_type(&c.data_type));
+                crate::query::OrderTerm { column: name.clone(), binary }
+            })
+            .collect()
+    }
+}
+
 fn extract_batch_max_key(batch: &RecordBatch, key_col: &str) -> Result<Option<i64>> {
     let column = batch
         .column_by_name(key_col)
@@ -117,11 +167,25 @@ where
         let mut chunk_index: u64 = 0;
         let key_col = select_integer_pk(source_columns, indexes);
         let mut last_key = None;
+        let offset_order_terms = if key_col.is_none() {
+            build_offset_order_terms(columns, source_columns, indexes)
+        } else {
+            Vec::new()
+        };
 
         if let Some(key_col) = key_col.as_deref() {
             info!(table = table_name, key_col, "full refresh using keyset pagination");
+        } else if let Some(unique_cols) = select_unique_ordering_index(source_columns, indexes) {
+            info!(
+                table = table_name,
+                order_columns = ?unique_cols,
+                "full refresh using deterministic offset pagination ordered by a unique not-null index"
+            );
         } else {
-            info!(table = table_name, "full refresh using deterministic offset pagination");
+            info!(
+                table = table_name,
+                "full refresh using deterministic offset pagination ordered by all columns (BINARY-strengthened on string columns)"
+            );
         }
 
         loop {
@@ -171,7 +235,13 @@ where
                     batch_size,
                 )
             } else {
-                QueryBuilder::build_full_refresh_query_paged(table_name, columns, batch_size, offset)
+                QueryBuilder::build_full_refresh_query_paged(
+                    table_name,
+                    columns,
+                    &offset_order_terms,
+                    batch_size,
+                    offset,
+                )
             };
 
             let extraction = self.extractor.extract(&sql)?;
@@ -490,7 +560,10 @@ mod tests {
             ]));
             match count {
                 0 => {
-                    assert!(sql.contains("ORDER BY `id`, `name` LIMIT 2 OFFSET 0"));
+                    // N8: a UNIQUE index over a NOT-NULL column ("id") gives a total order on
+                    // its own, so the OFFSET path orders by just that index (not all columns) —
+                    // total order without a filesort over every selected column.
+                    assert!(sql.contains("ORDER BY `id` LIMIT 2 OFFSET 0"));
                     assert!(!sql.contains("WHERE `id` >"));
                     let batch = RecordBatch::try_new(
                         schema,
@@ -499,7 +572,7 @@ mod tests {
                     ok_batches(vec![batch])
                 }
                 1 => {
-                    assert!(sql.contains("ORDER BY `id`, `name` LIMIT 2 OFFSET 2"));
+                    assert!(sql.contains("ORDER BY `id` LIMIT 2 OFFSET 2"));
                     let batch = RecordBatch::try_new(
                         schema,
                         vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![3]))],
@@ -548,7 +621,10 @@ mod tests {
             ]));
             match count {
                 0 => {
-                    assert!(sql.contains("ORDER BY `id`, `name` LIMIT 2 OFFSET 0"));
+                    // N8: no unique/PRIMARY index at all, so this falls to the all-columns
+                    // fallback — `id` (bigint) orders plainly, `name` (varchar) is
+                    // BINARY-strengthened so a ci-collation tie can't reorder rows across pages.
+                    assert!(sql.contains("ORDER BY `id`, BINARY `name` LIMIT 2 OFFSET 0"));
                     let batch = RecordBatch::try_new(
                         schema,
                         vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![1, 2]))],
@@ -556,7 +632,7 @@ mod tests {
                     ok_batches(vec![batch])
                 }
                 1 => {
-                    assert!(sql.contains("ORDER BY `id`, `name` LIMIT 2 OFFSET 2"));
+                    assert!(sql.contains("ORDER BY `id`, BINARY `name` LIMIT 2 OFFSET 2"));
                     let batch = RecordBatch::try_new(
                         schema,
                         vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![3]))],
@@ -953,5 +1029,118 @@ mod tests {
         let rows = result.expect("a truncated keyset window must not fail the table");
         assert_eq!(rows, 3);
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+
+    // N8: OFFSET-path ordering helpers.
+    use super::{build_offset_order_terms, select_unique_ordering_index};
+    use crate::discovery::IndexInfo;
+
+    #[test]
+    fn select_unique_ordering_index_prefers_primary_not_null() {
+        let columns = vec![
+            ColumnInfo {
+                name: "id".to_string(),
+                data_type: "bigint".to_string(),
+                column_type: "bigint(20)".to_string(),
+                nullable: false,
+            },
+            ColumnInfo {
+                name: "name".to_string(),
+                data_type: "varchar".to_string(),
+                column_type: "varchar(255)".to_string(),
+                nullable: true,
+            },
+        ];
+        let indexes = vec![
+            IndexInfo { name: "PRIMARY".to_string(), unique: true, columns: vec!["id".to_string()] },
+            IndexInfo { name: "name_uniq".to_string(), unique: true, columns: vec!["name".to_string()] },
+        ];
+
+        let result = select_unique_ordering_index(&columns, &indexes);
+        assert_eq!(result, Some(vec!["id".to_string()]));
+    }
+
+    #[test]
+    fn select_unique_ordering_index_skips_nullable_unique() {
+        let columns = vec![
+            ColumnInfo {
+                name: "id".to_string(),
+                data_type: "bigint".to_string(),
+                column_type: "bigint(20)".to_string(),
+                nullable: false,
+            },
+            ColumnInfo {
+                name: "email".to_string(),
+                data_type: "varchar".to_string(),
+                column_type: "varchar(255)".to_string(),
+                nullable: true,
+            },
+        ];
+        // Only candidate is a UNIQUE index on the nullable `email` column — a UNIQUE index
+        // permits multiple NULL rows, which would tie, so it must be rejected.
+        let indexes = vec![IndexInfo {
+            name: "email_uniq".to_string(),
+            unique: true,
+            columns: vec!["email".to_string()],
+        }];
+
+        let result = select_unique_ordering_index(&columns, &indexes);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn select_unique_ordering_index_uses_non_primary_unique() {
+        let columns = vec![
+            ColumnInfo {
+                name: "id".to_string(),
+                data_type: "bigint".to_string(),
+                column_type: "bigint(20)".to_string(),
+                nullable: false,
+            },
+            ColumnInfo {
+                name: "sku".to_string(),
+                data_type: "varchar".to_string(),
+                column_type: "varchar(64)".to_string(),
+                nullable: false,
+            },
+        ];
+        // No PRIMARY key at all, but a not-null UNIQUE index on `sku`.
+        let indexes = vec![IndexInfo {
+            name: "sku_uniq".to_string(),
+            unique: true,
+            columns: vec!["sku".to_string()],
+        }];
+
+        let result = select_unique_ordering_index(&columns, &indexes);
+        assert_eq!(result, Some(vec!["sku".to_string()]));
+    }
+
+    #[test]
+    fn build_offset_order_terms_binary_on_strings() {
+        let source_columns = vec![
+            ColumnInfo {
+                name: "qty".to_string(),
+                data_type: "int".to_string(),
+                column_type: "int(11)".to_string(),
+                nullable: false,
+            },
+            ColumnInfo {
+                name: "label".to_string(),
+                data_type: "varchar".to_string(),
+                column_type: "varchar(255)".to_string(),
+                nullable: false,
+            },
+        ];
+        // No unique/PRIMARY index — falls to the all-columns fallback.
+        let indexes: Vec<IndexInfo> = vec![];
+        let columns = vec!["qty".to_string(), "label".to_string()];
+
+        let terms = build_offset_order_terms(&columns, &source_columns, &indexes);
+
+        assert_eq!(terms.len(), 2);
+        assert_eq!(terms[0].column, "qty");
+        assert!(!terms[0].binary, "int column must order plainly");
+        assert_eq!(terms[1].column, "label");
+        assert!(terms[1].binary, "varchar column must be BINARY-strengthened");
     }
 }

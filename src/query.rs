@@ -19,10 +19,22 @@ fn format_columns(columns: &[String]) -> String {
         .join(", ")
 }
 
-fn format_order_by(columns: &[String]) -> String {
-    columns
+/// One ORDER BY term for OFFSET-paged full refresh (N8). `binary` wraps the column in `BINARY`
+/// so a case-insensitive collation can't order two distinct-but-collation-equal string values
+/// arbitrarily across pages (which would skip/duplicate rows). Non-string columns and
+/// unique-index columns use `binary = false` (plain value order; index-usable).
+pub struct OrderTerm {
+    pub column: String,
+    pub binary: bool,
+}
+
+fn format_order_by(terms: &[OrderTerm]) -> String {
+    terms
         .iter()
-        .map(|c| backtick(c))
+        .map(|t| {
+            let c = backtick(&t.column);
+            if t.binary { format!("BINARY {c}") } else { c }
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -68,12 +80,13 @@ impl QueryBuilder {
     pub fn build_full_refresh_query_paged(
         table: &str,
         columns: &[String],
+        order_terms: &[OrderTerm],
         batch_size: u64,
         offset: u64,
     ) -> String {
         let col_list = format_columns(columns);
         let quoted_table = backtick(table);
-        let order_by = format_order_by(columns);
+        let order_by = format_order_by(order_terms);
         format!(
             "SELECT {col_list} FROM {quoted_table} ORDER BY {order_by} LIMIT {batch_size} OFFSET {offset}"
         )
@@ -200,6 +213,10 @@ mod tests {
         let sql = QueryBuilder::build_full_refresh_query_paged(
             "products",
             &["id".to_string(), "name".to_string()],
+            &[
+                OrderTerm { column: "id".to_string(), binary: false },
+                OrderTerm { column: "name".to_string(), binary: false },
+            ],
             100,
             200,
         );
@@ -462,7 +479,14 @@ mod tests {
     #[test]
     fn full_refresh_paged_contains_limit_and_offset() {
         let sql = QueryBuilder::build_full_refresh_query_paged(
-            "orders", &["id".to_string(), "name".to_string()], 5000, 0,
+            "orders",
+            &["id".to_string(), "name".to_string()],
+            &[
+                OrderTerm { column: "id".to_string(), binary: false },
+                OrderTerm { column: "name".to_string(), binary: false },
+            ],
+            5000,
+            0,
         );
         assert!(sql.contains("LIMIT 5000"));
         assert!(sql.contains("OFFSET 0"));
@@ -473,7 +497,11 @@ mod tests {
     #[test]
     fn full_refresh_paged_second_page_offset() {
         let sql = QueryBuilder::build_full_refresh_query_paged(
-            "orders", &["id".to_string()], 5000, 5000,
+            "orders",
+            &["id".to_string()],
+            &[OrderTerm { column: "id".to_string(), binary: false }],
+            5000,
+            5000,
         );
         assert!(sql.contains("LIMIT 5000"));
         assert!(sql.contains("OFFSET 5000"));
@@ -482,7 +510,14 @@ mod tests {
     #[test]
     fn full_refresh_paged_exact_output() {
         let sql = QueryBuilder::build_full_refresh_query_paged(
-            "customers", &["id".to_string(), "email".to_string()], 1000, 2000,
+            "customers",
+            &["id".to_string(), "email".to_string()],
+            &[
+                OrderTerm { column: "id".to_string(), binary: false },
+                OrderTerm { column: "email".to_string(), binary: false },
+            ],
+            1000,
+            2000,
         );
         assert_eq!(
             sql,
@@ -493,7 +528,11 @@ mod tests {
     #[test]
     fn full_refresh_paged_backtick_quoting() {
         let sql = QueryBuilder::build_full_refresh_query_paged(
-            "order", &["id".to_string()], 100, 0,
+            "order",
+            &["id".to_string()],
+            &[OrderTerm { column: "id".to_string(), binary: false }],
+            100,
+            0,
         );
         assert!(sql.contains("FROM `order`"));
     }
@@ -501,9 +540,46 @@ mod tests {
     #[test]
     fn full_refresh_paged_zero_offset_first_page() {
         let sql = QueryBuilder::build_full_refresh_query_paged(
-            "t", &["a".to_string()], 10000, 0,
+            "t",
+            &["a".to_string()],
+            &[OrderTerm { column: "a".to_string(), binary: false }],
+            10000,
+            0,
         );
         assert!(sql.ends_with("LIMIT 10000 OFFSET 0"));
+    }
+
+    #[test]
+    fn full_refresh_paged_order_by_binary_string_column() {
+        let sql = QueryBuilder::build_full_refresh_query_paged(
+            "customers",
+            &["name".to_string()],
+            &[OrderTerm { column: "name".to_string(), binary: true }],
+            100,
+            0,
+        );
+        assert!(
+            sql.contains("ORDER BY BINARY `name`"),
+            "expected BINARY-wrapped order term, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn full_refresh_paged_order_by_mixed_binary_and_plain_terms() {
+        let sql = QueryBuilder::build_full_refresh_query_paged(
+            "customers",
+            &["id".to_string(), "name".to_string()],
+            &[
+                OrderTerm { column: "id".to_string(), binary: false },
+                OrderTerm { column: "name".to_string(), binary: true },
+            ],
+            100,
+            0,
+        );
+        assert!(
+            sql.contains("ORDER BY `id`, BINARY `name`"),
+            "expected mixed plain/BINARY order terms, got: {sql}"
+        );
     }
 
     #[test]
