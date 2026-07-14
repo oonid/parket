@@ -10,7 +10,8 @@ use parket::orchestrator::{
     SignalHandler, StateManageAdapter,
 };
 use parket::verify::{
-    DeltaProbeAdapter, SourceProbeAdapter, TablePlan, VerifyCommand, VerifyMode, VerifyVerdict,
+    DeltaProbeAdapter, SourceProbeAdapter, TableOutcome, TablePlan, VerifyCommand, VerifyMode,
+    VerifyVerdict,
 };
 use parket::writer::DeltaWriter;
 use sqlx::MySqlPool;
@@ -2429,4 +2430,406 @@ async fn extractor_reuses_pooled_connection_across_windows() {
     );
 
     pool.close().await;
+}
+
+// T6: Docker coverage for verify-verdict paths that were never exercised end-to-end against a
+// real MariaDB + MinIO — the two-stream verdict (Clean + Discrepancy), the Drift tier (rolled
+// up to Clean by `run()`, so asserted directly via `run_one_table`), the size-guard Skipped
+// tier, and a VARCHAR-only value drift.
+
+#[tokio::test]
+#[serial_test::serial]
+async fn verify_two_stream_verdict_clean_then_discrepancy() {
+    // T6(2a): `two_stream_key_stats_outcome` (verify.rs) has its own asymmetric verdict logic
+    // distinct from the basic/incremental path, and was never proven end-to-end. This test
+    // syncs a real two-stream table (insert cursor `id`, update cursor `completed_at`), verifies
+    // Clean right after sync, then grows the SOURCE beyond the synced delta and verifies the
+    // verdict flips to Discrepancy.
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let mut env = TestEnv::new(vec!["orders"]).await;
+    // Enable two-stream for `orders`: insert cursor = id (PK), update cursor = completed_at —
+    // mirrors run_two_stream_upsert_scenario's config wiring.
+    env.config
+        .table_insert_cursor
+        .insert("orders".to_string(), "id".to_string());
+    env.config
+        .table_update_cursor
+        .insert("orders".to_string(), "completed_at".to_string());
+
+    sqlx::query(
+        "CREATE TABLE orders (\
+            id BIGINT PRIMARY KEY, \
+            name VARCHAR(255), \
+            qty INT, \
+            completed_at DATETIME(6) NULL\
+        )",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create orders table");
+
+    sqlx::query("CREATE INDEX idx_orders_completed_at ON orders (completed_at, id)")
+        .execute(&env.pool)
+        .await
+        .expect("failed to create index");
+
+    sqlx::query(
+        "INSERT INTO orders (id, name, qty, completed_at) VALUES \
+            (1, 'widget', 10, '2026-01-01 10:00:00.000000'), \
+            (2, 'gadget', 5, NULL), \
+            (3, 'doohickey', 3, '2026-01-02 09:00:00.000000')",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert seed rows");
+
+    let mut run1 = env.make_orchestrator();
+    let exit1 = run1.run().await;
+    assert!(matches!(exit1, ExitCode::Success), "expected Success, got {exit1:?}");
+
+    let writer = DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    );
+    let update_hwm = writer.read_hwm("orders").await.expect("read_hwm failed for orders");
+    let insert_hwm = writer
+        .read_insert_hwm("orders")
+        .await
+        .expect("read_insert_hwm failed for orders");
+    assert_eq!(insert_hwm, Some(3), "insert HWM should be max id = 3 after run 1");
+
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let verdict = VerifyCommand::new(source, delta, vec!["orders".to_string()])
+        .with_table_plans(vec![TablePlan {
+            table: "orders".to_string(),
+            mode: VerifyMode::TwoStream {
+                insert_cursor: "id".to_string(),
+                update_cursor: "completed_at".to_string(),
+                update_hwm: update_hwm.clone(),
+                insert_hwm,
+            },
+        }])
+        .with_deep(true)
+        .run()
+        .await
+        .expect("verify two_stream should succeed right after sync");
+
+    assert_eq!(
+        verdict,
+        VerifyVerdict::Clean,
+        "a freshly-synced two-stream table must verify Clean via \
+         two_stream_key_stats_outcome's exact-match Pass branch"
+    );
+
+    // Discrepancy mechanism used: grow the SOURCE beyond what was synced, without re-running
+    // the pipeline (ids 4, 5 land only in the source). This makes source.count/distinct >
+    // delta's — the delta does NOT have "extra evidence" over the source (it's the other way
+    // around) — so two_stream_key_stats_outcome's `delta_has_extra_evidence` check is false
+    // and the asymmetric verdict falls through to Discrepancy, not Drift (Drift is reserved for
+    // the opposite direction: delta legitimately retaining extra ids/rows the source lacks).
+    // This reliably yields Discrepancy without needing the value-corruption fallback.
+    sqlx::query(
+        "INSERT INTO orders (id, name, qty, completed_at) VALUES \
+            (4, 'thingamajig', 7, NULL), \
+            (5, 'gizmo', 8, '2026-01-03 14:00:00.000000')",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert post-sync source rows");
+
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let verdict_after_growth = VerifyCommand::new(source, delta, vec!["orders".to_string()])
+        .with_table_plans(vec![TablePlan {
+            table: "orders".to_string(),
+            mode: VerifyMode::TwoStream {
+                insert_cursor: "id".to_string(),
+                update_cursor: "completed_at".to_string(),
+                update_hwm,
+                insert_hwm,
+            },
+        }])
+        .with_deep(true)
+        .run()
+        .await
+        .expect("verify two_stream should succeed after source growth");
+
+    assert_eq!(
+        verdict_after_growth,
+        VerifyVerdict::Discrepancy,
+        "source rows/ids beyond the synced delta must flip the two-stream verdict to \
+         Discrepancy, proving the asymmetric two_stream_key_stats_outcome path is exercised \
+         against real MariaDB + MinIO"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn verify_basic_drift_tier() {
+    // T6(2b): `key_stats_outcome`'s Drift tier ("source advanced past sync") is deliberately
+    // rolled up to `VerifyVerdict::Clean` by `run()` — so it was never asserted directly
+    // against real MariaDB + MinIO. Sync a basic table, then insert more rows into the SOURCE
+    // only (ids beyond delta's max), and call the now-public `run_one_table` directly to
+    // observe the per-table `TableOutcome::Drift` the aggregate verdict hides.
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let env = TestEnv::new(vec!["widgets"]).await;
+
+    sqlx::query("CREATE TABLE widgets (id BIGINT PRIMARY KEY, val INT NOT NULL)")
+        .execute(&env.pool)
+        .await
+        .expect("failed to create widgets table");
+
+    sqlx::query(
+        "INSERT INTO widgets (id, val) VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert widgets seed rows");
+
+    // No TABLE_MODE and no timestamp column ⇒ auto-detects full_refresh.
+    let mut orchestrator = env.make_orchestrator();
+    let exit_code = orchestrator.run().await;
+    assert!(
+        matches!(exit_code, ExitCode::Success),
+        "expected Success exit code, got {exit_code:?}"
+    );
+
+    // Grow the SOURCE only, without re-running the pipeline: ids beyond delta's max, so
+    // source.distinct > delta.distinct and delta's [min,max] range stays inside source's.
+    sqlx::query("INSERT INTO widgets (id, val) VALUES (6, 60), (7, 70)")
+        .execute(&env.pool)
+        .await
+        .expect("failed to insert post-sync widgets rows");
+
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let plan = TablePlan {
+        table: "widgets".to_string(),
+        mode: VerifyMode::Basic,
+    };
+    let cmd = VerifyCommand::new(source, delta, vec!["widgets".to_string()]).with_deep(true);
+    let outcome = cmd
+        .run_one_table("widgets", &plan)
+        .await
+        .expect("run_one_table should succeed for widgets");
+
+    assert!(
+        matches!(outcome, TableOutcome::Drift { .. }),
+        "source rows added past the synced delta must surface as TableOutcome::Drift, got \
+         {outcome:?}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn verify_skipped_size_guard() {
+    // T6(2c): the size guard (`!deep && source_row_count > row_cap` -> Skipped) was never
+    // exercised against real MariaDB + MinIO because the default cap is 1_000_000 rows. The
+    // now-public `with_row_cap` lets this test force the guard with a handful of rows, and
+    // also prove the guard is deep-gated (bypassed when `--verify-deep` / `.with_deep(true)`
+    // is set).
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let env = TestEnv::new(vec!["tiny_table"]).await;
+
+    sqlx::query("CREATE TABLE tiny_table (id BIGINT PRIMARY KEY, val INT NOT NULL)")
+        .execute(&env.pool)
+        .await
+        .expect("failed to create tiny_table");
+
+    let values: Vec<String> = (1..=10).map(|i| format!("({i}, {})", i * 10)).collect();
+    sqlx::query(&format!(
+        "INSERT INTO tiny_table (id, val) VALUES {}",
+        values.join(", ")
+    ))
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert tiny_table seed rows");
+
+    let mut orchestrator = env.make_orchestrator();
+    let exit_code = orchestrator.run().await;
+    assert!(
+        matches!(exit_code, ExitCode::Success),
+        "expected Success exit code, got {exit_code:?}"
+    );
+
+    let plan = TablePlan {
+        table: "tiny_table".to_string(),
+        mode: VerifyMode::Basic,
+    };
+
+    // deep=false (default) + row_cap=5: 10 source rows > cap 5 -> Skipped.
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let cmd = VerifyCommand::new(source, delta, vec!["tiny_table".to_string()]).with_row_cap(5);
+    let outcome = cmd
+        .run_one_table("tiny_table", &plan)
+        .await
+        .expect("run_one_table should succeed for tiny_table (non-deep)");
+    assert!(
+        matches!(outcome, TableOutcome::Skipped { .. }),
+        "10 source rows over a row_cap of 5 with deep=false must be Skipped, got {outcome:?}"
+    );
+
+    // Same row_cap, but deep=true: the size guard is deep-gated, so it must NOT be Skipped.
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let cmd = VerifyCommand::new(source, delta, vec!["tiny_table".to_string()])
+        .with_row_cap(5)
+        .with_deep(true);
+    let outcome_deep = cmd
+        .run_one_table("tiny_table", &plan)
+        .await
+        .expect("run_one_table should succeed for tiny_table (deep)");
+    assert!(
+        !matches!(outcome_deep, TableOutcome::Skipped { .. }),
+        "with deep=true the same over-cap table must NOT be Skipped (deep bypasses the size \
+         guard), got {outcome_deep:?}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn verify_varchar_only_drift() {
+    // T6(2d): the per-column value-aggregate check (which downgrades an exact key-stats Pass
+    // to Discrepancy on a value mismatch) had only ever been proven against numeric/date/text
+    // columns mixed together (see verify_value_aggregates_real_basic_match_across_type_families).
+    // This isolates the drift to a SINGLE VARCHAR column with ids/row-count left completely
+    // untouched, proving the value-aggregate machinery genuinely covers VARCHAR, not just
+    // numeric families.
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let env = TestEnv::new(vec!["labels"]).await;
+
+    sqlx::query(
+        "CREATE TABLE labels (id BIGINT PRIMARY KEY, tag VARCHAR(255) CHARACTER SET utf8mb4)",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create labels table");
+
+    sqlx::query(
+        "INSERT INTO labels (id, tag) VALUES \
+            (1, 'alpha'), (2, 'bravo'), (3, 'charlie'), (4, 'delta'), (5, 'echo')",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert labels seed rows");
+
+    let mut orchestrator = env.make_orchestrator();
+    let exit_code = orchestrator.run().await;
+    assert!(
+        matches!(exit_code, ExitCode::Success),
+        "expected Success exit code, got {exit_code:?}"
+    );
+
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let verdict = VerifyCommand::new(source, delta, vec!["labels".to_string()])
+        .with_table_plans(vec![TablePlan {
+            table: "labels".to_string(),
+            mode: VerifyMode::Basic,
+        }])
+        .with_deep(true)
+        .run()
+        .await
+        .expect("verify basic value aggregates should succeed for labels");
+
+    assert_eq!(verdict, VerifyVerdict::Clean);
+
+    // Corrupt ONLY the VARCHAR value of one row directly in the SOURCE, without re-running the
+    // pipeline. ids and row count are unchanged, so key-stats still reports an exact Pass — the
+    // ONLY way verify can catch this is the per-column value-aggregate check on `tag`.
+    sqlx::query("UPDATE labels SET tag = 'charlie-corrupted' WHERE id = 3")
+        .execute(&env.pool)
+        .await
+        .expect("failed to corrupt labels row directly");
+
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let verdict_after_corruption = VerifyCommand::new(source, delta, vec!["labels".to_string()])
+        .with_table_plans(vec![TablePlan {
+            table: "labels".to_string(),
+            mode: VerifyMode::Basic,
+        }])
+        .with_deep(true)
+        .run()
+        .await
+        .expect("verify basic value aggregates should succeed after corruption");
+
+    assert_eq!(
+        verdict_after_corruption,
+        VerifyVerdict::Discrepancy,
+        "a VARCHAR-only value drift with unchanged ids/row-count must be caught by the \
+         per-column value-aggregate check, proving VARCHAR columns aren't silently \
+         unverified"
+    );
 }

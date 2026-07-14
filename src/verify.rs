@@ -410,6 +410,14 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
         self
     }
 
+    /// Override the size-guard row cap (default 1_000_000). Below `row_cap` source rows a
+    /// non-deep verify runs fully; above it (and !deep) the table is Skipped. Exposed for tests
+    /// exercising the size-guard tier without seeding a million rows.
+    pub fn with_row_cap(mut self, row_cap: i64) -> Self {
+        self.row_cap = row_cap;
+        self
+    }
+
     fn key_stats_outcome(
         source_label: &str,
         delta_label: &str,
@@ -574,7 +582,7 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
 
     /// Per-table verify body, extracted from `run()` so a probe error on one table can be
     /// captured as `Skipped` by the caller instead of aborting every other table (VA4).
-    async fn run_one_table(&self, table: &str, plan: &TablePlan) -> Result<TableOutcome> {
+    pub async fn run_one_table(&self, table: &str, plan: &TablePlan) -> Result<TableOutcome> {
             println!("verify {table} plan: {}", plan.describe());
 
             let scols = self.source.columns(table).await?;
