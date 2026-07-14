@@ -17,7 +17,7 @@ use super::{DeltaWrite, Extract, SchemaInspect, StateManage};
 /// yet" — a transient error (S3 hiccup, auth blip) silently disables the schema-evolution
 /// guard (an R1-class recurrence). Only a genuinely missing table is `Ok(None)`; anything
 /// else propagates with context.
-async fn get_schema_impl(inner: &DeltaWriter, table_name: &str) -> Result<Option<SchemaRef>> {
+pub(crate) async fn get_schema_impl(inner: &DeltaWriter, table_name: &str) -> Result<Option<SchemaRef>> {
     match inner.open_table(table_name).await {
         Ok(table) => {
             let kernel_schema = table.snapshot()?.schema();

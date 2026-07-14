@@ -23,7 +23,9 @@ mod datetime;
 #[cfg(test)]
 mod test_support;
 pub use adapters::{DeltaWriterAdapter, ExtractorAdapter, LocalDeltaWriterAdapter, SchemaInspectorAdapter, StateManageAdapter};
-use schema::{mariadb_type_to_arrow, schema_evolution_check};
+pub(crate) use adapters::get_schema_impl;
+pub(crate) use schema::schema_evolution_check;
+use schema::mariadb_type_to_arrow;
 use full_refresh::select_integer_pk;
 use datetime::format_timestamp_now;
 

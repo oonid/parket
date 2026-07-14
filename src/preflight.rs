@@ -23,6 +23,10 @@ pub trait PreflightStorage: Send + Sync {
 #[allow(async_fn_in_trait)]
 pub trait PreflightHwm: Send + Sync {
     async fn read_hwm(&self, table: &str) -> Result<Option<crate::writer::Hwm>>;
+
+    /// O7-rest-b: fetch the existing Delta schema for a table (None if the table doesn't exist
+    /// yet), so preflight can run the same schema-evolution check the run does.
+    async fn delta_schema(&self, table: &str) -> Result<Option<deltalake::arrow::datatypes::SchemaRef>>;
 }
 
 pub struct NoopPreflightStorage;
@@ -91,6 +95,16 @@ where
             && self.config.table_initial_hwm.contains_key(table_name)
         {
             anyhow::bail!("TABLE_HWM_{table_name} set but table is not incremental or two-stream");
+        }
+
+        // O7-rest-b: mirror the run's schema-evolution check (orchestrator applies it for
+        // Incremental|TwoStream against an existing Delta table) so `--check` pre-flags an
+        // incompatible existing schema — a dropped or type-changed column — that the run would
+        // otherwise bail on. Skipped when the Delta table doesn't exist yet (first run).
+        if matches!(mode, crate::config::ExtractionMode::Incremental | crate::config::ExtractionMode::TwoStream)
+            && let Some(existing_schema) = self.hwm.delta_schema(table_name).await?
+        {
+            crate::orchestrator::schema_evolution_check(&columns, &existing_schema)?;
         }
 
         let avg_row_length = self.inspect.get_avg_row_length(table_name).await?;
@@ -299,6 +313,10 @@ impl PreflightHwm for PreflightHwmAdapter {
     async fn read_hwm(&self, table: &str) -> Result<Option<crate::writer::Hwm>> {
         self.inner.read_hwm(table).await
     }
+
+    async fn delta_schema(&self, table: &str) -> Result<Option<deltalake::arrow::datatypes::SchemaRef>> {
+        crate::orchestrator::get_schema_impl(&self.inner, table).await
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +391,7 @@ mod tests {
 
         storage.expect_check_writable().returning(|| Ok(()));
         hwm.expect_read_hwm().returning(|_| Ok(None));
+        hwm.expect_delta_schema().returning(|_| Ok(None));
         inspect
             .expect_discover_columns()
             .withf(|t| t == "orders")
@@ -411,6 +430,7 @@ mod tests {
                     last_id: 1000,
                 }))
             });
+        hwm.expect_delta_schema().returning(|_| Ok(None));
         inspect
             .expect_discover_columns()
             .withf(|t| t == "orders")
@@ -477,6 +497,7 @@ mod tests {
 
         storage.expect_check_writable().returning(|| Ok(()));
         hwm.expect_read_hwm().returning(|_| Ok(None));
+        hwm.expect_delta_schema().returning(|_| Ok(None));
         inspect
             .expect_discover_columns()
             .withf(|t| t == "good")
@@ -512,6 +533,7 @@ mod tests {
 
         storage.expect_check_writable().returning(|| Ok(()));
         hwm.expect_read_hwm().returning(|_| Ok(None));
+        hwm.expect_delta_schema().returning(|_| Ok(None));
         inspect
             .expect_discover_columns()
             .returning(|_| Ok(full_refresh_columns()));
@@ -540,6 +562,7 @@ mod tests {
 
         storage.expect_check_writable().returning(|| Ok(()));
         hwm.expect_read_hwm().returning(|_| Ok(None));
+        hwm.expect_delta_schema().returning(|_| Ok(None));
         inspect.expect_discover_columns().returning(|_| {
             Ok(vec![
                 col("id", "bigint", "bigint(20)"),
@@ -578,6 +601,7 @@ mod tests {
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(128)));
         hwm.expect_read_hwm().returning(|_| Ok(None));
+        hwm.expect_delta_schema().returning(|_| Ok(None));
 
         let check = PreflightCheck::new(config, inspect, NoopPreflightStorage, hwm);
         let result = check.run().await;
@@ -613,6 +637,7 @@ mod tests {
 
         storage.expect_check_writable().returning(|| Ok(()));
         hwm.expect_read_hwm().returning(|_| Ok(None));
+        hwm.expect_delta_schema().returning(|_| Ok(None));
         inspect
             .expect_discover_columns()
             .returning(|_| Ok(full_refresh_columns()));
@@ -662,6 +687,7 @@ mod tests {
 
         storage.expect_check_writable().returning(|| Ok(()));
         hwm.expect_read_hwm().returning(|_| Ok(None));
+        hwm.expect_delta_schema().returning(|_| Ok(None));
         inspect
             .expect_discover_columns()
             .returning(|_| Ok(incremental_columns()));
@@ -786,6 +812,7 @@ mod tests {
 
         storage.expect_check_writable().returning(|| Ok(()));
         hwm.expect_read_hwm().returning(|_| Ok(None));
+        hwm.expect_delta_schema().returning(|_| Ok(None));
         inspect
             .expect_discover_columns()
             .withf(|t| t == "data")
@@ -813,6 +840,7 @@ mod tests {
 
         storage.expect_check_writable().returning(|| Ok(()));
         hwm.expect_read_hwm().returning(|_| Ok(None));
+        hwm.expect_delta_schema().returning(|_| Ok(None));
         inspect
             .expect_discover_columns()
             .returning(move |_| Ok(columns.clone()));
@@ -839,6 +867,7 @@ mod tests {
 
         storage.expect_check_writable().returning(|| Ok(()));
         hwm.expect_read_hwm().returning(|_| Ok(None));
+        hwm.expect_delta_schema().returning(|_| Ok(None));
         inspect
             .expect_discover_columns()
             .returning(move |_| Ok(columns.clone()));
@@ -865,6 +894,7 @@ mod tests {
 
         storage.expect_check_writable().returning(|| Ok(()));
         hwm.expect_read_hwm().returning(|_| Ok(None));
+        hwm.expect_delta_schema().returning(|_| Ok(None));
         inspect
             .expect_discover_columns()
             .returning(move |_| Ok(columns.clone()));
@@ -890,6 +920,7 @@ mod tests {
 
         storage.expect_check_writable().returning(|| Ok(()));
         hwm.expect_read_hwm().returning(|_| Ok(None));
+        hwm.expect_delta_schema().returning(|_| Ok(None));
         let cols = incremental_columns();
         inspect
             .expect_discover_columns()
@@ -914,6 +945,7 @@ mod tests {
 
         storage.expect_check_writable().returning(|| Ok(()));
         hwm.expect_read_hwm().returning(|_| Ok(None));
+        hwm.expect_delta_schema().returning(|_| Ok(None));
         inspect
             .expect_discover_columns()
             .returning(move |_| Ok(columns.clone()));
@@ -937,6 +969,7 @@ mod tests {
 
         storage.expect_check_writable().returning(|| Ok(()));
         hwm.expect_read_hwm().returning(|_| Ok(None));
+        hwm.expect_delta_schema().returning(|_| Ok(None));
         inspect
             .expect_discover_columns()
             .returning(move |_| Ok(columns.clone()));
@@ -967,6 +1000,7 @@ mod tests {
 
         storage.expect_check_writable().returning(|| Ok(()));
         hwm.expect_read_hwm().returning(|_| Ok(None));
+        hwm.expect_delta_schema().returning(|_| Ok(None));
         inspect
             .expect_discover_columns()
             .returning(move |_| Ok(columns.clone()));
@@ -992,6 +1026,7 @@ mod tests {
 
         storage.expect_check_writable().returning(|| Ok(()));
         hwm.expect_read_hwm().returning(|_| Ok(None));
+        hwm.expect_delta_schema().returning(|_| Ok(None));
         inspect.expect_discover_columns().returning(|_| {
             Ok(vec![
                 col("id", "bigint", "bigint(20)"),
@@ -1031,6 +1066,7 @@ mod tests {
                     last_id: 5000,
                 }))
             });
+        hwm.expect_delta_schema().returning(|_| Ok(None));
         inspect
             .expect_discover_columns()
             .returning(|_| Ok(incremental_columns()));
@@ -1072,5 +1108,68 @@ mod tests {
         let storage = LocalPreflightStorage::new(&base_dir);
         let result = storage.check_writable().await;
         assert!(result.is_err(), "expected unwritable path to fail: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn preflight_flags_incompatible_delta_schema() {
+        // O7-rest-b: preflight now runs the same schema_evolution_check the run does.
+        // Simulate an existing Delta table whose `id` column was persisted as Utf8 while the
+        // MariaDB source is bigint (-> Arrow Int64) -- a type change the run would bail on.
+        // `name`/`updated_at` are declared with the types their MariaDB columns already map
+        // to (varchar/timestamp -> Utf8), so `id` is the only mismatch and the failure
+        // reason is unambiguous.
+        let config = make_config(vec!["orders".to_string()]);
+        let mut inspect = MockPreflightInspect::new();
+        let mut storage = MockPreflightStorage::new();
+        let mut hwm = MockPreflightHwm::new();
+
+        storage.expect_check_writable().returning(|| Ok(()));
+        hwm.expect_read_hwm().returning(|_| Ok(None));
+        hwm.expect_delta_schema().returning(|_| {
+            Ok(Some(std::sync::Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                deltalake::arrow::datatypes::Field::new(
+                    "id",
+                    deltalake::arrow::datatypes::DataType::Utf8,
+                    false,
+                ),
+                deltalake::arrow::datatypes::Field::new(
+                    "name",
+                    deltalake::arrow::datatypes::DataType::Utf8,
+                    false,
+                ),
+                deltalake::arrow::datatypes::Field::new(
+                    "updated_at",
+                    deltalake::arrow::datatypes::DataType::Utf8,
+                    false,
+                ),
+            ]))))
+        });
+        inspect
+            .expect_discover_columns()
+            .returning(|_| Ok(incremental_columns()));
+        inspect
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(128)));
+
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
+
+        // check_table surfaces the real error message; run() collapses it into a count (see
+        // the other tests in this module), so assert on the underlying error here.
+        let table_result = check.check_table("orders").await;
+        assert!(
+            table_result.is_err(),
+            "expected incompatible Delta schema to fail preflight: {table_result:?}"
+        );
+        let err = table_result.unwrap_err().to_string();
+        assert!(
+            err.contains("schema evolution error"),
+            "expected schema evolution error, got: {err}"
+        );
+
+        // The overall run also fails, surfaced the same way every other check_table failure
+        // is in this module: as a failure count.
+        let result = check.run().await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("1 table(s) failed"));
     }
 }
