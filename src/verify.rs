@@ -148,7 +148,7 @@ pub struct ColumnMeta {
     pub type_str: String,
     pub nullable: bool,
     /// NUMERIC_SCALE from information_schema (source only; None on the Delta side and for
-    /// non-decimal columns). Drives the native-scale DECIMAL(38,scale) used in value
+    /// non-decimal columns). Drives the native-scale DECIMAL(65,scale) used in value
     /// aggregates so a source column declared at e.g. scale 12 isn't silently truncated to
     /// the historical fixed scale of 10 (VA2).
     pub numeric_scale: Option<u32>,
@@ -198,8 +198,11 @@ pub(crate) fn agg_kind(type_str: &str) -> Option<AggKind> {
     }
 }
 
-/// Max total decimal digits DataFusion/MariaDB DECIMAL(38,x) can hold.
-const DECIMAL_TOTAL_DIGITS: u32 = 38;
+/// Max total decimal digits DataFusion/MariaDB DECIMAL(65,x) can hold — MariaDB's DECIMAL
+/// max precision, and within DataFusion's Decimal256 range (precision <= 76). VA1-r: widened
+/// from 38 so a sum-only corruption on a wide-decimal column isn't hidden by the overflow
+/// guard skipping the SUM.
+const DECIMAL_TOTAL_DIGITS: u32 = 65;
 
 /// Number of digits before the decimal point in a numeric string (ignoring a leading '-').
 /// Used by the VA1 overflow guard to bound how many digits a SUM could grow to.
@@ -210,7 +213,7 @@ fn int_digit_count(s: &str) -> usize {
 }
 
 /// The decimal capacity (total digits available for the integer part of a SUM) for a
-/// numeric AggKind: 38 for Integer (summed as DECIMAL(38,0)), 38-scale for Decimal.
+/// numeric AggKind: 65 for Integer (summed as DECIMAL(65,0)), 65-scale for Decimal.
 fn decimal_capacity(kind: &AggKind) -> u32 {
     match kind {
         AggKind::Integer => DECIMAL_TOTAL_DIGITS,
@@ -220,7 +223,7 @@ fn decimal_capacity(kind: &AggKind) -> u32 {
 }
 
 /// VA1: would summing `non_null_count` values whose magnitude is bounded by `min`/`max`
-/// risk exceeding the DECIMAL(38,scale) capacity DataFusion sums into? DataFusion silently
+/// risk exceeding the DECIMAL(65,scale) capacity DataFusion sums into? DataFusion silently
 /// wraps/corrupts an overflowing decimal sum instead of erroring (unlike MariaDB, which
 /// saturates), so a false Discrepancy would otherwise fire on huge-but-healthy sums. An
 /// empty column (no min/max) never overflows.
@@ -2682,31 +2685,41 @@ mod tests {
 
     #[test]
     fn sum_overflow_guard_boundaries() {
-        // Integer capacity = 38 digits: int_digits + digits(count) > 38 → skip.
-        let d37 = "9".repeat(37);
-        let d38 = "9".repeat(38);
+        // Integer capacity = 65 digits (VA1-r: widened from 38 — MariaDB's DECIMAL max /
+        // DataFusion Decimal256 range): int_digits + digits(count) > 65 → skip.
+        let d64 = "9".repeat(64);
+        let d65 = "9".repeat(65);
         assert!(
-            !sum_would_overflow(&AggKind::Integer, Some("1"), Some(&d37), 9),
-            "37 + 1 = 38 fits exactly"
+            !sum_would_overflow(&AggKind::Integer, Some("1"), Some(&d64), 9),
+            "64 + 1 = 65 fits exactly"
         );
         assert!(
-            sum_would_overflow(&AggKind::Integer, Some("1"), Some(&d38), 9),
-            "38 + 1 = 39 exceeds"
+            sum_would_overflow(&AggKind::Integer, Some("1"), Some(&d65), 9),
+            "65 + 1 = 66 exceeds"
         );
         // count contributes its own digit length: 10 rows (2 digits) tips the same magnitude.
-        assert!(sum_would_overflow(&AggKind::Integer, Some("1"), Some(&d37), 10));
-        // Decimal at scale 10 → capacity 28 integer digits.
+        assert!(sum_would_overflow(&AggKind::Integer, Some("1"), Some(&d64), 10));
+        // Decimal at scale 10 → capacity 55 integer digits.
         let dec = AggKind::Decimal { scale: 10 };
-        let i27 = format!("{}.5", "9".repeat(27));
-        let i28 = format!("{}.5", "9".repeat(28));
-        assert!(!sum_would_overflow(&dec, Some("0.1"), Some(&i27), 9));
-        assert!(sum_would_overflow(&dec, Some("0.1"), Some(&i28), 9));
+        let i54 = format!("{}.5", "9".repeat(54));
+        let i55 = format!("{}.5", "9".repeat(55));
+        assert!(!sum_would_overflow(&dec, Some("0.1"), Some(&i54), 9));
+        assert!(sum_would_overflow(&dec, Some("0.1"), Some(&i55), 9));
         // Sign is ignored for the digit count (min can carry the magnitude).
-        let neg = format!("-{d38}");
+        let neg = format!("-{d65}");
         assert!(sum_would_overflow(&AggKind::Integer, Some(&neg), Some("1"), 9));
         // Empty column / zero rows never trip the guard.
         assert!(!sum_would_overflow(&AggKind::Integer, None, None, 9));
-        assert!(!sum_would_overflow(&AggKind::Integer, Some(&d38), Some(&d38), 0));
+        assert!(!sum_would_overflow(&AggKind::Integer, Some(&d65), Some(&d65), 0));
+
+        // VA1-r regression: a value that WOULD have overflowed the old 38-digit capacity
+        // (40 int digits + 1 count digit = 41 > 38) no longer trips the guard now that the
+        // capacity is 65 — the sum is computed and compared instead of being skipped.
+        let d40 = "9".repeat(40);
+        assert!(
+            !sum_would_overflow(&AggKind::Integer, Some("1"), Some(&d40), 9),
+            "40 + 1 = 41 fit within the new 65-digit capacity (would have overflowed at 38)"
+        );
     }
 
     #[test]
@@ -2717,7 +2730,9 @@ mod tests {
             name: "amount".to_string(),
             kind: AggKind::Decimal { scale: 10 },
         }];
-        let big = "9".repeat(28);
+        // Decimal{scale:10} capacity is 65-10=55 integer digits (VA1-r); 56 nines + 1
+        // count digit trips the guard.
+        let big = "9".repeat(56);
         let src = vec![ColumnAggValues {
             sum: Some("1".to_string()),
             min: Some("0".to_string()),

@@ -74,8 +74,9 @@ impl SourceProbe for SourceProbeAdapter {
                 name,
                 type_str,
                 nullable: nullable == "YES",
-                // VA2: native scale drives the DECIMAL(38,scale) used in value aggregates,
-                // instead of a historical fixed scale of 10.
+                // VA2: native scale drives the DECIMAL(65,scale) used in value aggregates,
+                // instead of a historical fixed scale of 10. 65 is MariaDB's DECIMAL max
+                // (and DataFusion Decimal256's max precision) — see VA1-r.
                 numeric_scale: numeric_scale.and_then(|s| u32::try_from(s).ok()),
             })
             .collect())
@@ -276,9 +277,9 @@ impl SourceProbeAdapter {
                 format!("COUNT(`{c}`)"),
             ],
             AggKind::Decimal { scale } => vec![
-                format!("CAST(CAST(SUM(`{c}`) AS DECIMAL(38,{scale})) AS CHAR)"),
-                format!("CAST(CAST(MIN(`{c}`) AS DECIMAL(38,{scale})) AS CHAR)"),
-                format!("CAST(CAST(MAX(`{c}`) AS DECIMAL(38,{scale})) AS CHAR)"),
+                format!("CAST(CAST(SUM(`{c}`) AS DECIMAL(65,{scale})) AS CHAR)"),
+                format!("CAST(CAST(MIN(`{c}`) AS DECIMAL(65,{scale})) AS CHAR)"),
+                format!("CAST(CAST(MAX(`{c}`) AS DECIMAL(65,{scale})) AS CHAR)"),
                 format!("COUNT(`{c}`)"),
             ],
             AggKind::DatetimeSec => vec![

@@ -91,15 +91,15 @@ impl DeltaProbeAdapter {
         let c = &col.name;
         match col.kind {
             AggKind::Integer => vec![
-                format!("cast(sum(try_cast(`{c}` as decimal(38,0))) as varchar)"),
+                format!("cast(sum(try_cast(`{c}` as decimal(65,0))) as varchar)"),
                 format!("cast(min(try_cast(`{c}` as bigint)) as varchar)"),
                 format!("cast(max(try_cast(`{c}` as bigint)) as varchar)"),
                 format!("count(`{c}`)"),
             ],
             AggKind::Decimal { scale } => vec![
-                format!("cast(sum(try_cast(`{c}` as decimal(38,{scale}))) as varchar)"),
-                format!("cast(min(try_cast(`{c}` as decimal(38,{scale}))) as varchar)"),
-                format!("cast(max(try_cast(`{c}` as decimal(38,{scale}))) as varchar)"),
+                format!("cast(sum(try_cast(`{c}` as decimal(65,{scale}))) as varchar)"),
+                format!("cast(min(try_cast(`{c}` as decimal(65,{scale}))) as varchar)"),
+                format!("cast(max(try_cast(`{c}` as decimal(65,{scale}))) as varchar)"),
                 format!("count(`{c}`)"),
             ],
             AggKind::DatetimeSec => vec![

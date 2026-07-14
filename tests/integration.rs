@@ -1438,6 +1438,105 @@ async fn verify_value_aggregates_real_basic_match_across_type_families() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn verify_wide_decimal_sum_is_verified_not_skipped() {
+    // VA1-r: a DECIMAL(50,0) column whose SUM crosses 38 digits (but stays well under the
+    // widened 65-digit capacity) must have its SUM actually computed and compared, not
+    // skipped by the overflow guard. Three 38-digit values summing to a 39-digit total:
+    //   90000000000000000000000000000000000001
+    // + 80000000000000000000000000000000000002
+    // + 70000000000000000000000000000000000003
+    // = 240000000000000000000000000000000000006  (39 digits, > 38 and << 65)
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let env = TestEnv::new(vec!["wide_values"]).await;
+
+    sqlx::query(
+        "CREATE TABLE wide_values (            id BIGINT PRIMARY KEY,             big_num DECIMAL(50,0) NOT NULL        )",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create wide_values table");
+
+    sqlx::query(
+        "INSERT INTO wide_values (id, big_num) VALUES             (1, 90000000000000000000000000000000000001),             (2, 80000000000000000000000000000000000002),             (3, 70000000000000000000000000000000000003)",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert wide_values rows");
+
+    let mut orchestrator = env.make_orchestrator();
+    let exit_code = orchestrator.run().await;
+    assert!(
+        matches!(exit_code, ExitCode::Success),
+        "expected Success exit code, got {exit_code:?}"
+    );
+
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let verdict = VerifyCommand::new(source, delta, vec!["wide_values".to_string()])
+        .with_table_plans(vec![TablePlan {
+            table: "wide_values".to_string(),
+            mode: VerifyMode::Basic,
+        }])
+        .with_deep(true)
+        .run()
+        .await
+        .expect("verify of the wide-decimal sum should succeed");
+
+    assert_eq!(
+        verdict,
+        VerifyVerdict::Clean,
+        "the 39-digit SUM must be computed and byte-match across probes, not skipped"
+    );
+
+    // Corrupt only the sum-bearing column on one row directly in the source (min/max/count
+    // stay put: 70000000000000000000000000000000000003 + 1 is still strictly between the
+    // other two values). Before VA1-r this kind of sum-only drift on a wide column would have
+    // been invisible because the guard skipped the SUM on both sides.
+    sqlx::query("UPDATE wide_values SET big_num = big_num + 1 WHERE id = 3")
+        .execute(&env.pool)
+        .await
+        .expect("failed to corrupt wide_values row directly");
+
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let verdict_after_corruption =
+        VerifyCommand::new(source, delta, vec!["wide_values".to_string()])
+            .with_table_plans(vec![TablePlan {
+                table: "wide_values".to_string(),
+                mode: VerifyMode::Basic,
+            }])
+            .with_deep(true)
+            .run()
+            .await
+            .expect("verify of the wide-decimal sum should succeed after corruption");
+
+    assert_eq!(
+        verdict_after_corruption,
+        VerifyVerdict::Discrepancy,
+        "a sum-only drift on the wide decimal column must now be detected"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn verify_value_aggregates_real_incremental_hwm_scope_matches_latest_rows() {
     let _guard = tracing_subscriber::fmt()
         .with_env_filter("parket=debug")
