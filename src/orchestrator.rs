@@ -259,12 +259,19 @@ where
         // `discovery::EXTRACTABLE_DATA_TYPES` for the allowlist this enforces.
         let columns = filter_unsupported_columns(&columns);
 
+        // N3-r: indexes are discovered ONCE, up front, because `resolve_ts_col_and_mode`
+        // now needs them to decide auto-detected mode (a single-column integer PRIMARY
+        // key generalizes the old literal-`id` check via `select_integer_pk`). The
+        // Incremental/FullRefresh arms below reuse this same `indexes` instead of
+        // discovering it again.
+        let indexes = self.schema_inspect.discover_indexes(table_name).await?;
+
         // If an explicit TABLE_TIMESTAMP_<table> override names a column that
         // `filter_unsupported_columns` just dropped (e.g. a TIME column), it is no
         // longer present in `columns` at all, so `validate_timestamp_col` bails
         // actionably ("missing or not a timestamp/datetime column") — a per-table
         // error, not a panic and not silent (N1/O8 consequence check).
-        let (ts_col, mode) = crate::discovery::resolve_ts_col_and_mode(&columns, &self.config, table_name)?;
+        let (ts_col, mode) = crate::discovery::resolve_ts_col_and_mode(&columns, &indexes, &self.config, table_name)?;
 
         let mode_str = match mode {
             ExtractionMode::Incremental => "incremental",
@@ -300,7 +307,6 @@ where
 
         let rows = match mode {
             ExtractionMode::Incremental => {
-                let indexes = self.schema_inspect.discover_indexes(table_name).await?;
                 let key_col = select_integer_pk(&columns, &indexes).unwrap_or_else(|| "id".to_string());
                 if !select_columns.iter().any(|c| c == &ts_col) {
                     anyhow::bail!(
@@ -323,7 +329,6 @@ where
                 self.process_incremental(table_name, &select_columns, &ts_col, &key_col, &schema, cursor_nullable).await?
             }
             ExtractionMode::FullRefresh => {
-                let indexes = self.schema_inspect.discover_indexes(table_name).await?;
                 self.process_full_refresh(table_name, &select_columns, &columns, &indexes, &schema)
                     .await?
             }
@@ -540,7 +545,7 @@ mod tests {
         schema_mock
             .expect_discover_indexes()
             .withf(|t| t == "good_table")
-            .returning(|_| Ok(make_full_refresh_indexes()));
+            .returning(|_| Ok(make_full_refresh_primary_key("id")));
         schema_mock
             .expect_get_avg_row_length()
             .withf(|t| t == "good_table")
@@ -677,7 +682,7 @@ mod tests {
             .returning(move |_| Ok(make_columns()));
         schema_mock
             .expect_discover_indexes()
-            .returning(|_| Ok(make_full_refresh_indexes()));
+            .returning(|_| Ok(make_full_refresh_primary_key("id")));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -787,7 +792,7 @@ mod tests {
             .returning(move |_| Ok(make_columns()));
         schema_mock
             .expect_discover_indexes()
-            .returning(|_| Ok(make_full_refresh_indexes()));
+            .returning(|_| Ok(make_full_refresh_primary_key("id")));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -886,7 +891,7 @@ mod tests {
             .returning(move |_| Ok(make_columns()));
         schema_mock
             .expect_discover_indexes()
-            .returning(|_| Ok(make_full_refresh_indexes()));
+            .returning(|_| Ok(make_full_refresh_primary_key("id")));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -924,7 +929,7 @@ mod tests {
             .returning(move |_| Ok(make_columns()));
         schema_mock
             .expect_discover_indexes()
-            .returning(|_| Ok(make_full_refresh_indexes()));
+            .returning(|_| Ok(make_full_refresh_primary_key("id")));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -974,7 +979,7 @@ mod tests {
             .returning(move |_| Ok(make_columns()));
         schema_mock
             .expect_discover_indexes()
-            .returning(|_| Ok(make_full_refresh_indexes()));
+            .returning(|_| Ok(make_full_refresh_primary_key("id")));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -1145,7 +1150,7 @@ mod tests {
             .returning(move |_| Ok(make_columns()));
         schema_mock
             .expect_discover_indexes()
-            .returning(|_| Ok(make_full_refresh_indexes()));
+            .returning(|_| Ok(make_full_refresh_primary_key("id")));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -1211,7 +1216,7 @@ mod tests {
         schema_mock
             .expect_discover_indexes()
             .withf(|t| t == "table1")
-            .returning(|_| Ok(make_full_refresh_indexes()));
+            .returning(|_| Ok(make_full_refresh_primary_key("id")));
         schema_mock
             .expect_get_avg_row_length()
             .withf(|t| t == "table1")
@@ -1281,7 +1286,7 @@ mod tests {
             .returning(move |_| Ok(make_columns()));
         schema_mock
             .expect_discover_indexes()
-            .returning(|_| Ok(make_full_refresh_indexes()));
+            .returning(|_| Ok(make_full_refresh_primary_key("id")));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -1488,7 +1493,7 @@ mod tests {
             .returning(move |_| Ok(make_columns()));
         schema_mock
             .expect_discover_indexes()
-            .returning(|_| Ok(make_full_refresh_indexes()));
+            .returning(|_| Ok(make_full_refresh_primary_key("id")));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -1565,9 +1570,10 @@ mod tests {
         // runs. An explicit TABLE_TIMESTAMP_<table> override naming that (now-absent)
         // column must fail the table with an actionable "missing or not a
         // timestamp/datetime column" error (validate_timestamp_col sees an absent
-        // column) — never a panic, never silently ignored. Only discover_columns is
-        // mocked: process_table must bail before get_avg_row_length/ensure_table/etc are
-        // ever reached, so any further mock call would panic on "no expectation set".
+        // column) — never a panic, never silently ignored. Only discover_columns and
+        // discover_indexes (N3-r: now fetched up front, before mode/ts_col resolution)
+        // are mocked: process_table must bail before get_avg_row_length/ensure_table/etc
+        // are ever reached, so any further mock call would panic on "no expectation set".
         let dir = TempDir::new().unwrap();
         let mut config = make_config(vec!["events".to_string()]);
         config
@@ -1588,6 +1594,7 @@ mod tests {
                 ColumnInfo { name: "t".into(), data_type: "time".into(), column_type: "time".into(), nullable: false },
             ])
         });
+        schema_mock.expect_discover_indexes().returning(|_| Ok(vec![]));
         state_mock
             .expect_update_table()
             .withf(|name, state, _| {

@@ -216,7 +216,7 @@ mod tests {
             .returning(move |_| Ok(make_columns()));
         schema_mock
             .expect_discover_indexes()
-            .returning(|_| Ok(make_full_refresh_indexes()));
+            .returning(|_| Ok(make_full_refresh_primary_key("id")));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -318,7 +318,7 @@ mod tests {
             .returning(move |_| Ok(make_columns()));
         schema_mock
             .expect_discover_indexes()
-            .returning(|_| Ok(make_full_refresh_indexes()));
+            .returning(|_| Ok(make_full_refresh_primary_key("id")));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -427,7 +427,7 @@ mod tests {
             .returning(move |_| Ok(make_columns()));
         schema_mock
             .expect_discover_indexes()
-            .returning(|_| Ok(make_full_refresh_indexes()));
+            .returning(|_| Ok(make_full_refresh_primary_key("id")));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -573,7 +573,7 @@ mod tests {
             .returning(move |_| Ok(make_columns()));
         schema_mock
             .expect_discover_indexes()
-            .returning(|_| Ok(make_full_refresh_indexes()));
+            .returning(|_| Ok(make_full_refresh_primary_key("id")));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -630,7 +630,7 @@ mod tests {
             .returning(move |_| Ok(make_columns()));
         schema_mock
             .expect_discover_indexes()
-            .returning(|_| Ok(make_full_refresh_indexes()));
+            .returning(|_| Ok(make_full_refresh_primary_key("id")));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -710,7 +710,7 @@ mod tests {
             });
         schema_mock
             .expect_discover_indexes()
-            .returning(|_| Ok(make_full_refresh_indexes()));
+            .returning(|_| Ok(make_full_refresh_primary_key("id")));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -848,7 +848,7 @@ mod tests {
             .returning(move |_| Ok(make_columns()));
         schema_mock
             .expect_discover_indexes()
-            .returning(|_| Ok(make_full_refresh_indexes()));
+            .returning(|_| Ok(make_full_refresh_primary_key("id")));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -907,7 +907,7 @@ mod tests {
             .returning(move |_| Ok(make_columns()));
         schema_mock
             .expect_discover_indexes()
-            .returning(|_| Ok(vec![]));
+            .returning(|_| Ok(make_full_refresh_primary_key("id")));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -1039,7 +1039,7 @@ mod tests {
             .returning(move |_| Ok(make_columns()));
         schema_mock
             .expect_discover_indexes()
-            .returning(|_| Ok(vec![]));
+            .returning(|_| Ok(make_full_refresh_primary_key("id")));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));

@@ -1977,7 +1977,11 @@ async fn verify_auto_detected_incremental_scopes_to_hwm_not_basic() {
         .await
         .expect("discover_columns failed for events");
     let columns = parket::discovery::filter_unsupported_columns(&raw_columns);
-    let (ts_col, mode) = parket::discovery::resolve_ts_col_and_mode(&columns, &env.config, "events")
+    let indexes = inspector
+        .discover_indexes("events")
+        .await
+        .expect("discover_indexes failed for events");
+    let (ts_col, mode) = parket::discovery::resolve_ts_col_and_mode(&columns, &indexes, &env.config, "events")
         .expect("resolve_ts_col_and_mode failed for events");
     assert_eq!(ts_col, "updated_at");
     assert_eq!(
@@ -2015,6 +2019,147 @@ async fn verify_auto_detected_incremental_scopes_to_hwm_not_basic() {
         "incremental-scoped verify must exclude the post-HWM source rows and report Clean — \
          proving --verify resolved this auto-detected table as Incremental, not Basic"
     );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn run_auto_detects_incremental_on_non_id_integer_pk() {
+    // N3-r: detect_mode used to key off a column LITERALLY named `id`, so a table whose
+    // integer PRIMARY key is named something else (e.g. `code_id`) + a valid timestamp
+    // cursor auto-detected as FullRefresh — re-extracting the whole table every run —
+    // instead of Incremental. The fix generalizes to "has a single-column integer PRIMARY
+    // key" via `discovery::select_integer_pk`. No TABLE_MODE is configured here: this proves
+    // auto-detection alone now picks Incremental for a non-`id` PK, both at the resolver
+    // level and end-to-end (a re-run only appends the new post-sync row, not a full
+    // re-extract).
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let env = TestEnv::new(vec!["code_events"]).await;
+
+    sqlx::query(
+        "CREATE TABLE code_events (\
+            code_id BIGINT PRIMARY KEY, \
+            name VARCHAR(50) NOT NULL, \
+            updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)\
+        )",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create code_events table");
+
+    sqlx::query(
+        "INSERT INTO code_events (code_id, name, updated_at) VALUES \
+            (100, 'alpha', '2026-01-01 00:00:00.000000'), \
+            (200, 'bravo', '2026-01-02 00:00:00.000000')",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert initial code_events rows");
+
+    // Resolver-level proof: no TABLE_MODE_code_events configured (make_config's table_modes
+    // is empty) — the shared resolver (`discovery::resolve_ts_col_and_mode`, the same one the
+    // run/verify/--check paths all call) must auto-detect Incremental from `code_id` (a
+    // single-column integer PRIMARY key that is NOT named `id`) + the non-null `updated_at`
+    // cursor.
+    let inspector = parket::discovery::SchemaInspector::new(env.pool.clone(), "parket".to_string());
+    let raw_columns = inspector
+        .discover_columns("code_events")
+        .await
+        .expect("discover_columns failed for code_events");
+    let filtered_columns = parket::discovery::filter_unsupported_columns(&raw_columns);
+    let indexes = inspector
+        .discover_indexes("code_events")
+        .await
+        .expect("discover_indexes failed for code_events");
+    let (ts_col, mode) =
+        parket::discovery::resolve_ts_col_and_mode(&filtered_columns, &indexes, &env.config, "code_events")
+            .expect("resolve_ts_col_and_mode failed for code_events");
+    assert_eq!(ts_col, "updated_at");
+    assert_eq!(
+        mode,
+        parket::config::ExtractionMode::Incremental,
+        "auto-detected mode for code_events (code_id integer PRIMARY key + non-null \
+         updated_at, no TABLE_MODE override) must be Incremental — this is the exact N3-r \
+         fix: a non-`id`-named integer PRIMARY key must not fall back to full_refresh"
+    );
+
+    // End-to-end proof: sync, then insert one new post-HWM row directly into the source
+    // (without re-running the pipeline first), then re-run. If the table were (incorrectly)
+    // auto-detected as FullRefresh, the second run would simply re-extract and overwrite the
+    // whole table — the row count would still land on 3, indistinguishable from a correct
+    // incremental append. The real discriminator is the HWM: only an Incremental run reads
+    // and advances one, so asserting the HWM's presence/advance is what proves this ran
+    // incrementally, not just that the final count happens to match.
+    let mut orchestrator_run1 = env.make_orchestrator();
+    let exit_code_run1 = orchestrator_run1.run().await;
+    assert!(
+        matches!(exit_code_run1, ExitCode::Success),
+        "run 1: expected Success, got {exit_code_run1:?}"
+    );
+
+    let row_count_run1 = count_delta_rows(&env, "code_events").await;
+    assert_eq!(row_count_run1, 2, "run 1: expected 2 rows in Delta");
+
+    let writer = DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    );
+    let hwm_run1 = writer
+        .read_hwm("code_events")
+        .await
+        .expect("run 1: read_hwm failed")
+        .expect("run 1: an Incremental run must persist an HWM (a FullRefresh run never does)");
+    assert!(
+        hwm_run1.updated_at.starts_with("2026-01-02"),
+        "run 1: HWM updated_at should be 2026-01-02, got: {}",
+        hwm_run1.updated_at,
+    );
+    assert_eq!(
+        hwm_run1.last_id, 200,
+        "run 1: HWM last_id should track the discovered integer key `code_id` (200), not a \
+         hardcoded `id` column that doesn't exist on this table"
+    );
+
+    sqlx::query(
+        "INSERT INTO code_events (code_id, name, updated_at) VALUES \
+            (300, 'charlie', '2026-01-03 00:00:00.000000')",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert post-HWM code_events row");
+
+    let mut orchestrator_run2 = env.make_orchestrator();
+    let exit_code_run2 = orchestrator_run2.run().await;
+    assert!(
+        matches!(exit_code_run2, ExitCode::Success),
+        "run 2: expected Success, got {exit_code_run2:?}"
+    );
+
+    let row_count_run2 = count_delta_rows(&env, "code_events").await;
+    assert_eq!(
+        row_count_run2, 3,
+        "run 2: expected exactly 3 total rows (2 old + 1 new) — an incremental append, not a \
+         full re-extract"
+    );
+
+    let hwm_run2 = writer
+        .read_hwm("code_events")
+        .await
+        .expect("run 2: read_hwm failed")
+        .expect("run 2: HWM should still be present");
+    assert!(
+        hwm_run2.updated_at.starts_with("2026-01-03"),
+        "run 2: HWM updated_at should have advanced to 2026-01-03, got: {}",
+        hwm_run2.updated_at,
+    );
+    assert_eq!(hwm_run2.last_id, 300, "run 2: HWM last_id should advance to 300");
 }
 
 #[tokio::test]

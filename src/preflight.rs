@@ -4,7 +4,7 @@ use object_store::ObjectStore;
 use tracing::{error, info};
 
 use crate::config::Config;
-use crate::discovery::{filter_unsupported_columns, ColumnInfo, IndexInfo, SchemaInspector};
+use crate::discovery::{filter_unsupported_columns, select_integer_pk, ColumnInfo, IndexInfo, SchemaInspector};
 
 #[cfg_attr(test, mockall::automock)]
 #[allow(async_fn_in_trait)]
@@ -93,7 +93,8 @@ where
     async fn check_table(&self, table_name: &str) -> Result<()> {
         let columns = self.inspect.discover_columns(table_name).await?;
         let columns = filter_unsupported_columns(&columns);
-        let (ts_col, mode) = crate::discovery::resolve_ts_col_and_mode(&columns, &self.config, table_name)?;
+        let indexes = self.inspect.discover_indexes(table_name).await?;
+        let (ts_col, mode) = crate::discovery::resolve_ts_col_and_mode(&columns, &indexes, &self.config, table_name)?;
 
         if !matches!(mode, crate::config::ExtractionMode::Incremental | crate::config::ExtractionMode::TwoStream)
             && self.config.table_initial_hwm.contains_key(table_name)
@@ -125,20 +126,23 @@ where
             "override".to_string()
         } else {
             match mode {
-                crate::config::ExtractionMode::Incremental => format!("id, {ts_col}"),
+                crate::config::ExtractionMode::Incremental => {
+                    let key_col = select_integer_pk(&columns, &indexes).unwrap_or_else(|| "id".to_string());
+                    format!("{key_col}, {ts_col}")
+                }
                 crate::config::ExtractionMode::FullRefresh => {
                     // Determine why it's FullRefresh
-                    let has_id = columns.iter().any(|c| c.name == "id");
+                    let has_integer_key = select_integer_pk(&columns, &indexes).is_some();
                     let ts_candidate = columns.iter().find(|c| {
                         c.name == ts_col
                             && (c.data_type == "timestamp" || c.data_type == "datetime")
                     });
-                    match (has_id, ts_candidate) {
+                    match (has_integer_key, ts_candidate) {
                         (false, None) => format!("no id/{ts_col}"),
                         (false, Some(_)) => "no id".to_string(),
                         (true, None) => format!("no {ts_col}"),
-                        // O3: id + a right-typed but nullable cursor is demoted to
-                        // FullRefresh by detect_mode — this is now reachable, not a bug.
+                        // O3: an integer key + a right-typed but nullable cursor is demoted
+                        // to FullRefresh by detect_mode — this is now reachable, not a bug.
                         (true, Some(c)) if c.nullable => {
                             format!("nullable {ts_col} (unsafe cursor)")
                         }
@@ -377,6 +381,13 @@ mod tests {
         }
     }
 
+    /// A single-column integer PRIMARY key index on `id` — matches the shape of
+    /// `incremental_columns()` (id + updated_at) so `select_integer_pk` finds it and the
+    /// table auto-detects Incremental, mirroring pre-N3-r's literal-`id` check.
+    fn primary_id_index() -> Vec<IndexInfo> {
+        vec![IndexInfo { name: "PRIMARY".to_string(), unique: true, columns: vec!["id".to_string()] }]
+    }
+
     fn incremental_columns() -> Vec<ColumnInfo> {
         vec![
             col("id", "bigint", "bigint(20)"),
@@ -418,6 +429,7 @@ mod tests {
             .expect_get_avg_row_length()
             .withf(|t| t == "products")
             .returning(|_| Ok(None));
+        inspect.expect_discover_indexes().returning(|_| Ok(primary_id_index()));
 
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
@@ -449,6 +461,7 @@ mod tests {
             .expect_get_avg_row_length()
             .withf(|t| t == "orders")
             .returning(|_| Ok(Some(128)));
+        inspect.expect_discover_indexes().returning(|_| Ok(primary_id_index()));
 
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
@@ -520,6 +533,7 @@ mod tests {
             .expect_discover_columns()
             .withf(|t| t == "bad")
             .returning(|_| Err(anyhow::anyhow!("not found")));
+        inspect.expect_discover_indexes().returning(|_| Ok(primary_id_index()));
 
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
@@ -550,6 +564,7 @@ mod tests {
         inspect
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
+        inspect.expect_discover_indexes().returning(|_| Ok(vec![]));
 
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
@@ -583,6 +598,10 @@ mod tests {
         inspect
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
+        // id is a single-column integer PRIMARY key, so has_integer_key is true —
+        // exercising the intended "nullable cursor demotes an otherwise-eligible
+        // table" reason arm, not the unrelated "no integer key" arm.
+        inspect.expect_discover_indexes().returning(|_| Ok(primary_id_index()));
 
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         // Passes as a FullRefresh table (the KEY reason names the nullable cursor);
@@ -610,6 +629,7 @@ mod tests {
         inspect
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(128)));
+        inspect.expect_discover_indexes().returning(|_| Ok(primary_id_index()));
         hwm.expect_read_hwm().returning(|_| Ok(None));
         hwm.expect_delta_schema().returning(|_| Ok(None));
 
@@ -654,6 +674,7 @@ mod tests {
         inspect
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
+        inspect.expect_discover_indexes().returning(|_| Ok(vec![]));
 
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
@@ -677,6 +698,7 @@ mod tests {
         inspect
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
+        inspect.expect_discover_indexes().returning(|_| Ok(vec![]));
 
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
@@ -704,6 +726,7 @@ mod tests {
         inspect
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(128)));
+        inspect.expect_discover_indexes().returning(|_| Ok(vec![]));
 
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
@@ -726,6 +749,7 @@ mod tests {
         inspect
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(128)));
+        inspect.expect_discover_indexes().returning(|_| Ok(vec![]));
 
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
@@ -750,6 +774,7 @@ mod tests {
         inspect
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(128)));
+        inspect.expect_discover_indexes().returning(|_| Ok(vec![]));
 
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
@@ -775,6 +800,7 @@ mod tests {
         inspect
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(128)));
+        inspect.expect_discover_indexes().returning(|_| Ok(vec![]));
 
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
@@ -800,6 +826,7 @@ mod tests {
         inspect
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(128)));
+        inspect.expect_discover_indexes().returning(|_| Ok(vec![]));
 
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
@@ -830,6 +857,7 @@ mod tests {
         inspect
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(64)));
+        inspect.expect_discover_indexes().returning(|_| Ok(vec![]));
 
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
@@ -857,6 +885,9 @@ mod tests {
         inspect
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
+        // id is a single-column integer PRIMARY key, so the reason arm stays "no
+        // updated_at" (not "no id/updated_at") — matching this test's documented intent.
+        inspect.expect_discover_indexes().returning(|_| Ok(primary_id_index()));
 
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
@@ -884,6 +915,7 @@ mod tests {
         inspect
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(80)));
+        inspect.expect_discover_indexes().returning(|_| Ok(vec![]));
 
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
@@ -911,6 +943,7 @@ mod tests {
         inspect
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(128)));
+        inspect.expect_discover_indexes().returning(|_| Ok(vec![]));
 
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
@@ -938,6 +971,7 @@ mod tests {
         inspect
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(128)));
+        inspect.expect_discover_indexes().returning(|_| Ok(vec![]));
 
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
@@ -962,6 +996,9 @@ mod tests {
         inspect
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(128)));
+        // id is the single-column integer PRIMARY key so the table still resolves
+        // Incremental (this test's whole point is the Incremental KEY format).
+        inspect.expect_discover_indexes().returning(|_| Ok(primary_id_index()));
 
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
@@ -986,6 +1023,7 @@ mod tests {
         inspect
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(128)));
+        inspect.expect_discover_indexes().returning(|_| Ok(primary_id_index()));
 
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
@@ -1017,6 +1055,9 @@ mod tests {
         inspect
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(128)));
+        // id is the single-column integer PRIMARY key, so this still resolves Incremental
+        // with the custom "completed_at" cursor (this test's documented intent).
+        inspect.expect_discover_indexes().returning(|_| Ok(primary_id_index()));
 
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
@@ -1049,6 +1090,7 @@ mod tests {
         inspect
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(64)));
+        inspect.expect_discover_indexes().returning(|_| Ok(vec![]));
 
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
@@ -1083,6 +1125,7 @@ mod tests {
         inspect
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(128)));
+        inspect.expect_discover_indexes().returning(|_| Ok(primary_id_index()));
 
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
@@ -1160,6 +1203,9 @@ mod tests {
         inspect
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(128)));
+        // id must resolve as the integer PRIMARY key so the table is Incremental — the
+        // schema-evolution check this test exercises only runs for Incremental/TwoStream.
+        inspect.expect_discover_indexes().returning(|_| Ok(primary_id_index()));
 
         let check = PreflightCheck::new(config, inspect, storage, hwm);
 

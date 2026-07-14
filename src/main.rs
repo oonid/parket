@@ -126,23 +126,35 @@ async fn build_verify_table_plans(
             match inspector.discover_columns(table).await {
                 Ok(raw_columns) => {
                     let columns = parket::discovery::filter_unsupported_columns(&raw_columns);
-                    match parket::discovery::resolve_ts_col_and_mode(&columns, config, table) {
-                        Ok((ts_col, config::ExtractionMode::Incremental)) => {
-                            let hwm = writer
-                                .read_hwm(table)
-                                .await
-                                .with_context(|| format!("read HWM for verify table `{table}`"))?;
-                            parket::verify::VerifyMode::Incremental { cursor_col: ts_col, hwm }
+                    // N3-r: resolve_ts_col_and_mode now needs indexes to auto-detect
+                    // incremental via a single-column integer PRIMARY key (not just a
+                    // literal `id` column) — degrade to Basic on failure, same as a
+                    // discover_columns failure above, rather than fail the whole verify run.
+                    match inspector.discover_indexes(table).await {
+                        Ok(indexes) => {
+                            match parket::discovery::resolve_ts_col_and_mode(&columns, &indexes, config, table) {
+                                Ok((ts_col, config::ExtractionMode::Incremental)) => {
+                                    let hwm = writer
+                                        .read_hwm(table)
+                                        .await
+                                        .with_context(|| format!("read HWM for verify table `{table}`"))?;
+                                    parket::verify::VerifyMode::Incremental { cursor_col: ts_col, hwm }
+                                }
+                                Ok((_, config::ExtractionMode::FullRefresh)) => {
+                                    parket::verify::VerifyMode::FullRefresh
+                                }
+                                // TwoStream is handled by the branch above (config.two_stream was None here);
+                                // Auto is never returned by detect_mode. Either would be a config/logic
+                                // anomaly — fall back to a basic check rather than mis-scope.
+                                Ok(_) => parket::verify::VerifyMode::Basic,
+                                Err(e) => {
+                                    tracing::warn!(table = %table, error = %e, "verify: mode resolution failed; falling back to basic checks");
+                                    parket::verify::VerifyMode::Basic
+                                }
+                            }
                         }
-                        Ok((_, config::ExtractionMode::FullRefresh)) => {
-                            parket::verify::VerifyMode::FullRefresh
-                        }
-                        // TwoStream is handled by the branch above (config.two_stream was None here);
-                        // Auto is never returned by detect_mode. Either would be a config/logic
-                        // anomaly — fall back to a basic check rather than mis-scope.
-                        Ok(_) => parket::verify::VerifyMode::Basic,
                         Err(e) => {
-                            tracing::warn!(table = %table, error = %e, "verify: mode resolution failed; falling back to basic checks");
+                            tracing::warn!(table = %table, error = %e, "verify: index discovery failed; falling back to basic checks");
                             parket::verify::VerifyMode::Basic
                         }
                     }

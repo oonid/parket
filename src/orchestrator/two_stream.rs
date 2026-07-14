@@ -325,6 +325,9 @@ mod tests {
             .expect_discover_columns()
             .returning(move |_| Ok(make_columns()));
         schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(vec![]));
+        schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
         schema_mock
@@ -415,6 +418,9 @@ mod tests {
             .expect_discover_columns()
             .returning(move |_| Ok(make_columns()));
         schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(vec![]));
+        schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
         schema_mock
@@ -494,6 +500,9 @@ mod tests {
         schema_mock
             .expect_discover_columns()
             .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(vec![]));
         state_mock
             .expect_update_table()
             .returning(|_, _, _| Ok(()));
@@ -520,6 +529,9 @@ mod tests {
         schema_mock
             .expect_discover_columns()
             .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(vec![]));
         state_mock
             .expect_update_table()
             .returning(|_, _, _| Ok(()));
@@ -549,6 +561,9 @@ mod tests {
         schema_mock
             .expect_discover_columns()
             .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(vec![]));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -667,6 +682,9 @@ mod tests {
                     },
                 ])
             });
+        schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(vec![]));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -805,6 +823,9 @@ mod tests {
                 ])
             });
         schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(vec![]));
+        schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
         schema_mock
@@ -903,6 +924,9 @@ mod tests {
         schema_mock
             .expect_discover_columns()
             .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(vec![]));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -1003,6 +1027,9 @@ mod tests {
             .expect_discover_columns()
             .returning(move |_| Ok(make_columns()));
         schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(vec![]));
+        schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
         extract_mock
@@ -1095,6 +1122,9 @@ mod tests {
             .expect_discover_columns()
             .returning(move |_| Ok(make_columns()));
         schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(vec![]));
+        schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
         extract_mock
@@ -1177,6 +1207,9 @@ mod tests {
         schema_mock
             .expect_discover_columns()
             .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(vec![]));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
@@ -1302,6 +1335,9 @@ mod tests {
                 ])
             });
         schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(vec![]));
+        schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));
         schema_mock
@@ -1356,6 +1392,9 @@ mod tests {
         schema_mock
             .expect_discover_columns()
             .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(vec![]));
         schema_mock
             .expect_get_avg_row_length()
             .returning(|_| Ok(Some(100)));

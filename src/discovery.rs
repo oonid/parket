@@ -321,6 +321,7 @@ pub fn detect_mode(
     columns: &[ColumnInfo],
     override_mode: Option<&ExtractionMode>,
     timestamp_col: &str,
+    has_integer_key: bool,
 ) -> ExtractionMode {
     if let Some(mode) = override_mode
         && *mode != ExtractionMode::Auto
@@ -344,13 +345,13 @@ pub fn detect_mode(
         c.name == timestamp_col
             && (c.data_type == "timestamp" || c.data_type == "datetime")
     });
-    let has_id = columns.iter().any(|c| c.name == "id");
 
     match ts_col {
-        // Warn only when nullability is the DECIDING factor (id present, so the table
-        // would otherwise have qualified for incremental). A table without `id` is
-        // full_refresh regardless — attributing that to the cursor would mislead.
-        Some(c) if has_id && c.nullable => {
+        // Warn only when nullability is the DECIDING factor (a qualifying integer key is
+        // present, so the table would otherwise have qualified for incremental). A table
+        // without an integer key is full_refresh regardless — attributing that to the
+        // cursor would mislead.
+        Some(c) if has_integer_key && c.nullable => {
             warn!(
                 "auto-detection found timestamp cursor candidate '{timestamp_col}' but it is \
                  nullable — a nullable cursor is unsafe for incremental extraction (NULL-cursor \
@@ -359,7 +360,7 @@ pub fn detect_mode(
             );
             ExtractionMode::FullRefresh
         }
-        Some(_) if has_id => ExtractionMode::Incremental,
+        Some(_) if has_integer_key => ExtractionMode::Incremental,
         _ => ExtractionMode::FullRefresh,
     }
 }
@@ -371,6 +372,7 @@ pub fn detect_mode(
 /// tables as Basic). Behavior-preserving extraction of the orchestrator's prior inline logic.
 pub fn resolve_ts_col_and_mode(
     columns: &[ColumnInfo],
+    indexes: &[IndexInfo],
     config: &Config,
     table: &str,
 ) -> Result<(String, ExtractionMode)> {
@@ -403,7 +405,8 @@ pub fn resolve_ts_col_and_mode(
         validate_two_stream_cursors(columns, &ins, &upd)?;
         ExtractionMode::TwoStream
     } else {
-        detect_mode(columns, config.table_modes.get(table), &ts_col)
+        let has_integer_key = select_integer_pk(columns, indexes).is_some();
+        detect_mode(columns, config.table_modes.get(table), &ts_col, has_integer_key)
     };
     Ok((ts_col, mode))
 }
@@ -677,7 +680,7 @@ mod tests {
             col("name", "varchar", "varchar(255)"),
             col("updated_at", "timestamp", "timestamp"),
         ];
-        let mode = detect_mode(&columns, None, "updated_at");
+        let mode = detect_mode(&columns, None, "updated_at", true);
         assert_eq!(mode, ExtractionMode::Incremental);
     }
 
@@ -687,7 +690,7 @@ mod tests {
             col("id", "int", "int(11)"),
             col("updated_at", "datetime", "datetime"),
         ];
-        let mode = detect_mode(&columns, None, "updated_at");
+        let mode = detect_mode(&columns, None, "updated_at", true);
         assert_eq!(mode, ExtractionMode::Incremental);
     }
 
@@ -697,7 +700,7 @@ mod tests {
             col("id", "int", "int(11)"),
             col("name", "varchar", "varchar(255)"),
         ];
-        let mode = detect_mode(&columns, None, "updated_at");
+        let mode = detect_mode(&columns, None, "updated_at", true);
         assert_eq!(mode, ExtractionMode::FullRefresh);
     }
 
@@ -707,14 +710,14 @@ mod tests {
             col("name", "varchar", "varchar(255)"),
             col("updated_at", "timestamp", "timestamp"),
         ];
-        let mode = detect_mode(&columns, None, "updated_at");
+        let mode = detect_mode(&columns, None, "updated_at", false);
         assert_eq!(mode, ExtractionMode::FullRefresh);
     }
 
     #[test]
     fn detect_mode_full_refresh_no_relevant_columns() {
         let columns = vec![col("data", "json", "json")];
-        let mode = detect_mode(&columns, None, "updated_at");
+        let mode = detect_mode(&columns, None, "updated_at", false);
         assert_eq!(mode, ExtractionMode::FullRefresh);
     }
 
@@ -724,7 +727,7 @@ mod tests {
             col("id", "int", "int(11)"),
             col("updated_at", "varchar", "varchar(255)"),
         ];
-        let mode = detect_mode(&columns, None, "updated_at");
+        let mode = detect_mode(&columns, None, "updated_at", true);
         assert_eq!(mode, ExtractionMode::FullRefresh);
     }
 
@@ -734,21 +737,21 @@ mod tests {
             col("id", "int", "int(11)"),
             col("updated_at", "timestamp", "timestamp"),
         ];
-        let mode = detect_mode(&columns, Some(&ExtractionMode::FullRefresh), "updated_at");
+        let mode = detect_mode(&columns, Some(&ExtractionMode::FullRefresh), "updated_at", true);
         assert_eq!(mode, ExtractionMode::FullRefresh);
     }
 
     #[test]
     fn detect_mode_override_incremental_forces_incremental() {
         let columns = vec![col("name", "varchar", "varchar(255)")];
-        let mode = detect_mode(&columns, Some(&ExtractionMode::Incremental), "updated_at");
+        let mode = detect_mode(&columns, Some(&ExtractionMode::Incremental), "updated_at", false);
         assert_eq!(mode, ExtractionMode::Incremental);
     }
 
     #[test]
     fn detect_mode_override_auto_same_as_none() {
         let columns = vec![col("data", "json", "json")];
-        let mode = detect_mode(&columns, Some(&ExtractionMode::Auto), "updated_at");
+        let mode = detect_mode(&columns, Some(&ExtractionMode::Auto), "updated_at", false);
         assert_eq!(mode, ExtractionMode::FullRefresh);
     }
 
@@ -760,7 +763,7 @@ mod tests {
             col("id", "int", "int(11)"),
             nullable_col("updated_at", "timestamp", "timestamp"),
         ];
-        let mode = detect_mode(&columns, None, "updated_at");
+        let mode = detect_mode(&columns, None, "updated_at", true);
         assert_eq!(mode, ExtractionMode::FullRefresh);
     }
 
@@ -772,7 +775,20 @@ mod tests {
             col("id", "int", "int(11)"),
             nullable_col("updated_at", "timestamp", "timestamp"),
         ];
-        let mode = detect_mode(&columns, Some(&ExtractionMode::Incremental), "updated_at");
+        let mode = detect_mode(&columns, Some(&ExtractionMode::Incremental), "updated_at", true);
+        assert_eq!(mode, ExtractionMode::Incremental);
+    }
+
+    #[test]
+    fn detect_mode_incremental_with_non_id_integer_pk() {
+        // N3-r: the generalization — no column named `id` at all, but the caller has
+        // determined (via select_integer_pk) that a single-column integer PRIMARY key
+        // exists. detect_mode must key off the bool, not a literal "id" column name.
+        let columns = vec![
+            col("code_id", "bigint", "bigint(20)"),
+            col("updated_at", "timestamp", "timestamp"),
+        ];
+        let mode = detect_mode(&columns, None, "updated_at", true);
         assert_eq!(mode, ExtractionMode::Incremental);
     }
 
@@ -850,7 +866,7 @@ mod tests {
             col("id", "int", "int(11)"),
             col("completed_at", "timestamp", "timestamp"),
         ];
-        let mode = detect_mode(&columns, None, "completed_at");
+        let mode = detect_mode(&columns, None, "completed_at", true);
         assert_eq!(mode, ExtractionMode::Incremental);
     }
 
@@ -1234,7 +1250,8 @@ mod tests {
             col("updated_at", "timestamp", "timestamp"),
         ];
         let config = test_config();
-        let (ts_col, mode) = resolve_ts_col_and_mode(&columns, &config, "orders").unwrap();
+        let indexes = vec![IndexInfo { name: "PRIMARY".to_string(), unique: true, columns: vec!["id".to_string()] }];
+        let (ts_col, mode) = resolve_ts_col_and_mode(&columns, &indexes, &config, "orders").unwrap();
         assert_eq!(ts_col, "updated_at");
         assert_eq!(mode, ExtractionMode::Incremental);
     }
@@ -1246,7 +1263,7 @@ mod tests {
             col("updated_at", "timestamp", "timestamp"),
         ];
         let config = test_config();
-        let (_, mode) = resolve_ts_col_and_mode(&columns, &config, "orders").unwrap();
+        let (_, mode) = resolve_ts_col_and_mode(&columns, &[], &config, "orders").unwrap();
         assert_eq!(mode, ExtractionMode::FullRefresh);
     }
 
@@ -1262,7 +1279,7 @@ mod tests {
         config
             .table_modes
             .insert("orders".to_string(), ExtractionMode::FullRefresh);
-        let (_, mode) = resolve_ts_col_and_mode(&columns, &config, "orders").unwrap();
+        let (_, mode) = resolve_ts_col_and_mode(&columns, &[], &config, "orders").unwrap();
         assert_eq!(mode, ExtractionMode::FullRefresh);
     }
 
@@ -1280,7 +1297,7 @@ mod tests {
         config
             .table_update_cursor
             .insert("orders".to_string(), "updated_at".to_string());
-        let (_, mode) = resolve_ts_col_and_mode(&columns, &config, "orders").unwrap();
+        let (_, mode) = resolve_ts_col_and_mode(&columns, &[], &config, "orders").unwrap();
         assert_eq!(mode, ExtractionMode::TwoStream);
     }
 
@@ -1297,10 +1314,40 @@ mod tests {
         config
             .table_insert_cursor
             .insert("orders".to_string(), "user_id".to_string());
-        let result = resolve_ts_col_and_mode(&columns, &config, "orders");
+        let result = resolve_ts_col_and_mode(&columns, &[], &config, "orders");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("two-stream requires BOTH"));
+    }
+
+    #[test]
+    fn resolve_ts_col_and_mode_auto_detects_incremental_on_non_id_pk() {
+        // N3-r end-to-end proof at the resolver level: a single-column integer PRIMARY
+        // key named `code_id` (not `id`) + a timestamp cursor, no TABLE_MODE override —
+        // must auto-detect Incremental.
+        let columns = vec![
+            col("code_id", "bigint", "bigint(20)"),
+            col("updated_at", "timestamp", "timestamp"),
+        ];
+        let config = test_config();
+        let indexes = vec![IndexInfo { name: "PRIMARY".to_string(), unique: true, columns: vec!["code_id".to_string()] }];
+        let (ts_col, mode) = resolve_ts_col_and_mode(&columns, &indexes, &config, "orders").unwrap();
+        assert_eq!(ts_col, "updated_at");
+        assert_eq!(mode, ExtractionMode::Incremental);
+    }
+
+    #[test]
+    fn resolve_ts_col_and_mode_no_integer_pk_is_full_refresh() {
+        // No integer PRIMARY key at all (no indexes) — even with a valid timestamp
+        // cursor, auto-detection must not select Incremental (N3-r: incremental now
+        // requires a real single-column integer PRIMARY key).
+        let columns = vec![
+            col("name", "varchar", "varchar(255)"),
+            col("updated_at", "timestamp", "timestamp"),
+        ];
+        let config = test_config();
+        let (_, mode) = resolve_ts_col_and_mode(&columns, &[], &config, "orders").unwrap();
+        assert_eq!(mode, ExtractionMode::FullRefresh);
     }
 
     // O11: an explicitly-configured TABLE_TIMESTAMP is validated unconditionally BEFORE mode
@@ -1328,7 +1375,7 @@ mod tests {
         config
             .table_modes
             .insert("t".to_string(), ExtractionMode::FullRefresh);
-        let result = resolve_ts_col_and_mode(&columns, &config, "t");
+        let result = resolve_ts_col_and_mode(&columns, &[], &config, "t");
         assert!(result.is_ok(), "expected Ok, got {result:?}");
         let (_, mode) = result.unwrap();
         assert_eq!(mode, ExtractionMode::FullRefresh);
@@ -1355,7 +1402,7 @@ mod tests {
         config
             .table_update_cursor
             .insert("t".to_string(), "updated_at".to_string());
-        let result = resolve_ts_col_and_mode(&columns, &config, "t");
+        let result = resolve_ts_col_and_mode(&columns, &[], &config, "t");
         assert!(result.is_ok(), "expected Ok, got {result:?}");
         let (_, mode) = result.unwrap();
         assert_eq!(mode, ExtractionMode::TwoStream);
@@ -1375,7 +1422,7 @@ mod tests {
         config
             .table_timestamp_col
             .insert("t".to_string(), "does_not_exist".to_string());
-        let result = resolve_ts_col_and_mode(&columns, &config, "t");
+        let result = resolve_ts_col_and_mode(&columns, &[], &config, "t");
         assert!(result.is_err(), "expected Err, got {result:?}");
     }
 }

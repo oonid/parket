@@ -94,7 +94,7 @@ pub(crate) fn setup_incremental_mocks(
         .returning(move |_| Ok(make_columns()));
     schema_mock
         .expect_discover_indexes()
-        .returning(|_| Ok(make_full_refresh_indexes()));
+        .returning(|_| Ok(make_full_refresh_primary_key("id")));
     schema_mock
         .expect_get_avg_row_length()
         .returning(|_| Ok(Some(100)));

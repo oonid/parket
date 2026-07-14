@@ -728,6 +728,12 @@ mod tests {
         state_mock
             .expect_load_or_default()
             .returning(|_| crate::state::AppState::default());
+        // N3-r: process_table now discovers indexes up front (before mode is resolved), so
+        // even this early-bailing full_refresh test reaches the discover_indexes call. Inert
+        // here — the table is forced full_refresh and bails on the TABLE_HWM check regardless.
+        schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(vec![]));
         schema_mock
             .expect_discover_columns()
             .returning(move |_| {
