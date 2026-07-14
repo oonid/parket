@@ -22,14 +22,13 @@ impl DeltaWriter {
     /// Deduplicates the source by `key_col` before merging to prevent MERGE cardinality
     /// violations when the source contains duplicate keys.
     ///
-    /// D1 scope note: unlike the append paths (`append_batch`, `append_two_stream`,
-    /// `delete_then_append`), this `table.merge(...)` op does NOT carry `SchemaMode::Merge`,
-    /// so it does not evolve the schema. Additive schema evolution under the
-    /// `UPDATE_STRATEGY=merge` opt-out is out of scope: a new source column reaching a table
-    /// synced this way requires a one-off full refresh to pick it up (full refresh rebuilds
-    /// the Delta schema every run). `schema_evolution_check` would still include the new
-    /// column in the SELECT, but the MERGE's INSERT/UPDATE clauses only touch known columns,
-    /// so the extra data is dropped rather than persisted here.
+    /// D1-r: unlike the append paths (`append_batch`, `append_two_stream`,
+    /// `delete_then_append`), this `table.merge(...)` op's fixed `when_matched_update` /
+    /// `when_not_matched_insert` clauses are built from the batch's own columns and do NOT
+    /// carry `SchemaMode::Merge`, so they cannot evolve the Delta schema. When additive schema
+    /// evolution hands this fn a batch column the Delta table doesn't have yet, it is detected
+    /// below and delegated to `delete_then_append` — the same key-based upsert, but its append
+    /// carries `SchemaMode::Merge`, so the new column is captured instead of silently dropped.
     pub async fn merge_batch(
         &self,
         table_name: &str,
@@ -42,6 +41,34 @@ impl DeltaWriter {
             return Ok(());
         }
         let table = self.take_cached_table(table_name).await?;
+
+        // D1-r: additive schema evolution reaches merge_batch as a batch column the Delta table
+        // doesn't have yet. The MERGE op's fixed clauses only touch existing columns, so a new
+        // column would be silently dropped. Fall back to delete_then_append — the same key-based
+        // upsert, but its append carries SchemaMode::Merge, so it evolves the Delta schema and
+        // captures the new column instead of dropping it.
+        let delta_field_names: std::collections::HashSet<String> = table
+            .snapshot()?
+            .schema()
+            .fields()
+            .map(|f| f.name().clone())
+            .collect();
+        let has_new_column = batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .any(|f| !delta_field_names.contains(f.name()));
+        if has_new_column {
+            info!(
+                table = table_name,
+                "merge_batch: batch carries a column absent from the Delta table (additive schema \
+                 evolution); falling back to delete_then_append so SchemaMode::Merge evolves the \
+                 schema instead of the MERGE op silently dropping the new column"
+            );
+            return self
+                .delete_then_append(table_name, batches, key_col, insert_id, update_hwm)
+                .await;
+        }
 
         let schema = batches[0].schema();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -522,6 +549,126 @@ mod tests {
         // Check insert hwm
         let insert_hwm = writer.read_insert_hwm("t").await.unwrap();
         assert_eq!(insert_hwm, Some(3));
+    }
+
+    /// D1-r: a batch reaching `merge_batch` with a column the Delta table doesn't have yet
+    /// (additive schema evolution) must NOT be silently dropped by the MERGE op's fixed
+    /// clauses. `merge_batch` should detect the new column and fall back to
+    /// `delete_then_append`, whose append carries `SchemaMode::Merge` and evolves the schema.
+    #[tokio::test]
+    async fn merge_batch_new_column_falls_back_and_persists() {
+        use deltalake::arrow::array::StringViewArray;
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Utf8, false),
+        ]));
+
+        writer.ensure_table("t", schema.clone()).await.unwrap();
+
+        // Seed the table with the original 2-column schema: id=1 ("a"), id=2 ("b").
+        let seed_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2i64])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+        writer
+            .merge_batch("t", vec![seed_batch], "id", Some(2), None)
+            .await
+            .unwrap();
+
+        // Now merge a batch carrying a NEW column `extra` the Delta table doesn't have yet
+        // (simulating additive schema evolution reaching the merge path): update id=1, insert
+        // id=3. Under the old code, the MERGE op's fixed clauses only touched known columns
+        // and the extra data would be dropped rather than persisted.
+        let evolved_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Utf8, false),
+            Field::new("extra", DataType::Utf8, true),
+        ]));
+        let evolved_batch = RecordBatch::try_new(
+            evolved_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 3i64])),
+                Arc::new(StringArray::from(vec!["A", "c"])),
+                Arc::new(StringArray::from(vec!["extra-1", "extra-3"])),
+            ],
+        )
+        .unwrap();
+
+        writer
+            .merge_batch("t", vec![evolved_batch], "id", Some(3), None)
+            .await
+            .unwrap();
+
+        // Fresh-load (a brand new handle, bypassing the writer's cache) and verify the Delta
+        // schema evolved to include `extra`.
+        let t = writer.open_table("t").await.unwrap();
+        let field_names: Vec<String> = t
+            .snapshot()
+            .unwrap()
+            .schema()
+            .fields()
+            .map(|f| f.name().clone())
+            .collect();
+        assert!(
+            field_names.contains(&"extra".to_string()),
+            "Delta schema must have evolved to include `extra`, got {field_names:?}"
+        );
+
+        // Verify `extra`'s values were actually persisted for the rows in the evolved batch,
+        // not silently dropped.
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        let provider = t.table_provider().await.unwrap();
+        ctx.register_table("t", provider).unwrap();
+        let batches = ctx
+            .sql("SELECT id, val, extra FROM t ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 3);
+
+        let id_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(id_col.value(0), 1i64);
+        assert_eq!(id_col.value(1), 2i64);
+        assert_eq!(id_col.value(2), 3i64);
+
+        let extra_col = batch.column(2);
+        let extra_value = |i: usize| -> Option<String> {
+            if let Some(str_arr) = extra_col.as_any().downcast_ref::<StringArray>() {
+                if str_arr.is_null(i) { None } else { Some(str_arr.value(i).to_string()) }
+            } else if let Some(str_view_arr) = extra_col.as_any().downcast_ref::<StringViewArray>()
+            {
+                if str_view_arr.is_null(i) {
+                    None
+                } else {
+                    Some(str_view_arr.value(i).to_string())
+                }
+            } else {
+                panic!("Unexpected extra column type");
+            }
+        };
+
+        // id=1 was updated by the evolved batch: `extra` must be persisted, not dropped.
+        assert_eq!(extra_value(0), Some("extra-1".to_string()));
+        // id=2 predates the schema evolution (only ever in the seed batch): NULL is correct
+        // here (schema evolution backfills existing rows with NULL; it doesn't invent data).
+        assert_eq!(extra_value(1), None);
+        // id=3 was inserted by the evolved batch: `extra` must be persisted, not dropped.
+        assert_eq!(extra_value(2), Some("extra-3".to_string()));
     }
 
     #[tokio::test]
