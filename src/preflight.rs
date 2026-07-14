@@ -4,13 +4,17 @@ use object_store::ObjectStore;
 use tracing::{error, info};
 
 use crate::config::Config;
-use crate::discovery::{filter_unsupported_columns, ColumnInfo, SchemaInspector};
+use crate::discovery::{filter_unsupported_columns, ColumnInfo, IndexInfo, SchemaInspector};
 
 #[cfg_attr(test, mockall::automock)]
 #[allow(async_fn_in_trait)]
 pub trait PreflightInspect: Send + Sync {
     async fn discover_columns(&self, table: &str) -> Result<Vec<ColumnInfo>>;
     async fn get_avg_row_length(&self, table: &str) -> Result<Option<u64>>;
+    /// N3-r: the table's indexes, so preflight can resolve its integer PK (via
+    /// `discovery::select_integer_pk`) and detect incremental mode the same way the run does,
+    /// even for a non-`id`-named PK. Wired into `check_table` in the CP3 switchover.
+    async fn discover_indexes(&self, table: &str) -> Result<Vec<IndexInfo>>;
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -196,6 +200,12 @@ impl PreflightInspect for PreflightInspectAdapter {
     async fn get_avg_row_length(&self, table: &str) -> Result<Option<u64>> {
         SchemaInspector::new(self.pool.clone(), self.database.clone())
             .get_avg_row_length(table)
+            .await
+    }
+
+    async fn discover_indexes(&self, table: &str) -> Result<Vec<IndexInfo>> {
+        SchemaInspector::new(self.pool.clone(), self.database.clone())
+            .discover_indexes(table)
             .await
     }
 }
