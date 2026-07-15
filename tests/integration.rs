@@ -1438,6 +1438,104 @@ async fn verify_value_aggregates_real_basic_match_across_type_families() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn verify_key_less_table_value_aggregates_run_and_report_partial() {
+    // V3-r Tier 1: a table with no single-column integer PRIMARY key (and no `id` column)
+    // used to short-circuit straight to Skipped before any check ran, rolling up to a false
+    // Clean. It must now run the per-column value-aggregate checks (which need no key) and,
+    // if they pass, report PartiallyVerified — not Clean (row-set completeness is still
+    // unverified) and not Skipped (real checks did run).
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let env = TestEnv::new(vec!["key_less_values"]).await;
+
+    sqlx::query(
+        "CREATE TABLE key_less_values (            amount INT NOT NULL,             label VARCHAR(255) CHARACTER SET utf8mb4        )",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create key_less_values table");
+
+    sqlx::query(
+        "INSERT INTO key_less_values (amount, label) VALUES             (10, 'alpha'), (25, 'bravo'), (7, 'charlie'), (3, NULL), (42, 'héllo 世界')",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert key_less_values rows");
+
+    // No PK -> the pipeline auto-resolves this table to full_refresh.
+    let mut orchestrator = env.make_orchestrator();
+    let exit_code = orchestrator.run().await;
+    assert!(
+        matches!(exit_code, ExitCode::Success),
+        "expected Success exit code, got {exit_code:?}"
+    );
+
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let verdict = VerifyCommand::new(source, delta, vec!["key_less_values".to_string()])
+        .with_table_plans(vec![TablePlan {
+            table: "key_less_values".to_string(),
+            mode: VerifyMode::Basic,
+        }])
+        .with_deep(true)
+        .run()
+        .await
+        .expect("verify of a key-less table should still succeed");
+
+    assert_eq!(
+        verdict,
+        VerifyVerdict::PartiallyVerified,
+        "a key-less table with matching value-aggregates must be PartiallyVerified, not Clean \
+         (row-set completeness was never key-verified) and not Skipped (value-aggregates did run)"
+    );
+
+    // Corrupt the integer value column directly in the source (no key to target a row by, so
+    // corrupt every row uniformly) and prove the value-aggregate check still catches it despite
+    // there being no key at all.
+    sqlx::query("UPDATE key_less_values SET amount = amount + 1")
+        .execute(&env.pool)
+        .await
+        .expect("failed to corrupt key_less_values rows directly");
+
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let verdict_after_corruption =
+        VerifyCommand::new(source, delta, vec!["key_less_values".to_string()])
+            .with_table_plans(vec![TablePlan {
+                table: "key_less_values".to_string(),
+                mode: VerifyMode::Basic,
+            }])
+            .with_deep(true)
+            .run()
+            .await
+            .expect("verify of a key-less table should still succeed after corruption");
+
+    assert_eq!(
+        verdict_after_corruption,
+        VerifyVerdict::Discrepancy,
+        "value-aggregates must catch column corruption on a key-less table despite no key"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn verify_wide_decimal_sum_is_verified_not_skipped() {
     // VA1-r: a DECIMAL(50,0) column whose SUM crosses 38 digits (but stays well under the
     // widened 65-digit capacity) must have its SUM actually computed and compared, not

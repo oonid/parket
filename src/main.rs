@@ -95,7 +95,9 @@ fn log_startup_banner(config: &config::Config, local_dir: Option<&std::path::Pat
 }
 
 /// Run `--verify` reconciliation against the synced Delta tables.
-/// Returns a process exit code: 0 = clean, 1 = discrepancy, 2 = could not run.
+/// Returns a process exit code: 0 = clean, 1 = discrepancy, 2 = could not run,
+/// 3 = partially verified (V3-r Tier 1: one or more tables had no usable key for a
+/// key-set/row-set completeness check, so only value-aggregates were verified).
 async fn build_verify_table_plans(
     config: &config::Config,
     writer: &DeltaWriter,
@@ -217,6 +219,7 @@ async fn run_verify(
     match cmd.run().await {
         Ok(parket::verify::VerifyVerdict::Clean) => 0,
         Ok(parket::verify::VerifyVerdict::Discrepancy) => 1,
+        Ok(parket::verify::VerifyVerdict::PartiallyVerified) => 3,
         Err(e) => {
             eprintln!("verify failed: {e:#}");
             2

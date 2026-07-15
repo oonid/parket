@@ -15,6 +15,10 @@ pub enum TableOutcome {
     Drift { reason: String },
     Discrepancy { reason: String },
     Skipped { reason: String },
+    /// V3-r Tier 1: per-column value aggregates were verified, but the table's row-set
+    /// completeness could NOT be key-verified (no single-column integer PRIMARY key). Not a
+    /// failure, but not a full Clean either — surfaced distinctly so it isn't silent false confidence.
+    PartiallyVerified { reason: String },
 }
 
 /// Overall verification verdict.
@@ -22,6 +26,9 @@ pub enum TableOutcome {
 pub enum VerifyVerdict {
     Clean,
     Discrepancy,
+    /// V3-r Tier 1: no table had a discrepancy, but one or more could not be fully verified
+    /// (key-set/row-set completeness unchecked). Distinct from Clean so exit-code gating can tell.
+    PartiallyVerified,
 }
 
 #[derive(Debug, Clone)]
@@ -573,10 +580,14 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
             .iter()
             .filter(|o| matches!(o, TableOutcome::Skipped { .. }))
             .count();
+        let partially_verified_count = outcomes
+            .iter()
+            .filter(|o| matches!(o, TableOutcome::PartiallyVerified { .. }))
+            .count();
 
         println!(
-            "verify summary: pass={} drift={} discrepancy={} skipped={}",
-            pass_count, drift_count, discrepancy_count, skipped_count
+            "verify summary: pass={} drift={} discrepancy={} skipped={} partially_verified={}",
+            pass_count, drift_count, discrepancy_count, skipped_count, partially_verified_count
         );
 
         if outcomes
@@ -584,6 +595,11 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
             .any(|o| matches!(o, TableOutcome::Discrepancy { .. }))
         {
             Ok(VerifyVerdict::Discrepancy)
+        } else if outcomes
+            .iter()
+            .any(|o| matches!(o, TableOutcome::PartiallyVerified { .. }))
+        {
+            Ok(VerifyVerdict::PartiallyVerified)
         } else {
             Ok(VerifyVerdict::Clean)
         }
@@ -715,8 +731,12 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                     ),
                 }
             } else if !has_key {
-                TableOutcome::Skipped {
-                    reason: "no single-column integer PRIMARY key (or `id` column) for key-set verdict".to_string(),
+                // V3-r Tier 1: no usable key for a key-set fingerprint, but DON'T skip everything —
+                // fall through to the value-aggregate checks below (they need no key). This sentinel
+                // means "key-set/row-set completeness unverified"; the value-agg block runs and, if
+                // clean, the table ends PartiallyVerified (not Clean) rather than silently Skipped.
+                TableOutcome::PartiallyVerified {
+                    reason: "no single-column integer PRIMARY key (or `id` column): row-set completeness not key-verified; value-aggregates only".to_string(),
                 }
             } else if let Some(scope) = incremental_scope.as_ref() {
                 let key = key_col.as_deref().unwrap();
@@ -744,7 +764,7 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
             //    scoped-to-HWM (V1b-2).
             //  - non-scoped, non-append-log (full-refresh/basic/two-stream): full compare (V1b-1).
             //  - no-HWM append-log incremental: no fair window -> skip with a note.
-            if matches!(outcome, TableOutcome::Pass) {
+            if matches!(outcome, TableOutcome::Pass | TableOutcome::PartiallyVerified { .. }) {
                 let specs: Vec<ColumnAgg> = scols
                     .iter()
                     .filter(|c| {
@@ -820,6 +840,9 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                 }
                 TableOutcome::Skipped { reason } => {
                     println!("verify {table} VERDICT: SKIPPED: {reason}");
+                }
+                TableOutcome::PartiallyVerified { reason } => {
+                    println!("verify {table} VERDICT: PARTIALLY_VERIFIED: {reason}");
                 }
             }
 
@@ -1462,6 +1485,135 @@ mod tests {
         assert!(result.is_ok());
         // Distinct fallback matches -> Clean
         assert_eq!(result.unwrap(), VerifyVerdict::Clean);
+    }
+
+    /// V3-r Tier 1: a table with no single-column integer PRIMARY key (and no `id` column)
+    /// must NOT silently short-circuit to Skipped anymore — the per-column value-aggregate
+    /// checks (which need no key) still run, and a clean match ends PartiallyVerified (not
+    /// Clean, not Skipped) since row-set completeness was never key-verified.
+    #[tokio::test]
+    async fn verify_key_less_table_partially_verified() {
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
+        source.expect_row_count().returning(|_| Ok(3));
+        delta.expect_row_count().returning(|_| Ok(3));
+        let cols = || {
+            Ok(vec![
+                ColumnMeta {
+                    name: "amount".to_string(),
+                    type_str: "int".to_string(),
+                    nullable: true,
+                    numeric_scale: None,
+                },
+                ColumnMeta {
+                    name: "label".to_string(),
+                    type_str: "varchar".to_string(),
+                    nullable: true,
+                    numeric_scale: None,
+                },
+            ])
+        };
+        source.expect_columns().returning(move |_| cols());
+        delta.expect_columns().returning(move |_| cols());
+        // No integer/`id` key -> key_stats must never be called (has_key is false).
+        source.expect_key_stats().times(0).returning(|_, _| unreachable!());
+        delta.expect_key_stats().times(0).returning(|_, _| unreachable!());
+        let agg_values = || {
+            Ok(vec![
+                ColumnAggValues {
+                    sum: Some("60".to_string()),
+                    min: Some("10".to_string()),
+                    max: Some("30".to_string()),
+                    non_null_count: 3,
+                },
+                ColumnAggValues {
+                    sum: Some("12".to_string()),
+                    min: None,
+                    max: None,
+                    non_null_count: 3,
+                },
+            ])
+        };
+        source
+            .expect_value_aggregates()
+            .returning(move |_, _| agg_values());
+        delta
+            .expect_value_aggregates()
+            .returning(move |_, _| agg_values());
+        let cmd = VerifyCommand::new(source, delta, vec!["key_less".to_string()]);
+        let result = cmd.run().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), VerifyVerdict::PartiallyVerified);
+    }
+
+    /// V3-r Tier 1: even without a key, a value-aggregate mismatch on a key-less table must
+    /// still be caught as Discrepancy — the whole point of running value-aggregates for
+    /// key-less tables is that they catch column-value corruption a key-set check can't.
+    #[tokio::test]
+    async fn verify_key_less_table_value_mismatch_is_discrepancy() {
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
+        source.expect_row_count().returning(|_| Ok(3));
+        delta.expect_row_count().returning(|_| Ok(3));
+        let cols = || {
+            Ok(vec![
+                ColumnMeta {
+                    name: "amount".to_string(),
+                    type_str: "int".to_string(),
+                    nullable: true,
+                    numeric_scale: None,
+                },
+                ColumnMeta {
+                    name: "label".to_string(),
+                    type_str: "varchar".to_string(),
+                    nullable: true,
+                    numeric_scale: None,
+                },
+            ])
+        };
+        source.expect_columns().returning(move |_| cols());
+        delta.expect_columns().returning(move |_| cols());
+        source.expect_key_stats().times(0).returning(|_, _| unreachable!());
+        delta.expect_key_stats().times(0).returning(|_, _| unreachable!());
+        source.expect_value_aggregates().returning(|_, _| {
+            Ok(vec![
+                ColumnAggValues {
+                    sum: Some("60".to_string()),
+                    min: Some("10".to_string()),
+                    max: Some("30".to_string()),
+                    non_null_count: 3,
+                },
+                ColumnAggValues {
+                    sum: Some("12".to_string()),
+                    min: None,
+                    max: None,
+                    non_null_count: 3,
+                },
+            ])
+        });
+        // Delta's `amount` column got corrupted: sum differs (60 -> 61).
+        delta.expect_value_aggregates().returning(|_, _| {
+            Ok(vec![
+                ColumnAggValues {
+                    sum: Some("61".to_string()),
+                    min: Some("10".to_string()),
+                    max: Some("30".to_string()),
+                    non_null_count: 3,
+                },
+                ColumnAggValues {
+                    sum: Some("12".to_string()),
+                    min: None,
+                    max: None,
+                    non_null_count: 3,
+                },
+            ])
+        });
+        let cmd = VerifyCommand::new(source, delta, vec!["key_less".to_string()]);
+        let result = cmd.run().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), VerifyVerdict::Discrepancy);
     }
 
     #[tokio::test]
@@ -2265,6 +2417,9 @@ mod tests {
 
     #[tokio::test]
     async fn verify_incremental_hwm_without_id_skips_key_set() {
+        // No usable key -> incremental_scope stays None and the key-set/row-set check is
+        // skipped, but (V3-r Tier 1) the value-aggregate check on `updated_at` still runs and
+        // still passes -> PartiallyVerified, not silently Clean.
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
         source.expect_integer_pk().returning(|_| Ok(None));
@@ -2286,6 +2441,20 @@ mod tests {
             .returning(|_, _| Ok(Some("2026-06-30T12:00:00.000000".to_string())));
         source.expect_row_count().returning(|_| Ok(2));
         delta.expect_row_count().returning(|_| Ok(2));
+        let agg_values = || {
+            Ok(vec![ColumnAggValues {
+                sum: None,
+                min: Some("2026-06-30 12:00:00".to_string()),
+                max: Some("2026-06-30 12:00:00".to_string()),
+                non_null_count: 2,
+            }])
+        };
+        source
+            .expect_value_aggregates()
+            .returning(move |_, _| agg_values());
+        delta
+            .expect_value_aggregates()
+            .returning(move |_, _| agg_values());
         let cmd =
             VerifyCommand::new(source, delta, vec!["orders".to_string()]).with_table_plans(vec![
                 TablePlan {
@@ -2301,7 +2470,7 @@ mod tests {
             ]);
         let result = cmd.run().await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), VerifyVerdict::Clean);
+        assert_eq!(result.unwrap(), VerifyVerdict::PartiallyVerified);
     }
 
     #[tokio::test]
@@ -2968,11 +3137,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_no_pk_and_no_id_column_is_skipped_with_honest_reason() {
-        // No discovered integer PK and no `id` column: this must still Skip (there's no
-        // fair key to compare), but the reason must name the real gap instead of
-        // hardcoding "no `id` column" — a table that legitimately has no usable key
-        // shouldn't read as if `id` were the only thing considered.
+    async fn verify_no_pk_and_no_id_column_is_partially_verified_with_honest_reason() {
+        // No discovered integer PK and no `id` column: the key-set/row-set check can't run
+        // (there's no fair key to compare), but (V3-r Tier 1) that must NOT skip everything —
+        // the value-aggregate check on `note` still runs and, matching, ends
+        // PartiallyVerified with a reason naming the real gap instead of hardcoding
+        // "no `id` column" — a table that legitimately has no usable key shouldn't read as
+        // if `id` were the only thing considered.
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
         source.expect_row_count().returning(|_| Ok(3));
@@ -2988,17 +3159,31 @@ mod tests {
         source.expect_columns().returning(move |_| cols());
         delta.expect_columns().returning(move |_| cols());
         source.expect_integer_pk().returning(|_| Ok(None));
+        let agg_values = || {
+            Ok(vec![ColumnAggValues {
+                sum: Some("30".to_string()),
+                min: None,
+                max: None,
+                non_null_count: 3,
+            }])
+        };
+        source
+            .expect_value_aggregates()
+            .returning(move |_, _| agg_values());
+        delta
+            .expect_value_aggregates()
+            .returning(move |_, _| agg_values());
         let plan = TablePlan::basic("events");
         let cmd = VerifyCommand::new(source, delta, vec!["events".to_string()]);
         let outcome = cmd.run_one_table("events", &plan).await.unwrap();
         match outcome {
-            TableOutcome::Skipped { reason } => {
+            TableOutcome::PartiallyVerified { reason } => {
                 assert!(
                     reason.contains("no single-column integer PRIMARY key (or `id` column)"),
                     "unexpected reason: {reason}"
                 );
             }
-            other => panic!("expected Skipped, got {other:?}"),
+            other => panic!("expected PartiallyVerified, got {other:?}"),
         }
     }
 
