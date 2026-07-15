@@ -70,11 +70,19 @@ struct OverwriteSession {
 /// find its column in the batch by NAME, cast it to the target type when they differ (a safe
 /// widening to the Delta type — e.g. Int16→Int32 as N5 intends), and rebuild under the target
 /// schema (which also aligns field nullability). Errors if a target column is absent from the batch.
+///
+/// FA1: the cast uses `CastOptions { safe: false }` — arrow's kernel ERRORS on any value that
+/// doesn't fit the target type instead of silently substituting NULL (`safe: true`, arrow's
+/// default). Without this, a full-refresh table whose source type drifted narrower than its Delta
+/// column (e.g. a value now exceeding the stored INTEGER range) would write silent NULLs, exit 0 —
+/// the exact silent-corruption class N5's `align_batches_to_schema` (which also uses `safe: false`)
+/// exists to prevent. A data-losing narrowing now fails the table loudly and actionably instead.
 fn coerce_batch_to_schema(
     batch: &RecordBatch,
     target: &deltalake::arrow::datatypes::SchemaRef,
 ) -> Result<RecordBatch> {
-    use deltalake::arrow::compute::cast;
+    use deltalake::arrow::compute::{cast_with_options, CastOptions};
+    let cast_opts = CastOptions { safe: false, ..Default::default() };
     let mut columns = Vec::with_capacity(target.fields().len());
     for field in target.fields() {
         let col = batch.column_by_name(field.name()).ok_or_else(|| {
@@ -86,7 +94,15 @@ fn coerce_batch_to_schema(
         let coerced = if col.data_type() == field.data_type() {
             col.clone()
         } else {
-            cast(col, field.data_type())?
+            cast_with_options(col, field.data_type(), &cast_opts).map_err(|e| {
+                anyhow::anyhow!(
+                    "atomic overwrite: column `{}` value does not fit the Delta column type {:?} \
+                     (source type {:?}); a full refresh cannot narrow it without data loss — {e}",
+                    field.name(),
+                    field.data_type(),
+                    col.data_type()
+                )
+            })?
         };
         columns.push(coerced);
     }
@@ -1195,6 +1211,40 @@ mod tests {
             .values()
             .to_vec();
         assert_eq!(ids, vec![1, 2], "the coerced non-nullable batch must persist");
+    }
+
+    #[test]
+    fn coerce_batch_to_schema_errors_on_lossy_narrowing_not_silent_null() {
+        // FA1: a widening cast (Int16 source -> Int32 Delta, the N5 case) succeeds; a NARROWING
+        // cast whose value overflows the target (Int64 value > i32::MAX -> Int32 Delta) must ERROR
+        // loudly, NOT silently substitute NULL (arrow's safe:true default). Guards the full-refresh
+        // silent-corruption class.
+        use deltalake::arrow::array::{Int16Array, Int64Array};
+        use deltalake::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+
+        let target = Arc::new(ArrowSchema::new(vec![Field::new("v", DataType::Int32, true)]));
+
+        // Widening Int16 -> Int32: OK.
+        let widen = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new("v", DataType::Int16, true)])),
+            vec![Arc::new(Int16Array::from(vec![7i16, 42]))],
+        )
+        .unwrap();
+        let out = coerce_batch_to_schema(&widen, &target).expect("widening Int16->Int32 must succeed");
+        assert_eq!(out.num_rows(), 2);
+
+        // Narrowing Int64 -> Int32 with an out-of-range value: must ERROR (not NULL).
+        let overflow = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new("v", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(vec![(i32::MAX as i64) + 1]))],
+        )
+        .unwrap();
+        let err = coerce_batch_to_schema(&overflow, &target)
+            .expect_err("a value exceeding the Delta Int32 range must fail, not become NULL");
+        assert!(
+            err.to_string().contains("does not fit the Delta column type"),
+            "unexpected error: {err}"
+        );
     }
 
     /// O2-r CP1 de-risker: an aborted staged-overwrite (staged but never committed) must leave
