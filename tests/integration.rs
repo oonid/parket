@@ -10,8 +10,8 @@ use parket::orchestrator::{
     SignalHandler, StateManageAdapter,
 };
 use parket::verify::{
-    DeltaProbeAdapter, SourceProbe, SourceProbeAdapter, TableOutcome, TablePlan, VerifyCommand,
-    VerifyMode, VerifyVerdict,
+    DeltaProbe, DeltaProbeAdapter, SourceProbe, SourceProbeAdapter, TableOutcome, TablePlan,
+    VerifyCommand, VerifyMode, VerifyVerdict,
 };
 use parket::writer::DeltaWriter;
 use sqlx::MySqlPool;
@@ -1531,6 +1531,167 @@ async fn verify_key_less_table_value_aggregates_run_and_report_partial() {
         verdict_after_corruption,
         VerifyVerdict::Discrepancy,
         "value-aggregates must catch column corruption on a key-less table despite no key"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn verify_sample_spot_checks_recent_rows() {
+    // V6: the deep-mode row spot-check (SourceProbe::sample_ids) used to sample only the
+    // LOWEST `SAMPLE_SIZE` (100) ids, so the newest rows (highest ids — the most recently
+    // synced, where fresh-sync corruption is most likely) were never spot-checked. Seed MORE
+    // than SAMPLE_SIZE rows (150, ids 1..=150) so the old lowest-100-only sample would not
+    // reach id=150 at all.
+    //
+    // Note on how this is asserted: `run_one_table`'s per-row sample (`sample_ids` +
+    // `sample_rows` on both probes) is a diagnostic layer only — printed as
+    // "verify {table} sample: ... differ=N" / "sample row {id}: differing columns [...]" —
+    // it does not itself flip the returned TableOutcome/VerifyVerdict (only the schema check,
+    // key-stats, and full-table value-aggregates do; confirmed empirically: a same-length
+    // VARCHAR content swap on a sampled row prints "differ=1" yet the run still reports
+    // VerifyVerdict::Clean). So this test proves the fix directly at the exact surface V6
+    // changed — `SourceProbe::sample_ids`'s id selection, and the `sample_rows` comparison
+    // both probes run over those ids — rather than via a VerifyVerdict that this layer cannot
+    // move without a change to verify.rs (out of scope / forbidden for this fix).
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let env = TestEnv::new(vec!["recent_rows"]).await;
+
+    sqlx::query(
+        "CREATE TABLE recent_rows (            id BIGINT PRIMARY KEY,             val VARCHAR(50) CHARACTER SET utf8mb4        )",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create recent_rows table");
+
+    // 150 rows > SAMPLE_SIZE (100). Every value is "row-NNN" — fixed length (7 chars) so a
+    // later content-only corruption doesn't perturb the TextMass length-sum value-aggregate,
+    // isolating what only a per-row compare (this sample) can catch.
+    let values: Vec<String> = (1..=150)
+        .map(|id| format!("({id}, 'row-{id:03}')"))
+        .collect();
+    sqlx::query(&format!(
+        "INSERT INTO recent_rows (id, val) VALUES {}",
+        values.join(", ")
+    ))
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert recent_rows rows");
+
+    // No cursor column -> the pipeline auto-resolves this table to full_refresh.
+    let mut orchestrator = env.make_orchestrator();
+    let exit_code = orchestrator.run().await;
+    assert!(
+        matches!(exit_code, ExitCode::Success),
+        "expected Success exit code, got {exit_code:?}"
+    );
+
+    // 1. Prove the fix at the source: sample_ids(150 rows, limit=100) must span BOTH the
+    //    lowest half and the highest half of the id range, not just the lowest 100. Under the
+    //    OLD `ORDER BY id LIMIT 100` query, the max returned id would be 100 — id=150 (and
+    //    every id above 100) would never appear.
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let ids = source
+        .sample_ids("recent_rows", "id", 100)
+        .await
+        .expect("sample_ids should succeed");
+    assert_eq!(
+        ids.len(),
+        100,
+        "150 rows / limit 100 with no overlap should yield exactly 100 distinct sampled ids"
+    );
+    assert!(
+        ids.iter().any(|&id| id <= 50),
+        "sample must still include the lowest half of the id range: {ids:?}"
+    );
+    assert!(
+        ids.iter().any(|&id| id >= 101),
+        "sample must include the HIGHEST half of the id range (the recently-synced rows) — \
+         under the old lowest-100-only query the max sampled id would be 100: {ids:?}"
+    );
+    assert!(
+        ids.contains(&150),
+        "the newest row (id=150) must be in the spread sample: {ids:?}"
+    );
+
+    // 2. Baseline: a full deep verify over the freshly-synced, uncorrupted table is Clean.
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let verdict = VerifyCommand::new(source, delta, vec!["recent_rows".to_string()])
+        .with_table_plans(vec![TablePlan {
+            table: "recent_rows".to_string(),
+            mode: VerifyMode::Basic,
+        }])
+        .with_deep(true)
+        .run()
+        .await
+        .expect("verify of recent_rows should succeed");
+
+    assert_eq!(verdict, VerifyVerdict::Clean);
+
+    // 3. Corrupt the VARCHAR value of the HIGH-id row (id=150) directly in the source, without
+    // re-syncing. Same length ("row-ZZZ" is 7 chars, same as "row-150") so the TextMass
+    // value-aggregate (SUM(CHAR_LENGTH) + non-null count) is unaffected — the only way to
+    // catch this is a per-row compare of id=150 specifically.
+    sqlx::query("UPDATE recent_rows SET val = 'row-ZZZ' WHERE id = 150")
+        .execute(&env.pool)
+        .await
+        .expect("failed to corrupt recent_rows high-id row directly");
+
+    // 4. Re-derive the sample (same shape as verify.rs's row-sample layer: sample_ids then
+    // sample_rows on both probes for those ids) and confirm id=150's corrupted value is
+    // actually detected as differing — proving the new spread sample doesn't just include
+    // id=150, it catches the drift there. Under the OLD lowest-100-only sample_ids, id=150
+    // would never have been fetched (or compared) at all, so this corruption would have gone
+    // completely undetected by this layer.
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let ids_after_corruption = source
+        .sample_ids("recent_rows", "id", 100)
+        .await
+        .expect("sample_ids should succeed after corruption");
+    assert!(
+        ids_after_corruption.contains(&150),
+        "corrupted id=150 must still be in the spread sample: {ids_after_corruption:?}"
+    );
+    let columns = vec!["val".to_string()];
+    let srows = source
+        .sample_rows("recent_rows", "id", &columns, &ids_after_corruption)
+        .await
+        .expect("source sample_rows should succeed");
+    let drows = delta
+        .sample_rows("recent_rows", "id", &columns, &ids_after_corruption)
+        .await
+        .expect("delta sample_rows should succeed");
+
+    assert_ne!(
+        srows.get(&150),
+        drows.get(&150),
+        "the recent-row (id=150) spot-check must detect the corrupted VARCHAR value that the \
+         TextMass value-aggregate cannot (same-length content swap) — this row is only reached \
+         because sample_ids now includes the highest half of the id range"
+    );
+    // Sanity: an untouched low-id row still compares equal (no false positive from the fix).
+    assert_eq!(
+        srows.get(&1),
+        drows.get(&1),
+        "an uncorrupted low-id row must still compare equal"
     );
 }
 

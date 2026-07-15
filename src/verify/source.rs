@@ -257,8 +257,18 @@ impl SourceProbe for SourceProbeAdapter {
         if limit <= 0 {
             return Ok(vec![]);
         }
+        // V6: sample the LOWEST half and the HIGHEST half of the id range (not just the
+        // lowest `limit`), so the most recently synced rows (highest ids) — where fresh-sync
+        // corruption is most likely — are spot-checked too. UNION dedups any overlap when the
+        // table has fewer than `limit` rows. Both probes then compare rows for these same ids.
+        let high = limit / 2;
+        let low = limit - high;
         let sql = format!(
-            "SELECT CAST(`{id_col}` AS SIGNED) FROM `{table}` ORDER BY `{id_col}` LIMIT {limit}"
+            "SELECT k FROM ( \
+               (SELECT CAST(`{id_col}` AS SIGNED) AS k FROM `{table}` ORDER BY `{id_col}` ASC LIMIT {low}) \
+               UNION \
+               (SELECT CAST(`{id_col}` AS SIGNED) AS k FROM `{table}` ORDER BY `{id_col}` DESC LIMIT {high}) \
+             ) AS spread ORDER BY k"
         );
         let rows = sqlx::query(&sql)
             .fetch_all(&self.pool)
