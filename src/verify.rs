@@ -148,6 +148,69 @@ fn is_value_comparable(type_str: &str) -> bool {
     )
 }
 
+/// V5 (diagnostic): coarse type family of a MariaDB DATA_TYPE. Category-level only — this backs a
+/// print-only type-drift diagnostic (NOT the verdict), so it groups by kind rather than exact type.
+///
+/// IMPORTANT calibration note: `decimal`/`numeric`, `date`, `datetime`/`timestamp`, and
+/// `json`/`enum`/`set` all map to `"string"` here, NOT to a `"decimal"`/`"date"`/`"timestamp"`/
+/// `"json"` label, because that's what they actually become on the Delta side. Verified against
+/// `orchestrator::schema::mariadb_type_to_arrow`, which maps every one of these MariaDB types to
+/// `DataType::Utf8` (mirroring the vendored connector_arrow's MySQL reader, which emits Utf8 for
+/// DECIMAL/DATE/DATETIME/TIMESTAMP on the wire — MySQL server-timezone ambiguity and precision
+/// concerns rule out native Decimal128/Date32/Timestamp on this pipeline). So a healthy synced
+/// decimal/date/datetime/json column has Delta family `"string"` (see `delta_type_family`'s
+/// `Utf8`/`Utf8View` arm), and the source family must match that or every such column would
+/// false-flag as a type diff. `time`/`year`/`bit` are NOT in the extractable-type allowlist
+/// (`discovery::EXTRACTABLE_DATA_TYPES`) — a column of one of those types never reaches the Delta
+/// side at all, so it can never appear in the "columns present on both sides" comparison below;
+/// their family labels here are unreachable in practice and kept only for completeness.
+fn source_type_family(mariadb_type: &str) -> String {
+    let lower = mariadb_type.to_ascii_lowercase();
+    match lower.as_str() {
+        "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" => "int".to_string(),
+        "decimal" | "numeric" => "string".to_string(),
+        "float" | "double" | "real" => "float".to_string(),
+        "date" | "datetime" | "timestamp" => "string".to_string(),
+        "time" => "time".to_string(),
+        "year" => "year".to_string(),
+        "char" | "varchar" | "text" | "tinytext" | "mediumtext" | "longtext" | "enum" | "set"
+        | "json" => "string".to_string(),
+        "binary" | "varbinary" | "blob" | "tinyblob" | "mediumblob" | "longblob" => "binary".to_string(),
+        "bit" => "bit".to_string(),
+        _ => lower, // unknown -> its own label; a genuine mismatch will still show
+    }
+}
+
+/// V5 (diagnostic): coarse type family of an Arrow DataType debug string (delta side). Kept in
+/// lockstep with `source_type_family` above — see that function's doc comment for why
+/// decimal/date/datetime/json land in `"string"` rather than a type-specific family. The
+/// `Decimal`/`Date`/`Timestamp` arms below are defensive (unreachable for data synced through
+/// this pipeline today, since those MariaDB types are written as Utf8) rather than live paths.
+fn delta_type_family(arrow_debug: &str) -> &'static str {
+    let d = arrow_debug;
+    if d.starts_with("Int") || d.starts_with("UInt") {
+        "int"
+    } else if d.starts_with("Decimal") {
+        "decimal"
+    } else if d.starts_with("Float") {
+        "float"
+    } else if d.starts_with("Date") {
+        "date"
+    } else if d.starts_with("Timestamp") {
+        "timestamp"
+    } else if d.starts_with("Time") {
+        "time"
+    } else if d == "Utf8" || d == "LargeUtf8" || d == "Utf8View" {
+        "string"
+    } else if d.starts_with("Binary") || d.starts_with("LargeBinary") || d.starts_with("FixedSizeBinary") {
+        "binary"
+    } else if d == "Boolean" {
+        "int" // MySQL bool/tinyint(1) round-trips through the int family
+    } else {
+        "other"
+    }
+}
+
 /// Column metadata for a single table column (used by L0 schema reconciliation).
 #[derive(Debug, Clone)]
 pub struct ColumnMeta {
@@ -691,6 +754,27 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                 missing_in_delta,
                 extra_in_delta
             );
+            // V5 (diagnostic, does NOT affect the verdict): flag columns whose TYPE FAMILY differs
+            // between source and Delta (e.g. a column that was int is now text). A genuine type
+            // change can't reach here through parket (the run + --check evolution guards bail on
+            // it), so this surfaces external Delta tampering / drift for the operator; it is
+            // intentionally NOT a Discrepancy (cross-engine type representations differ; only the
+            // parity-hardened key-set + value-aggregate checks gate the verdict).
+            let type_diffs: Vec<String> = scols
+                .iter()
+                .filter_map(|sc| {
+                    let dc = dcols.iter().find(|d| d.name == sc.name)?;
+                    let sf = source_type_family(&sc.type_str);
+                    let df = delta_type_family(&dc.type_str);
+                    (sf != df).then(|| format!("{} (source {}=[{}] vs Delta {}=[{}])", sc.name, sc.type_str, sf, dc.type_str, df))
+                })
+                .collect();
+            if !type_diffs.is_empty() {
+                println!(
+                    "verify {table} schema TYPE DIFF (diagnostic — does not affect verdict): {}",
+                    type_diffs.join(", ")
+                );
+            }
             if let Some(cursor) = plan.mode.freshness_cursor() {
                 let source_max = self.source.max_cursor(table, cursor).await?;
                 let delta_max = self.delta.max_cursor(table, cursor).await?;
@@ -969,7 +1053,7 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                                     .collect::<Vec<_>>()
                                     .join(", ");
                                 println!(
-                                    "verify {table} non-null census: DIFFERS in {} column(s): {diff_str}",
+                                    "verify {table} non-null census: DIFFERS in {} column(s): {diff_str} (diagnostic — does not affect verdict)",
                                     diffs.len()
                                 );
                             }
@@ -1025,7 +1109,7 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                                     }
                                 }
                                 println!(
-                                    "verify {table} sample: checked={} match={} differ={} missing={}",
+                                    "verify {table} sample: checked={} match={} differ={} missing={} (diagnostic — does not affect verdict)",
                                     ids.len(),
                                     matched,
                                     differing.len(),
@@ -1056,6 +1140,164 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// V5: pins the no-false-positive invariant — for every column type parket actually syncs,
+    /// `source_type_family(source)` must equal `delta_type_family(delta)`. Pairs reflect what
+    /// `orchestrator::schema::mariadb_type_to_arrow` really produces (verified against the
+    /// vendored connector_arrow's MySQL reader), NOT a naive "decimal->Decimal128" assumption:
+    /// decimal/date/datetime/json all round-trip through Delta as Utf8, so their family is
+    /// "string" on both sides, matching every other Utf8-backed source type.
+    #[test]
+    fn source_type_family_and_delta_type_family_agree_on_synced_types() {
+        let synced_pairs = [
+            ("bigint", "Int64"),
+            ("int", "Int32"),
+            ("tinyint", "Int32"), // N5 widens unsigned tinyint; still same "int" family
+            ("smallint", "Int16"),
+            ("mediumint", "Int32"),
+            ("double", "Float64"),
+            ("float", "Float32"),
+            ("varchar", "Utf8"),
+            ("char", "Utf8View"),
+            ("text", "Utf8"),
+            // decimal/date/datetime/timestamp/json all map to Utf8 on the Delta side
+            // (mariadb_type_to_arrow), so their family must be "string", matching Utf8's family.
+            ("decimal", "Utf8"),
+            ("date", "Utf8"),
+            ("datetime", "Utf8"),
+            ("timestamp", "Utf8"),
+            ("json", "Utf8"),
+            ("blob", "Binary"),
+            ("varbinary", "Binary"),
+        ];
+        for (source_type, delta_type) in synced_pairs {
+            assert_eq!(
+                source_type_family(source_type),
+                delta_type_family(delta_type),
+                "expected matching families for synced pair ({source_type}, {delta_type})"
+            );
+        }
+    }
+
+    #[test]
+    fn type_family_detects_category_drift() {
+        // A real drift (int source column now text on the Delta side) must still be flagged.
+        assert_ne!(source_type_family("int"), delta_type_family("Utf8"));
+        assert_ne!(source_type_family("varchar"), delta_type_family("Int64"));
+    }
+
+    /// V5: build a mock pair where a column's type family genuinely differs between source and
+    /// Delta (category drift), everything else (key-set + value-aggregates) clean, and assert
+    /// `run()` still returns `Clean` — proving the type-family diagnostic is print-only and never
+    /// flips the verdict. The drifted column ("notes": source `blob`, delta `Utf8`) has no
+    /// `agg_kind` on the source side, so it's excluded from value-aggregates entirely and can't
+    /// disturb that check.
+    #[tokio::test]
+    async fn verify_type_family_diff_is_diagnostic_not_discrepancy() {
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
+        source.expect_row_count().returning(|_| Ok(2));
+        delta.expect_row_count().returning(|_| Ok(2));
+
+        let scols = || {
+            Ok(vec![
+                ColumnMeta {
+                    name: "id".to_string(),
+                    type_str: "bigint".to_string(),
+                    nullable: false,
+                    numeric_scale: None,
+                },
+                ColumnMeta {
+                    name: "name".to_string(),
+                    type_str: "varchar".to_string(),
+                    nullable: true,
+                    numeric_scale: None,
+                },
+                ColumnMeta {
+                    name: "notes".to_string(),
+                    type_str: "blob".to_string(), // family "binary"
+                    nullable: true,
+                    numeric_scale: None,
+                },
+            ])
+        };
+        let dcols = || {
+            Ok(vec![
+                ColumnMeta {
+                    name: "id".to_string(),
+                    type_str: "Int64".to_string(),
+                    nullable: false,
+                    numeric_scale: None,
+                },
+                ColumnMeta {
+                    name: "name".to_string(),
+                    type_str: "Utf8".to_string(),
+                    nullable: true,
+                    numeric_scale: None,
+                },
+                ColumnMeta {
+                    name: "notes".to_string(),
+                    type_str: "Utf8".to_string(), // family "string" -> DRIFT vs source "binary"
+                    nullable: true,
+                    numeric_scale: None,
+                },
+            ])
+        };
+        source.expect_columns().returning(move |_| scols());
+        delta.expect_columns().returning(move |_| dcols());
+
+        let stats = || {
+            Ok(KeyStats {
+                count: 2,
+                distinct: 2,
+                min: Some(1),
+                max: Some(2),
+                xor: 3,
+                distinct_xor: 3,
+                sum: 3,
+            })
+        };
+        source.expect_key_stats().returning(move |_, _| stats());
+        delta.expect_key_stats().returning(move |_, _| stats());
+
+        source
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![2i64; cols.len()]));
+        delta
+            .expect_non_null_counts()
+            .returning(|_, cols: &[String]| Ok(vec![2i64; cols.len()]));
+
+        // "name" (varchar) is the only column with an AggKind (TextMass); "notes" (blob) has
+        // none, so it never reaches value_aggregates.
+        source.expect_value_aggregates().returning(|_, _| {
+            Ok(vec![ColumnAggValues {
+                sum: Some("10".to_string()),
+                min: None,
+                max: None,
+                non_null_count: 2,
+            }])
+        });
+        delta.expect_value_aggregates().returning(|_, _| {
+            Ok(vec![ColumnAggValues {
+                sum: Some("10".to_string()),
+                min: None,
+                max: None,
+                non_null_count: 2,
+            }])
+        });
+
+        source.expect_sample_ids().returning(|_, _, _| Ok(vec![]));
+
+        let cmd = VerifyCommand::new(source, delta, vec!["orders".to_string()]);
+        let result = cmd.run().await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            VerifyVerdict::Clean,
+            "a type-family drift must be diagnostic-only and never produce a Discrepancy"
+        );
+    }
 
     #[test]
     fn table_plan_describe_includes_mode_and_hwms() {
