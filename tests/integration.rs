@@ -1635,6 +1635,113 @@ async fn verify_wide_decimal_sum_is_verified_not_skipped() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn verify_string_pk_table_key_set_detects_missing_row() {
+    // V3-r Tier 2: a single-column NON-integer (string) PRIMARY key — e.g. an `oauth_*`
+    // varchar-PK table — must now get a real key-set fingerprint (count/distinct/BINARY-
+    // normalized min/max) instead of Tier 1's value-aggregates-only PartiallyVerified. A full
+    // match must roll up all the way to Clean, and a missing/extra row must be caught as
+    // Discrepancy, exactly like an integer-keyed table.
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let env = TestEnv::new(vec!["oauth_tokens"]).await;
+
+    sqlx::query(
+        "CREATE TABLE oauth_tokens (            token VARCHAR(64) PRIMARY KEY,             client_id VARCHAR(50) NOT NULL        )",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create oauth_tokens table");
+
+    // Tokens are inserted in ascending byte order so deleting a MIDDLE row (below) leaves
+    // min/max unchanged on both sides — isolating the distinct-count mismatch as the only
+    // signal, rather than conflating it with a min/max shift.
+    sqlx::query(
+        "INSERT INTO oauth_tokens (token, client_id) VALUES             ('token_b', 'app1'), ('token_d', 'app2'), ('token_f', 'app3'),             ('token_h', 'app1'), ('token_j', 'app2')",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert oauth_tokens rows");
+
+    // A single-column string PK -> N3-r's detect_mode requires an integer PK for incremental,
+    // so the pipeline auto-resolves this table to full_refresh.
+    let mut orchestrator = env.make_orchestrator();
+    let exit_code = orchestrator.run().await;
+    assert!(
+        matches!(exit_code, ExitCode::Success),
+        "expected Success exit code, got {exit_code:?}"
+    );
+
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let verdict = VerifyCommand::new(source, delta, vec!["oauth_tokens".to_string()])
+        .with_table_plans(vec![TablePlan {
+            table: "oauth_tokens".to_string(),
+            mode: VerifyMode::Basic,
+        }])
+        .with_deep(true)
+        .run()
+        .await
+        .expect("verify of a string-PK table should succeed");
+
+    assert_eq!(
+        verdict,
+        VerifyVerdict::Clean,
+        "a fully matching string key-set must verify Clean, not PartiallyVerified (Tier 2 \
+         upgrades a single-column string PK to a full key-verified check)"
+    );
+
+    // Delete a MIDDLE row (token_f) directly from the source, without re-running the pipeline.
+    // min/max stay put (token_b/token_j untouched) so the ONLY signal is the distinct-count
+    // mismatch: source now has 4 distinct keys, delta (unsynced) still has 5 — delta holds a
+    // key (`token_f`) that source no longer does. In `string_key_stats_outcome` this is the
+    // "delta has extra" direction: `d.distinct (5) < s.distinct (4)` is false, so it does NOT
+    // qualify for the Drift ("source advanced past sync") carve-out and falls through to
+    // Discrepancy — the same asymmetry `key_stats_outcome` already applies for integer keys.
+    sqlx::query("DELETE FROM oauth_tokens WHERE token = 'token_f'")
+        .execute(&env.pool)
+        .await
+        .expect("failed to delete oauth_tokens row directly");
+
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let verdict_after_delete =
+        VerifyCommand::new(source, delta, vec!["oauth_tokens".to_string()])
+            .with_table_plans(vec![TablePlan {
+                table: "oauth_tokens".to_string(),
+                mode: VerifyMode::Basic,
+            }])
+            .with_deep(true)
+            .run()
+            .await
+            .expect("verify of a string-PK table should succeed after a row is deleted");
+
+    assert_eq!(
+        verdict_after_delete,
+        VerifyVerdict::Discrepancy,
+        "a row present in Delta but missing from the source must be caught by the string \
+         key-set fingerprint"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn verify_value_aggregates_real_incremental_hwm_scope_matches_latest_rows() {
     let _guard = tracing_subscriber::fmt()
         .with_env_filter("parket=debug")

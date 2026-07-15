@@ -328,6 +328,18 @@ pub struct KeyStats {
     pub sum: i128,
 }
 
+/// V3-r Tier 2: key-set fingerprint for a single-column NON-integer (string) PRIMARY key.
+/// `min`/`max` are BINARY-normalized on the MySQL side (`MIN(BINARY \`k\`)`) so they compare
+/// byte-for-byte against DataFusion's byte-ordered Utf8 `min`/`max` regardless of the column's
+/// MySQL collation (often case-insensitive) — the N8 collation lesson applied to the key.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StringKeyStats {
+    pub count: i64,
+    pub distinct: i64,
+    pub min: Option<String>,
+    pub max: Option<String>,
+}
+
 /// Source-side probe (the live DB).
 #[cfg_attr(test, mockall::automock)]
 #[allow(async_fn_in_trait)]
@@ -339,7 +351,11 @@ pub trait SourceProbe: Send + Sync {
     /// V3: the table's single-column integer PRIMARY key, if it has one — used to derive
     /// the key-set verdict's key column instead of requiring a column literally named `id`.
     async fn integer_pk(&self, table: &str) -> Result<Option<String>>;
+    /// V3-r Tier 2: the table's single-column NON-integer PRIMARY key, if it has one (returns
+    /// None for an integer PK — that's handled by `integer_pk` — or a composite/absent PK).
+    async fn string_pk(&self, table: &str) -> Result<Option<String>>;
     async fn key_stats(&self, table: &str, key_col: &str) -> Result<KeyStats>;
+    async fn string_key_stats(&self, table: &str, key_col: &str) -> Result<StringKeyStats>;
     async fn key_stats_scoped(
         &self,
         table: &str,
@@ -367,6 +383,7 @@ pub trait DeltaProbe: Send + Sync {
     async fn max_cursor(&self, table: &str, cursor_col: &str) -> Result<Option<String>>;
     async fn columns(&self, table: &str) -> Result<Vec<ColumnMeta>>;
     async fn key_stats(&self, table: &str, key_col: &str) -> Result<KeyStats>;
+    async fn string_key_stats(&self, table: &str, key_col: &str) -> Result<StringKeyStats>;
     async fn latest_key_stats(
         &self,
         table: &str,
@@ -470,6 +487,42 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                     delta_stats.distinct,
                     delta_stats.min,
                     delta_stats.max
+                ),
+            }
+        }
+    }
+
+    /// V3-r Tier 2: key-set verdict for a single-column string PRIMARY key, mirroring
+    /// `key_stats_outcome`'s Drift-vs-Discrepancy split but over the string fingerprint
+    /// (count/distinct/BINARY-normalized min/max).
+    fn string_key_stats_outcome(
+        source_label: &str,
+        delta_label: &str,
+        s: &StringKeyStats,
+        d: &StringKeyStats,
+    ) -> TableOutcome {
+        if s == d {
+            return TableOutcome::Pass;
+        }
+        // Delta lagging (fewer distinct, its [min,max] within source's byte range) -> Drift
+        // (source advanced past sync), mirroring the integer key_stats_outcome Drift rule.
+        let delta_range_inside_source = match (&s.min, &s.max, &d.min, &d.max) {
+            (Some(smin), Some(smax), Some(dmin), Some(dmax)) => dmin >= smin && dmax <= smax,
+            (None, None, None, None) => true,
+            _ => false,
+        };
+        if d.distinct < s.distinct && delta_range_inside_source {
+            TableOutcome::Drift {
+                reason: format!(
+                    "{source_label} advanced past sync: {source_label} distinct={} {delta_label} distinct={} (string key) — likely new rows since sync",
+                    s.distinct, d.distinct
+                ),
+            }
+        } else {
+            TableOutcome::Discrepancy {
+                reason: format!(
+                    "string key-set mismatch: {source_label}(count={} distinct={} min={:?} max={:?}) {delta_label}(count={} distinct={} min={:?} max={:?})",
+                    s.count, s.distinct, s.min, s.max, d.count, d.distinct, d.min, d.max
                 ),
             }
         }
@@ -660,6 +713,20 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
             };
             let has_key = key_col.is_some();
 
+            // V3-r Tier 2: no integer key (and no `id` fallback) — check for a single-column
+            // NON-integer (string) PRIMARY key instead. Two-stream is excluded because its key
+            // is the config-declared insert_cursor (always resolved above), and a string key
+            // wouldn't work as an insert cursor anyway. Kept in its own variable, separate from
+            // `key_col`, so it never flows into the integer-only scoped/two-stream/census/sample
+            // paths below (which cast the key as i64).
+            let string_key: Option<String> = if key_col.is_none()
+                && !matches!(&plan.mode, VerifyMode::TwoStream { .. })
+            {
+                self.source.string_pk(table).await?
+            } else {
+                None
+            };
+
             let incremental_scope = match (&plan.mode, key_col.as_ref()) {
                 (
                     VerifyMode::Incremental {
@@ -730,6 +797,12 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                         cap = self.row_cap
                     ),
                 }
+            } else if let Some(skey) = string_key.as_ref() {
+                // V3-r Tier 2: single-column string PK — a real key-set fingerprint
+                // (count/distinct/BINARY-min/max) instead of value-aggregates-only.
+                let s = self.source.string_key_stats(table, skey).await?;
+                let d = self.delta.string_key_stats(table, skey).await?;
+                Self::string_key_stats_outcome("source", "delta", &s, &d)
             } else if !has_key {
                 // V3-r Tier 1: no usable key for a key-set fingerprint, but DON'T skip everything —
                 // fall through to the value-aggregate checks below (they need no key). This sentinel
@@ -846,7 +919,7 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                 }
             }
 
-            if matches!(&outcome, TableOutcome::Pass) {
+            if matches!(&outcome, TableOutcome::Pass) && key_col.is_some() {
                 if let Some(reason) = skip_pass_layers_reason {
                     println!("verify {table} non-null census: skipped ({reason})");
                     println!("verify {table} sample: skipped ({reason})");
@@ -967,6 +1040,13 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                         }
                     }
                 }
+            } else if matches!(&outcome, TableOutcome::Pass) {
+                // V3-r Tier 2: a string-keyed Pass has no integer key to sample/census by
+                // (census/sample below cast the key as i64) — its row-set completeness was
+                // already fully key-verified above via the string key-set fingerprint.
+                println!(
+                    "verify {table} sample: skipped (string key — key-set verified via count/distinct/min/max)"
+                );
             }
 
             Ok(outcome)
@@ -1496,6 +1576,8 @@ mod tests {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
         source.expect_integer_pk().returning(|_| Ok(None));
+        // No single-column string PK either — stays a Tier 1 key-less table.
+        source.expect_string_pk().returning(|_| Ok(None));
         source.expect_row_count().returning(|_| Ok(3));
         delta.expect_row_count().returning(|_| Ok(3));
         let cols = || {
@@ -1555,6 +1637,8 @@ mod tests {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
         source.expect_integer_pk().returning(|_| Ok(None));
+        // No single-column string PK either — stays a Tier 1 key-less table.
+        source.expect_string_pk().returning(|_| Ok(None));
         source.expect_row_count().returning(|_| Ok(3));
         delta.expect_row_count().returning(|_| Ok(3));
         let cols = || {
@@ -2423,6 +2507,8 @@ mod tests {
         let mut source = MockSourceProbe::new();
         let mut delta = MockDeltaProbe::new();
         source.expect_integer_pk().returning(|_| Ok(None));
+        // No single-column string PK either — stays a Tier 1 key-less table.
+        source.expect_string_pk().returning(|_| Ok(None));
         let cols = || {
             Ok(vec![ColumnMeta {
                 name: "updated_at".to_string(),
@@ -3159,6 +3245,8 @@ mod tests {
         source.expect_columns().returning(move |_| cols());
         delta.expect_columns().returning(move |_| cols());
         source.expect_integer_pk().returning(|_| Ok(None));
+        // No single-column string PK either — stays a Tier 1 key-less table.
+        source.expect_string_pk().returning(|_| Ok(None));
         let agg_values = || {
             Ok(vec![ColumnAggValues {
                 sum: Some("30".to_string()),
@@ -3347,5 +3435,183 @@ mod tests {
         let cmd = VerifyCommand::new(source, delta, vec!["orders".to_string()]);
         let outcome = cmd.run_one_table("orders", &plan).await.unwrap();
         assert_eq!(outcome, TableOutcome::Pass);
+    }
+
+    // --- V3-r Tier 2: single-column string PRIMARY key ----------------------------------
+
+    #[test]
+    fn string_key_stats_outcome_pass_drift_discrepancy() {
+        let s = StringKeyStats {
+            count: 3,
+            distinct: 3,
+            min: Some("a".to_string()),
+            max: Some("z".to_string()),
+        };
+
+        // Equal on both sides -> Pass.
+        let d_equal = s.clone();
+        let outcome = VerifyCommand::<MockSourceProbe, MockDeltaProbe>::string_key_stats_outcome(
+            "source", "delta", &s, &d_equal,
+        );
+        assert_eq!(outcome, TableOutcome::Pass);
+
+        // Delta lagging (fewer distinct, its [min,max] within source's byte range) -> Drift,
+        // not a failure (source advanced past sync).
+        let d_lagging = StringKeyStats {
+            count: 2,
+            distinct: 2,
+            min: Some("b".to_string()),
+            max: Some("y".to_string()),
+        };
+        let outcome = VerifyCommand::<MockSourceProbe, MockDeltaProbe>::string_key_stats_outcome(
+            "source",
+            "delta",
+            &s,
+            &d_lagging,
+        );
+        assert!(
+            matches!(outcome, TableOutcome::Drift { .. }),
+            "expected Drift, got {outcome:?}"
+        );
+
+        // Delta has a key beyond the source's range (e.g. an extra/missing-in-source key) ->
+        // Discrepancy.
+        let d_extra = StringKeyStats {
+            count: 4,
+            distinct: 4,
+            min: Some("a".to_string()),
+            max: Some("zz".to_string()),
+        };
+        let outcome = VerifyCommand::<MockSourceProbe, MockDeltaProbe>::string_key_stats_outcome(
+            "source", "delta", &s, &d_extra,
+        );
+        assert!(
+            matches!(outcome, TableOutcome::Discrepancy { .. }),
+            "expected Discrepancy, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_string_key_table_pass_and_discrepancy() {
+        // A single-column string PK (no integer PK, no `id` column) must get a real key-set
+        // fingerprint via string_pk/string_key_stats instead of Tier 1's value-aggregates-only
+        // PartiallyVerified — a full match rolls up to Clean, not PartiallyVerified.
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
+        source
+            .expect_string_pk()
+            .returning(|_| Ok(Some("token".to_string())));
+        source.expect_row_count().returning(|_| Ok(3));
+        delta.expect_row_count().returning(|_| Ok(3));
+        let cols = || {
+            Ok(vec![ColumnMeta {
+                name: "token".to_string(),
+                type_str: "varchar".to_string(),
+                nullable: false,
+                numeric_scale: None,
+            }])
+        };
+        source.expect_columns().returning(move |_| cols());
+        delta.expect_columns().returning(move |_| cols());
+        // The integer key-set path must never be touched for a string-keyed table.
+        source.expect_key_stats().times(0).returning(|_, _| unreachable!());
+        delta.expect_key_stats().times(0).returning(|_, _| unreachable!());
+        let matching_stats = || {
+            Ok(StringKeyStats {
+                count: 3,
+                distinct: 3,
+                min: Some("aaa".to_string()),
+                max: Some("zzz".to_string()),
+            })
+        };
+        source
+            .expect_string_key_stats()
+            .returning(move |_, _| matching_stats());
+        delta
+            .expect_string_key_stats()
+            .returning(move |_, _| matching_stats());
+        let agg_values = || {
+            Ok(vec![ColumnAggValues {
+                sum: Some("9".to_string()),
+                min: None,
+                max: None,
+                non_null_count: 3,
+            }])
+        };
+        source
+            .expect_value_aggregates()
+            .returning(move |_, _| agg_values());
+        delta
+            .expect_value_aggregates()
+            .returning(move |_, _| agg_values());
+        let cmd = VerifyCommand::new(source, delta, vec!["tokens".to_string()]);
+        let result = cmd.run().await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            VerifyVerdict::Clean,
+            "a fully matching string key-set must roll up to Clean, not PartiallyVerified"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_string_key_table_max_mismatch_is_discrepancy() {
+        // Same setup as the Pass case, but delta's string key stats show a key range beyond
+        // the source's (an extra row Delta has that source doesn't) -> Discrepancy.
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        source.expect_integer_pk().returning(|_| Ok(None));
+        source
+            .expect_string_pk()
+            .returning(|_| Ok(Some("token".to_string())));
+        source.expect_row_count().returning(|_| Ok(3));
+        delta.expect_row_count().returning(|_| Ok(3));
+        let cols = || {
+            Ok(vec![ColumnMeta {
+                name: "token".to_string(),
+                type_str: "varchar".to_string(),
+                nullable: false,
+                numeric_scale: None,
+            }])
+        };
+        source.expect_columns().returning(move |_| cols());
+        delta.expect_columns().returning(move |_| cols());
+        source.expect_key_stats().times(0).returning(|_, _| unreachable!());
+        delta.expect_key_stats().times(0).returning(|_, _| unreachable!());
+        source.expect_string_key_stats().returning(|_, _| {
+            Ok(StringKeyStats {
+                count: 3,
+                distinct: 3,
+                min: Some("aaa".to_string()),
+                max: Some("zzz".to_string()),
+            })
+        });
+        delta.expect_string_key_stats().returning(|_, _| {
+            Ok(StringKeyStats {
+                count: 3,
+                distinct: 3,
+                min: Some("aaa".to_string()),
+                max: Some("zzzz".to_string()),
+            })
+        });
+        let agg_values = || {
+            Ok(vec![ColumnAggValues {
+                sum: Some("9".to_string()),
+                min: None,
+                max: None,
+                non_null_count: 3,
+            }])
+        };
+        source
+            .expect_value_aggregates()
+            .returning(move |_, _| agg_values());
+        delta
+            .expect_value_aggregates()
+            .returning(move |_, _| agg_values());
+        let cmd = VerifyCommand::new(source, delta, vec!["tokens".to_string()]);
+        let result = cmd.run().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), VerifyVerdict::Discrepancy);
     }
 }

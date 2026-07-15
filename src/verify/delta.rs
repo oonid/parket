@@ -7,7 +7,7 @@ use deltalake::datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use deltalake::datafusion::prelude::{SessionConfig, SessionContext};
 use std::collections::HashMap;
 
-use super::{AggKind, ColumnAgg, ColumnAggValues, ColumnMeta, DeltaProbe, KeyStats};
+use super::{AggKind, ColumnAgg, ColumnAggValues, ColumnMeta, DeltaProbe, KeyStats, StringKeyStats};
 use crate::writer::DeltaWriter;
 
 pub struct DeltaProbeAdapter {
@@ -299,6 +299,51 @@ impl DeltaProbe for DeltaProbeAdapter {
             xor: col_opt(4).unwrap_or(0),
             distinct_xor: col_opt(5).unwrap_or(0),
             sum,
+        })
+    }
+
+    /// V3-r Tier 2: DataFusion `min`/`max`/`count(distinct ...)` over Utf8 are already
+    /// byte-ordered, so this matches the source side's `BINARY`-normalized reading without
+    /// any extra casting.
+    async fn string_key_stats(&self, table: &str, key_col: &str) -> Result<StringKeyStats> {
+        let t = self.writer.open_table(table).await?;
+        let ctx = SessionContext::new();
+        ctx.register_table("t", t.table_provider().await?)?;
+        let sql = format!(
+            "SELECT count(*) AS c, count(distinct `{key_col}`) AS d, \
+             cast(min(`{key_col}`) as varchar) AS mn, cast(max(`{key_col}`) as varchar) AS mx FROM t"
+        );
+        let batches = ctx.sql(&sql).await?.collect().await?;
+        let b = batches
+            .first()
+            .context("delta string_key_stats: empty result")?;
+        let col_opt = |i: usize| -> Option<i64> {
+            b.column(i)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .and_then(|a| {
+                    if a.is_empty() || a.is_null(0) {
+                        None
+                    } else {
+                        Some(a.value(0))
+                    }
+                })
+        };
+        let col_str = |i: usize| -> Option<String> {
+            let c = b.column(i);
+            if let Some(a) = c.as_any().downcast_ref::<StringArray>() {
+                (!a.is_empty() && !a.is_null(0)).then(|| a.value(0).to_string())
+            } else if let Some(a) = c.as_any().downcast_ref::<StringViewArray>() {
+                (!a.is_empty() && !a.is_null(0)).then(|| a.value(0).to_string())
+            } else {
+                None
+            }
+        };
+        Ok(StringKeyStats {
+            count: col_opt(0).unwrap_or(0),
+            distinct: col_opt(1).unwrap_or(0),
+            min: col_str(2),
+            max: col_str(3),
         })
     }
 

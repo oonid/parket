@@ -2,7 +2,10 @@ use anyhow::{Context, Result};
 use sqlx::Row;
 use std::collections::HashMap;
 
-use super::{AggKind, ColumnAgg, ColumnAggValues, ColumnMeta, KeyStats, SourceProbe, SourceScope};
+use super::{
+    AggKind, ColumnAgg, ColumnAggValues, ColumnMeta, KeyStats, SourceProbe, SourceScope,
+    StringKeyStats,
+};
 
 fn scope_predicate_sql(scope: &SourceScope) -> String {
     // V8: DECIMAL(20,0) (not SIGNED) so a BIGINT UNSIGNED key above i64::MAX compares
@@ -119,6 +122,32 @@ impl SourceProbe for SourceProbeAdapter {
         Ok(is_integer.then(|| key_col.clone()))
     }
 
+    /// V3-r Tier 2: mirrors `integer_pk`'s single-column PRIMARY key lookup, but returns the
+    /// column only when it is NOT an integer type (composite keys and integer keys are both
+    /// `None` here — the latter is `integer_pk`'s job).
+    async fn string_pk(&self, table: &str) -> Result<Option<String>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT s.COLUMN_NAME, c.DATA_TYPE FROM information_schema.statistics s \
+             JOIN information_schema.columns c \
+               ON c.TABLE_SCHEMA = s.TABLE_SCHEMA AND c.TABLE_NAME = s.TABLE_NAME AND c.COLUMN_NAME = s.COLUMN_NAME \
+             WHERE s.TABLE_SCHEMA = DATABASE() AND s.TABLE_NAME = ? AND s.INDEX_NAME = 'PRIMARY'",
+        )
+        .bind(table)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("source string_pk lookup for `{table}`"))?;
+        if rows.len() != 1 {
+            // No PRIMARY key, or a composite one — neither is a usable single-column key.
+            return Ok(None);
+        }
+        let (key_col, data_type) = &rows[0];
+        let is_integer = matches!(
+            data_type.to_ascii_lowercase().as_str(),
+            "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint"
+        );
+        Ok((!is_integer).then(|| key_col.clone()))
+    }
+
     async fn key_stats(&self, table: &str, key_col: &str) -> Result<KeyStats> {
         // MariaDB's BIT_XOR does not accept DISTINCT (syntax error). The source key
         // column is the primary key (unique), so BIT_XOR over all rows already equals
@@ -181,6 +210,25 @@ impl SourceProbe for SourceProbeAdapter {
             xor,
             distinct_xor: xor,
             sum,
+        })
+    }
+
+    /// V3-r Tier 2: BINARY-normalized so MIN/MAX/COUNT(DISTINCT) use byte ordering instead of
+    /// the column's (often case-insensitive) collation — matches DataFusion's byte-ordered
+    /// Utf8 comparison on the Delta side (the N8 collation lesson applied to the key).
+    async fn string_key_stats(&self, table: &str, key_col: &str) -> Result<StringKeyStats> {
+        let row: (i64, i64, Option<String>, Option<String>) = sqlx::query_as(&format!(
+            "SELECT COUNT(*), COUNT(DISTINCT BINARY `{key_col}`), \
+             CAST(MIN(BINARY `{key_col}`) AS CHAR), CAST(MAX(BINARY `{key_col}`) AS CHAR) FROM `{table}`"
+        ))
+        .fetch_one(&self.pool)
+        .await
+        .with_context(|| format!("source string_key_stats for `{table}`.`{key_col}`"))?;
+        Ok(StringKeyStats {
+            count: row.0,
+            distinct: row.1,
+            min: row.2,
+            max: row.3,
         })
     }
 
