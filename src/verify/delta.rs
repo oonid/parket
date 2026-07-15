@@ -92,8 +92,11 @@ impl DeltaProbeAdapter {
         match col.kind {
             AggKind::Integer => vec![
                 format!("cast(sum(try_cast(`{c}` as decimal(65,0))) as varchar)"),
-                format!("cast(min(try_cast(`{c}` as bigint)) as varchar)"),
-                format!("cast(max(try_cast(`{c}` as bigint)) as varchar)"),
+                // V8: DECIMAL(65,0) (not bigint) so an unsigned integer VALUE column whose
+                // MIN/MAX exceeds i64::MAX isn't wrapped negative — symmetry with the source
+                // side's DECIMAL(65,scale) SUM/MIN/MAX casts above.
+                format!("cast(min(try_cast(`{c}` as decimal(65,0))) as varchar)"),
+                format!("cast(max(try_cast(`{c}` as decimal(65,0))) as varchar)"),
                 format!("count(`{c}`)"),
             ],
             AggKind::Decimal { scale } => vec![
@@ -203,9 +206,12 @@ impl DeltaProbe for DeltaProbeAdapter {
         let t = self.writer.open_table(table).await?;
         let ctx = SessionContext::new();
         ctx.register_table("t", t.table_provider().await?)?;
+        // V8: MIN/MAX cast through DECIMAL(20,0)-as-varchar (not bigint) so a key value
+        // above i64::MAX isn't wrapped negative; parsed to i128 below. bit_xor stays on the
+        // bigint cast (bit-preserving; delta keys are always <= i64::MAX per N5).
         let sql = format!(
             "SELECT count(*) AS c, count(distinct `{key_col}`) AS d, \
-             min(cast(`{key_col}` as bigint)) AS mn, max(cast(`{key_col}` as bigint)) AS mx, \
+             cast(min(cast(`{key_col}` as decimal(20,0))) as varchar) AS mn, cast(max(cast(`{key_col}` as decimal(20,0))) as varchar) AS mx, \
              bit_xor(cast(`{key_col}` as bigint)) AS x, bit_xor(distinct cast(`{key_col}` as bigint)) AS dx, \
              cast(sum(distinct cast(`{key_col}` as decimal(38,0))) as varchar) AS sm FROM t"
         );
@@ -236,8 +242,8 @@ impl DeltaProbe for DeltaProbeAdapter {
         Ok(KeyStats {
             count: col_opt(0).unwrap_or(0),
             distinct: col_opt(1).unwrap_or(0),
-            min: col_opt(2),
-            max: col_opt(3),
+            min: col_str(2).and_then(|s| s.parse::<i128>().ok()),
+            max: col_str(3).and_then(|s| s.parse::<i128>().ok()),
             xor: col_opt(4).unwrap_or(0),
             distinct_xor: col_opt(5).unwrap_or(0),
             sum,
@@ -253,8 +259,12 @@ impl DeltaProbe for DeltaProbeAdapter {
         let t = self.writer.open_table(table).await?;
         let ctx = self.bounded_ctx()?;
         ctx.register_table("t", t.table_provider().await?)?;
+        // V8: `key_value` (bigint) stays the identity used for row_number/bit_xor/distinct
+        // (bit-preserving, injective even for wrapped-negative unsigned keys); `key_dec`
+        // (decimal(20,0)) is the range-safe reading MIN/MAX are computed from, so a key
+        // above i64::MAX isn't wrapped negative in the min/max fingerprint.
         let sql = format!(
-            "WITH ranked AS (              SELECT cast(`{key_col}` as bigint) AS key_value,                     row_number() OVER (PARTITION BY cast(`{key_col}` as bigint) ORDER BY `{cursor_col}` DESC) AS rn              FROM t              )              SELECT count(*) AS c, count(distinct key_value) AS d,                     min(key_value) AS mn, max(key_value) AS mx,                     bit_xor(key_value) AS x, bit_xor(distinct key_value) AS dx,                     cast(sum(cast(key_value as decimal(38,0))) as varchar) AS sm              FROM ranked WHERE rn = 1"
+            "WITH ranked AS (              SELECT cast(`{key_col}` as bigint) AS key_value,                     cast(`{key_col}` as decimal(20,0)) AS key_dec,                     row_number() OVER (PARTITION BY cast(`{key_col}` as bigint) ORDER BY `{cursor_col}` DESC) AS rn              FROM t              )              SELECT count(*) AS c, count(distinct key_value) AS d,                     cast(min(key_dec) as varchar) AS mn, cast(max(key_dec) as varchar) AS mx,                     bit_xor(key_value) AS x, bit_xor(distinct key_value) AS dx,                     cast(sum(cast(key_value as decimal(38,0))) as varchar) AS sm              FROM ranked WHERE rn = 1"
         );
         let batches = ctx.sql(&sql).await?.collect().await?;
         let b = batches
@@ -284,8 +294,8 @@ impl DeltaProbe for DeltaProbeAdapter {
         Ok(KeyStats {
             count: col_opt(0).unwrap_or(0),
             distinct: col_opt(1).unwrap_or(0),
-            min: col_opt(2),
-            max: col_opt(3),
+            min: col_str(2).and_then(|s| s.parse::<i128>().ok()),
+            max: col_str(3).and_then(|s| s.parse::<i128>().ok()),
             xor: col_opt(4).unwrap_or(0),
             distinct_xor: col_opt(5).unwrap_or(0),
             sum,

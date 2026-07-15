@@ -304,12 +304,18 @@ pub(crate) fn assemble_fingerprints(
 }
 
 /// L2 key-set fingerprint over a table's PK column.
+///
+/// `min`/`max` are `i128` (not `i64`) so a `BIGINT UNSIGNED` key value above
+/// `i64::MAX` (2^63-1) can be represented exactly instead of wrapping negative
+/// under a SIGNED/bigint cast (V8). `xor`/`distinct_xor` stay `i64`: XOR is a
+/// bit-pattern (not a magnitude), so a bit-preserving cast is correct on both
+/// probes regardless of key range.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeyStats {
     pub count: i64,
     pub distinct: i64,
-    pub min: Option<i64>,
-    pub max: Option<i64>,
+    pub min: Option<i128>,
+    pub max: Option<i128>,
     pub xor: i64,
     pub distinct_xor: i64,
     pub sum: i128,
@@ -2404,6 +2410,69 @@ mod tests {
         };
         let outcome = VerifyCommand::<MockSourceProbe, MockDeltaProbe>::key_stats_outcome("source", "delta", &s, &d);
         assert!(!matches!(outcome, TableOutcome::Pass), "distinct-sum must break the xor collision");
+    }
+
+    #[test]
+    fn key_stats_outcome_handles_u64_range_min_max() {
+        // V8: min/max above i64::MAX (2^63-1) must be handled correctly by the range/Drift
+        // logic now that KeyStats.min/max are i128 — this proves the wider type doesn't just
+        // compile but actually participates in the comparisons unchanged.
+        let u64_max: i128 = 18_446_744_073_709_551_615; // 2^64 - 1
+        let above_i63: i128 = 9_300_000_000_000_000_000; // > i64::MAX, < u64::MAX
+
+        // Exact match on both sides (including a u64-range max) -> Pass.
+        let s = KeyStats {
+            count: 2,
+            distinct: 2,
+            min: Some(above_i63),
+            max: Some(u64_max),
+            xor: 5,
+            distinct_xor: 5,
+            sum: above_i63 + u64_max,
+        };
+        let d = s.clone();
+        let outcome = VerifyCommand::<MockSourceProbe, MockDeltaProbe>::key_stats_outcome(
+            "source", "delta", &s, &d,
+        );
+        assert_eq!(outcome, TableOutcome::Pass);
+
+        // Delta lagging behind (smaller distinct, range still inside source's u64-range
+        // bounds) -> Drift, not Discrepancy.
+        let d_lagging = KeyStats {
+            count: 1,
+            distinct: 1,
+            min: Some(above_i63),
+            max: Some(above_i63),
+            xor: above_i63 as i64,
+            distinct_xor: above_i63 as i64,
+            sum: above_i63,
+        };
+        let outcome = VerifyCommand::<MockSourceProbe, MockDeltaProbe>::key_stats_outcome(
+            "source", "delta", &s, &d_lagging,
+        );
+        assert!(
+            matches!(outcome, TableOutcome::Drift { .. }),
+            "expected Drift, got {outcome:?}"
+        );
+
+        // Delta claims a max beyond the source's u64-range max -> Discrepancy (delta has
+        // ids/rows not in source).
+        let d_extra = KeyStats {
+            count: 2,
+            distinct: 2,
+            min: Some(above_i63),
+            max: Some(u64_max + 1),
+            xor: 5,
+            distinct_xor: 5,
+            sum: above_i63 + u64_max + 1,
+        };
+        let outcome = VerifyCommand::<MockSourceProbe, MockDeltaProbe>::key_stats_outcome(
+            "source", "delta", &s, &d_extra,
+        );
+        assert!(
+            matches!(outcome, TableOutcome::Discrepancy { .. }),
+            "expected Discrepancy, got {outcome:?}"
+        );
     }
 
     #[tokio::test]

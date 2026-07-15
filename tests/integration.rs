@@ -10,8 +10,8 @@ use parket::orchestrator::{
     SignalHandler, StateManageAdapter,
 };
 use parket::verify::{
-    DeltaProbeAdapter, SourceProbeAdapter, TableOutcome, TablePlan, VerifyCommand, VerifyMode,
-    VerifyVerdict,
+    DeltaProbeAdapter, SourceProbe, SourceProbeAdapter, TableOutcome, TablePlan, VerifyCommand,
+    VerifyMode, VerifyVerdict,
 };
 use parket::writer::DeltaWriter;
 use sqlx::MySqlPool;
@@ -2931,4 +2931,50 @@ async fn verify_varchar_only_drift() {
          per-column value-aggregate check, proving VARCHAR columns aren't silently \
          unverified"
     );
+}
+
+// V8: verify's source-side key-set MIN/MAX must handle a BIGINT UNSIGNED key above i64::MAX.
+// The old code cast the key `AS SIGNED`, wrapping such a value to a negative i64 and corrupting
+// the min/max fingerprint (false/misleading verdicts). N5 blocks writing a > i64::MAX key to
+// Delta, but the LIVE SOURCE can still hold one (e.g. rows added since the last sync), and
+// verify's `source.key_stats()` aggregates over it — so this drives `key_stats` DIRECTLY on a
+// seeded table (no sync needed) and asserts the u64 value reads back exactly, not wrapped.
+#[tokio::test]
+#[serial_test::serial]
+async fn verify_source_key_stats_handles_bigint_unsigned_above_i63() {
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let env = TestEnv::new(vec!["ukey"]).await;
+
+    sqlx::query("CREATE TABLE ukey (k BIGINT UNSIGNED PRIMARY KEY, v INT NOT NULL)")
+        .execute(&env.pool)
+        .await
+        .expect("failed to create ukey table");
+
+    // Seed a small key and u64::MAX (18446744073709551615 = 2^64-1, far above i64::MAX 2^63-1).
+    sqlx::query("INSERT INTO ukey (k, v) VALUES (7, 1), (18446744073709551615, 2)")
+        .execute(&env.pool)
+        .await
+        .expect("failed to insert ukey rows");
+
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let stats = source
+        .key_stats("ukey", "k")
+        .await
+        .expect("source key_stats for a BIGINT UNSIGNED key must succeed");
+
+    // Under the old `CAST AS SIGNED` path, 18446744073709551615 wrapped to -1 and could not be
+    // held in i64 — max would have been a wrong (negative) value. The DECIMAL(20,0)→i128 path
+    // reads it exactly.
+    assert_eq!(
+        stats.max,
+        Some(18446744073709551615_i128),
+        "MAX of a BIGINT UNSIGNED key above i64::MAX must be the exact u64, not wrapped negative"
+    );
+    assert_eq!(stats.min, Some(7_i128), "MIN must be the small key, unaffected");
+    assert_eq!(stats.count, 2);
+    assert_eq!(stats.distinct, 2);
 }

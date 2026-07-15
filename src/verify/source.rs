@@ -5,11 +5,21 @@ use std::collections::HashMap;
 use super::{AggKind, ColumnAgg, ColumnAggValues, ColumnMeta, KeyStats, SourceProbe, SourceScope};
 
 fn scope_predicate_sql(scope: &SourceScope) -> String {
+    // V8: DECIMAL(20,0) (not SIGNED) so a BIGINT UNSIGNED key above i64::MAX compares
+    // correctly against the i64 `last_id` bound instead of wrapping negative and being
+    // wrongly included.
     format!(
-        "(`{cursor}` < ?) OR (`{cursor}` = ? AND CAST(`{key}` AS SIGNED) <= ?)",
+        "(`{cursor}` < ?) OR (`{cursor}` = ? AND CAST(`{key}` AS DECIMAL(20,0)) <= ?)",
         cursor = scope.cursor_col,
         key = scope.key_col,
     )
+}
+
+/// Parse a MariaDB `CAST(... AS DECIMAL(20,0)) AS CHAR` key-stats MIN/MAX reading into an
+/// `i128` (V8: range-safe over the full u64 span, unlike the old SIGNED/i64 cast which
+/// wrapped a BIGINT UNSIGNED value above i64::MAX to negative).
+fn parse_key_bound(s: &Option<String>) -> Option<i128> {
+    s.as_deref().and_then(|s| s.parse::<i128>().ok())
 }
 
 pub struct SourceProbeAdapter {
@@ -115,9 +125,12 @@ impl SourceProbe for SourceProbeAdapter {
         // the fingerprint over distinct values — we reuse it for `distinct_xor`. The
         // Delta side, which may carry append-log duplicates, computes a true
         // bit_xor(distinct ...).
-        let row: (i64, i64, Option<i64>, Option<i64>, Option<i64>, Option<String>) = sqlx::query_as(&format!(
+        // V8: MIN/MAX cast to DECIMAL(20,0)-as-CHAR (not SIGNED) so a BIGINT UNSIGNED key
+        // above i64::MAX is captured exactly instead of wrapping negative; parsed to i128
+        // below. BIT_XOR stays SIGNED/i64 (bit-preserving, not a magnitude).
+        let row: (i64, i64, Option<String>, Option<String>, Option<i64>, Option<String>) = sqlx::query_as(&format!(
             "SELECT COUNT(*), COUNT(DISTINCT `{key_col}`), \
-             CAST(MIN(`{key_col}`) AS SIGNED), CAST(MAX(`{key_col}`) AS SIGNED), \
+             CAST(CAST(MIN(`{key_col}`) AS DECIMAL(20,0)) AS CHAR), CAST(CAST(MAX(`{key_col}`) AS DECIMAL(20,0)) AS CHAR), \
              CAST(BIT_XOR(`{key_col}`) AS SIGNED), CAST(SUM(`{key_col}`) AS CHAR) FROM `{table}`"
         ))
         .fetch_one(&self.pool)
@@ -128,8 +141,8 @@ impl SourceProbe for SourceProbeAdapter {
         Ok(KeyStats {
             count: row.0,
             distinct: row.1,
-            min: row.2,
-            max: row.3,
+            min: parse_key_bound(&row.2),
+            max: parse_key_bound(&row.3),
             xor,
             distinct_xor: xor,
             sum,
@@ -144,9 +157,9 @@ impl SourceProbe for SourceProbeAdapter {
     ) -> Result<KeyStats> {
         let predicate = scope_predicate_sql(scope);
         let sql = format!(
-            "SELECT COUNT(*), COUNT(DISTINCT `{key_col}`),              CAST(MIN(`{key_col}`) AS SIGNED), CAST(MAX(`{key_col}`) AS SIGNED),              CAST(BIT_XOR(`{key_col}`) AS SIGNED), CAST(SUM(`{key_col}`) AS CHAR) FROM `{table}`              WHERE {predicate}"
+            "SELECT COUNT(*), COUNT(DISTINCT `{key_col}`),              CAST(CAST(MIN(`{key_col}`) AS DECIMAL(20,0)) AS CHAR), CAST(CAST(MAX(`{key_col}`) AS DECIMAL(20,0)) AS CHAR),              CAST(BIT_XOR(`{key_col}`) AS SIGNED), CAST(SUM(`{key_col}`) AS CHAR) FROM `{table}`              WHERE {predicate}"
         );
-        let row: (i64, i64, Option<i64>, Option<i64>, Option<i64>, Option<String>) = sqlx::query_as(&sql)
+        let row: (i64, i64, Option<String>, Option<String>, Option<i64>, Option<String>) = sqlx::query_as(&sql)
             .bind(&scope.updated_at)
             .bind(&scope.updated_at)
             .bind(scope.last_id)
@@ -163,8 +176,8 @@ impl SourceProbe for SourceProbeAdapter {
         Ok(KeyStats {
             count: row.0,
             distinct: row.1,
-            min: row.2,
-            max: row.3,
+            min: parse_key_bound(&row.2),
+            max: parse_key_bound(&row.3),
             xor,
             distinct_xor: xor,
             sum,
