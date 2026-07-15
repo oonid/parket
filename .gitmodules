@@ -10,3 +10,4 @@
 [submodule "reference/datafusion"]
 	path = reference/datafusion
 	url = git@github.com:apache/datafusion.git
+	ignore = dirty
