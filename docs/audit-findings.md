@@ -166,3 +166,101 @@ design (see `docs/verify-checks.md`).
 5. **O2/R4 + R3 + R5** — shutdown/durability batch.
 6. **O1/O4/O5/O6 + shared mode-resolver (O7/O12)** — config-intent batch.
 7. **M2/M3/M4, V3/V5/V6, D1–D3, CF/S/P/pf** — then Lows.
+
+---
+
+## 7. New audit — 2026-07-15 (fresh pass over v0.2.0; `fable` model, Opus-spot-verified)
+
+A second independent audit pass over the **post-v0.2.0** code (the entire §1–§6 Critical/High/Medium
+set is already resolved). Fresh-eyes review; excludes everything already resolved/registered above.
+IDs prefixed **`FA`** (fresh audit). Confidence is the reviewer's; **[Opus-verified]** marks findings
+the orchestrator independently confirmed against the code. These are CANDIDATES pending the
+plan→implement→review remediation loop; none fixed yet.
+
+### 7.1 Open — Critical
+*(none — the prior audit's Critical class re-traced and confirmed still closed.)*
+
+### 7.2 Open — High
+- **FA1** — **[Opus-verified] silent NULL-corruption on full-refresh type drift.** `coerce_batch_to_schema`
+  (`writer.rs:73-93`, used by `stage_overwrite_chunk`) casts each batch column to the *existing* Delta
+  schema with arrow's plain `cast()` = `safe: true` → an out-of-range/unparseable value becomes **NULL**
+  instead of erroring. Full refresh never runs `schema_evolution_check` (`orchestrator.rs:310-319` gates it
+  to `Incremental|TwoStream`; `_ => column_names`). So a full-refresh table whose source type drifted vs its
+  Delta column (e.g. `int→bigint` after ids pass 2³¹; or the register's own N5 "full-refresh to rebuild"
+  migration for a pre-N5 `int unsigned` table where Delta is Int32 but batches arrive Int64) silently writes
+  NULLs for every non-fitting value, exit 0. Directly undoes N5's discipline (`align_batches_to_schema`
+  uses `CastOptions{safe:false}` and errors by table+column one step earlier). **Fix:** use
+  `cast_with_options(.., {safe:false, ..})` in `coerce_batch_to_schema` (mirror `align_batches_to_schema`).
+- **FA2** — **[Opus-verified] two-stream cross-window row duplication.** The update stream (Stream B,
+  `orchestrator/two_stream.rs:199-267`) is bounded only by the UPDATE cursor — no upper bound on the insert
+  key. A row `id=Y` inserted after Stream A's window (insert watermark `X`, `Y>X`) whose `update_col` lands
+  in Stream B's window is appended by `delete_then_append` (delete finds nothing → append Y); the commit
+  keeps `insert_id=X`. Next run, Stream A extracts `id > X`, re-appends Y → **duplicate that persists** until
+  Y is updated again. Verify's `two_stream_key_stats_outcome` grades delta-count>source-count as **Drift**
+  (→ Clean), so it's invisible to the exit code and `--verify`. **Fix:** cap Stream B at the insert
+  watermark (`AND {insert_col} <= {hwm_id}`) — rows beyond it belong to the next run's insert stream. (Do
+  NOT advance the insert watermark past Stream B's max — that would lose not-yet-completed rows in `(X, maxB]`.)
+  Optionally make `two_stream_key_stats_outcome` treat `delta count > delta distinct` as a loud diagnostic.
+
+### 7.3 Open — Medium
+- **FA3** — full refresh never evolves the Delta schema (confirmed). `coerce_batch_to_schema` iterates only
+  *target* fields (extra batch columns silently dropped, no log); `commit_overwrite` emits only Remove+Add,
+  no `Metadata` action, so schema can't change. Consequences: (a) a NEW source column is extracted then
+  silently discarded every run (Incremental/TwoStream capture it via D1's `SchemaMode::Merge`; full refresh
+  doesn't); (b) a DROPPED source column makes `coerce` error every run with the misleading "column expected
+  by the Delta schema is missing from the extracted batch" — permanent, no remediation short of deleting the
+  Delta dir; (c) the register's N5 "full-refresh to rebuild" advice doesn't actually rebuild the schema (and
+  per FA1 silently NULLs the very values it was meant to fix). **Fix:** emit a `Metadata` action on
+  overwrite when the schema differs (delta-rs `Overwrite + SchemaMode::Overwrite`), or at least warn (new
+  col) / bail accurately (dropped col) in `process_full_refresh`; correct the N5 migration note. (Pairs with FA1.)
+- **FA4** — `delete_then_append` (the DEFAULT two-stream update strategy) dedups in an UNBOUNDED DataFusion
+  session (`writer/two_stream.rs:294-306`: `SessionContext::new()`, no `FairSpillPool`/spill dir) and
+  `.collect()`s the deduped output while the input `MemTable` is still resident → transient peak ~2–3× the
+  window (so ~4–6× `TARGET_MEMORY_MB` with the breaker's 2× admission), uncovered by M4's RAM validation.
+  `merge_batch` (the opt-out path) was hardened with a bounded pool; the default path was not. OOM-risk on
+  the 8 GB target for large update windows. **Fix:** give `delete_then_append`'s dedup the same bounded
+  runtime `merge_batch` builds; or dedup without full materialization (metadata-only when no dupes).
+- **FA5** — unquoted, case-normalized identifiers in `merge_batch`/`delete_then_append` DataFusion SQL +
+  `col()` exprs (`writer/two_stream.rs:132-161, 300-356`). DataFusion normalizes unquoted identifiers to
+  lowercase → a mixed-case column (`userId`), a reserved-word column (`order`), or a source column named
+  `__rn` (the dedup alias) fails the table on every update window (hard error, not corruption). verify's
+  probes backtick-quote for exactly this reason; the writer path doesn't. **Fix:** backtick-quote all
+  identifiers in the dedup SQL; use `Expr::Column`/`ident()` to bypass normalization; pick a collision-proof alias.
+
+### 7.4 Open — Low
+- **FA6** — adaptive batch sizing runs once per PROCESS not per table: `BatchExtractor.adapted`
+  (`extractor.rs:20,149-151`) latches on the first non-empty batch ever and never resets, so tables 2..N
+  keep a mis-sized LIMIT (repeated breaker truncations). **Fix:** reset `adapted=false` in
+  `calculate_batch_size` (called once per table).
+- **FA7** — `extract_id_as_i64` (`writer/hwm.rs:123-152`) ignores NULL validity → a NULL key slot reads as
+  0. Reachable only for a nullable fallback `id` key (explicit `TABLE_MODE=incremental`, no integer PK):
+  yields `last_id: 0`, re-extracting rows at the max timestamp → duplicates. **Fix:** skip null slots / return None on null.
+- **FA8** — `delete_then_append` UInt64 key collection uses wrapping `as i64` (`writer/two_stream.rs:328-333`).
+  Unreachable from the orchestrator (`align_batches_to_schema` errors on >i64::MAX first) but a public-API
+  hazard and inconsistent with `extract_id_as_i64`/`extract_batch_max_key`. **Fix:** `i64::try_from` with an error.
+- **FA9** — undocumented/unvalidated env knobs read deep in the write path: `UPDATE_STRATEGY`
+  (`orchestrator/two_stream.rs:251`, exact-match `"merge"` — a typo silently selects the default);
+  `MERGE_SORT_RESERVATION_MB`/`MERGE_TARGET_PARTITIONS` (`writer/two_stream.rs:97-116`, unparseable silently
+  ignored). Bypass `Config` entirely (invisible to `--check`). **Fix:** parse/validate in `Config::load`, thread through.
+- **FA10** — `max_timestamp`/`count_null` (`discovery.rs:160,174`) interpolate identifiers WITHOUT the S2
+  backtick-doubling — on the EXTRACTION path S2 claimed done (vs the verify path S2-r defers). Robustness
+  (schema/config-derived names), not injection. **Fix:** route through a shared `backtick()` helper.
+- **FA11** — a failed full refresh leaves its `OverwriteSession` (RecordBatchWriter buffers + accumulated Add
+  metadata + table handle) resident until process exit (`writer.rs:112,356-371`; failure paths in
+  `orchestrator/full_refresh.rs` never drain it). Bounded by table count; modest unaccounted retention.
+  **Fix:** an `abort_overwrite(table)` on the table-failure path (also the natural spot for the vacuum-hint log).
+- **FA12** — cosmetic/latent: `writer/schema.rs:28` maps `UInt32→INTEGER` (range-lossy; currently unreachable
+  — unsigned is widened first — but a defense-in-depth hole, map `→LONG`); `inspect.rs:78-79` still
+  recommends full_refresh on "No `id` column" pre-dating N3-r's integer-PK generalization (O13-adjacent); an
+  interrupted full refresh records the *staged* (uncommitted) row count in `state.json last_run_rows` (mildly misleading).
+
+### 7.5 Coverage note (from the fresh pass)
+Re-traced and found solid: the incremental loop (HWM ordering, N2-r/R2 guards, has-data guard, D2),
+extractor/breaker (cumulative accounting, widening weights, discard-on-truncation), the atomic-overwrite
+COMMIT protocol (single-commit, abort-safe, cache eviction — FA1/FA3 are about the *coercion/schema* inside
+it, not the commit), P1 caches (coherent under single-writer; no lock held across await except the harmless
+sessions lock), state fsync/rename + sticky last-success, signal/exit-code mapping, secret masking, verify
+SQL parity (DECIMAL(65)/i128/BINARY consistent on both probes), discovery/mode-resolution. Not fully
+explored: the ~2,700 lines of test bodies (function lists only), vendored connector_arrow internals, and
+whether delta-rs's Overwrite `CommitBuilder` does any protocol-level schema validation that would incidentally
+catch FA3(a) (staged parquet is written against the old schema regardless).
