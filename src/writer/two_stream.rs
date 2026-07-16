@@ -73,55 +73,7 @@ impl DeltaWriter {
         let schema = batches[0].schema();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
-        let pool_bytes = (self.merge_memory_mb as usize) * 1024 * 1024;
-        // Route the external sort's spill to the configured dir (MERGE_SPILL_DIR); else system temp.
-        let disk_builder = match &self.merge_spill_dir {
-            Some(dir) => DiskManagerBuilder::default()
-                .with_mode(DiskManagerMode::Directories(vec![dir.clone()])),
-            None => DiskManagerBuilder::default(),
-        };
-        let runtime = std::sync::Arc::new(
-            RuntimeEnvBuilder::new()
-                .with_memory_pool(std::sync::Arc::new(FairSpillPool::new(pool_bytes)))
-                .with_disk_manager_builder(disk_builder)
-                .build()?,
-        );
-        let mut session_config = SessionConfig::new();
-        // Force a spillable SortMergeJoin — datafusion 53's HashJoin does NOT spill, so under a
-        // bounded pool it would error instead of spilling.
-        session_config.options_mut().optimizer.prefer_hash_join = false;
-        // Optional tuning: override datafusion's `sort_spill_reservation_bytes` (default 10 MB),
-        // the memory reserved for the external sort's merge phase. On "Not enough memory to
-        // continue external sort", a SMALLER value shrinks the merge's reservation request and
-        // can let a bounded pool finish (datafusion's own hint). Read from env (advanced knob).
-        if let Ok(raw) = std::env::var("MERGE_SORT_RESERVATION_MB")
-            && let Ok(mb) = raw.trim().parse::<usize>()
-        {
-            session_config.options_mut().execution.sort_spill_reservation_bytes = mb * 1024 * 1024;
-            info!(
-                table = table_name,
-                merge_sort_reservation_mb = mb,
-                "merge: sort_spill_reservation_bytes overridden"
-            );
-        }
-        // Pin the external sort to a single partition by default. datafusion runs one external
-        // sorter per partition (default = CPU count), and they ALL share this one FairSpillPool,
-        // so fan-out fragments the pool and the merge phase starves even with a large pool
-        // ("Failed to allocate … for ExternalSorterMerge[N]"). One partition = one sorter owns the
-        // whole pool → fewer runs, the merge fits. Override via MERGE_TARGET_PARTITIONS (>0).
-        let merge_partitions = std::env::var("MERGE_TARGET_PARTITIONS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(1);
-        session_config.options_mut().execution.target_partitions = merge_partitions;
-        let ctx = SessionContext::new_with_config_rt(session_config, runtime);
-        info!(
-            table = table_name,
-            merge_memory_mb = self.merge_memory_mb,
-            merge_target_partitions = merge_partitions,
-            "merge: bounded datafusion session (spills to disk)"
-        );
+        let ctx = self.build_bounded_session(table_name)?;
 
         // Zero-copy registration: MemTable takes ownership of `batches` directly (a Vec of
         // partitions, one Vec<RecordBatch> per partition) instead of concat_batches'ing them
@@ -164,6 +116,65 @@ impl DeltaWriter {
         info!(table = table_name, rows = total_rows, "merge committed");
         self.cache_store(table_name, table).await;
         Ok(())
+    }
+
+    /// FA4/M2/M3: build a MEMORY-BOUNDED DataFusion session for the two-stream update path's
+    /// sort/join/dedup — a `FairSpillPool(merge_memory_mb)` + spill dir (MERGE_SPILL_DIR) so the
+    /// work spills to disk instead of OOMing the 8 GB VM. Forces a spillable SortMergeJoin
+    /// (datafusion 53's HashJoin doesn't spill) and one partition by default (so a single external
+    /// sorter owns the whole pool). MERGE_SORT_RESERVATION_MB / MERGE_TARGET_PARTITIONS override.
+    /// Used by BOTH `merge_batch` and `delete_then_append` (the default strategy) so neither runs
+    /// an unbounded session.
+    fn build_bounded_session(&self, table_name: &str) -> Result<SessionContext> {
+        let pool_bytes = (self.merge_memory_mb as usize) * 1024 * 1024;
+        // Route the external sort's spill to the configured dir (MERGE_SPILL_DIR); else system temp.
+        let disk_builder = match &self.merge_spill_dir {
+            Some(dir) => DiskManagerBuilder::default()
+                .with_mode(DiskManagerMode::Directories(vec![dir.clone()])),
+            None => DiskManagerBuilder::default(),
+        };
+        let runtime = std::sync::Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(std::sync::Arc::new(FairSpillPool::new(pool_bytes)))
+                .with_disk_manager_builder(disk_builder)
+                .build()?,
+        );
+        let mut session_config = SessionConfig::new();
+        // Force a spillable SortMergeJoin — datafusion 53's HashJoin does NOT spill, so under a
+        // bounded pool it would error instead of spilling.
+        session_config.options_mut().optimizer.prefer_hash_join = false;
+        // Optional tuning: override datafusion's `sort_spill_reservation_bytes` (default 10 MB),
+        // the memory reserved for the external sort's merge phase. On "Not enough memory to
+        // continue external sort", a SMALLER value shrinks the merge's reservation request and
+        // can let a bounded pool finish (datafusion's own hint). Read from env (advanced knob).
+        if let Ok(raw) = std::env::var("MERGE_SORT_RESERVATION_MB")
+            && let Ok(mb) = raw.trim().parse::<usize>()
+        {
+            session_config.options_mut().execution.sort_spill_reservation_bytes = mb * 1024 * 1024;
+            info!(
+                table = table_name,
+                merge_sort_reservation_mb = mb,
+                "merge: sort_spill_reservation_bytes overridden"
+            );
+        }
+        // Pin the external sort to a single partition by default. datafusion runs one external
+        // sorter per partition (default = CPU count), and they ALL share this one FairSpillPool,
+        // so fan-out fragments the pool and the merge phase starves even with a large pool
+        // ("Failed to allocate … for ExternalSorterMerge[N]"). One partition = one sorter owns the
+        // whole pool → fewer runs, the merge fits. Override via MERGE_TARGET_PARTITIONS (>0).
+        let merge_partitions = std::env::var("MERGE_TARGET_PARTITIONS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1);
+        session_config.options_mut().execution.target_partitions = merge_partitions;
+        info!(
+            table = table_name,
+            merge_memory_mb = self.merge_memory_mb,
+            merge_target_partitions = merge_partitions,
+            "bounded datafusion session (spills to disk)"
+        );
+        Ok(SessionContext::new_with_config_rt(session_config, runtime))
     }
 
     /// Append new rows (insert stream of two-stream mode) carrying BOTH watermarks on
@@ -291,7 +302,10 @@ impl DeltaWriter {
 
         // Dedup the incoming batches by key_col (same pattern as merge_batch).
         let schema = batches[0].schema();
-        let ctx = SessionContext::new();
+        // FA4: the default two-stream update strategy's dedup ROW_NUMBER sort must run in the same
+        // memory-bounded session merge_batch uses — an unbounded SessionContext::new() here would
+        // OOM the 8 GB VM on a large update window.
+        let ctx = self.build_bounded_session(table_name)?;
         // Zero-copy registration: MemTable moves `batches` in directly instead of
         // concat_batches'ing them into a separate contiguous copy first (M3).
         let provider = MemTable::try_new(schema.clone(), vec![batches])?;
