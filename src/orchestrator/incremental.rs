@@ -91,6 +91,7 @@ where
                 current_hwm.as_ref().map(|h| h.updated_at.as_str()),
                 current_hwm.as_ref().map(|h| h.last_id),
                 batch_size,
+                None,
             );
 
             let extraction = self.extractor.extract(&sql)?;

@@ -42,6 +42,7 @@ fn format_order_by(terms: &[OrderTerm]) -> String {
 pub struct QueryBuilder;
 
 impl QueryBuilder {
+    #[allow(clippy::too_many_arguments)]
     pub fn build_incremental_query(
         table: &str,
         columns: &[String],
@@ -50,22 +51,30 @@ impl QueryBuilder {
         hwm_updated_at: Option<&str>,
         hwm_last_id: Option<i64>,
         batch_size: u64,
+        key_upper_bound: Option<i64>,
     ) -> String {
         let col_list = format_columns(columns);
         let quoted_table = backtick(table);
         let ts = backtick(timestamp_col);
         let key = backtick(key_col);
+        // FA2: two-stream Stream B passes the insert watermark here so a row inserted past it
+        // (belonging to the next run's insert stream) isn't updated+appended now and re-appended
+        // next run. Plain incremental passes None (single cursor — no cross-stream race).
+        let cap = match key_upper_bound {
+            Some(b) => format!(" AND {key} <= {b}"),
+            None => String::new(),
+        };
 
         match (hwm_updated_at, hwm_last_id) {
             (Some(updated_at), Some(last_id)) => {
                 let updated_at = sql_str_literal(updated_at);
                 format!(
-                    "SELECT {col_list} FROM {quoted_table} WHERE {ts} IS NOT NULL AND (({ts} = '{updated_at}' AND {key} > {last_id}) OR ({ts} > '{updated_at}')) ORDER BY {ts} ASC, {key} ASC LIMIT {batch_size}"
+                    "SELECT {col_list} FROM {quoted_table} WHERE {ts} IS NOT NULL AND (({ts} = '{updated_at}' AND {key} > {last_id}) OR ({ts} > '{updated_at}')){cap} ORDER BY {ts} ASC, {key} ASC LIMIT {batch_size}"
                 )
             }
             _ => {
                 format!(
-                    "SELECT {col_list} FROM {quoted_table} WHERE {ts} IS NOT NULL ORDER BY {ts} ASC, {key} ASC LIMIT {batch_size}"
+                    "SELECT {col_list} FROM {quoted_table} WHERE {ts} IS NOT NULL{cap} ORDER BY {ts} ASC, {key} ASC LIMIT {batch_size}"
                 )
             }
         }
@@ -154,6 +163,7 @@ mod tests {
             Some("2026-03-28 09:00:00"),
             Some(500),
             10000,
+            None,
         );
 
         assert!(sql.contains("SELECT `id`, `name`, `updated_at` FROM `orders`"));
@@ -178,6 +188,7 @@ mod tests {
             None,
             None,
             10000,
+            None,
         );
 
         assert!(sql.contains("SELECT `id`, `name`, `updated_at` FROM `orders`"));
@@ -293,6 +304,7 @@ mod tests {
             Some("2026-01-01 00:00:00"),
             Some(42),
             5000,
+            None,
         );
 
         assert!(
@@ -313,6 +325,7 @@ mod tests {
             Some("2026-01-01 00:00:00"),
             None,
             10000,
+            None,
         );
 
         assert!(
@@ -332,6 +345,7 @@ mod tests {
             None,
             Some(42),
             10000,
+            None,
         );
 
         assert!(
@@ -374,6 +388,7 @@ mod tests {
             Some("2026-01-01' OR '1'='1"),
             Some(42),
             5000,
+            None,
         );
 
         // The single quotes in the value are doubled, so the literal stays intact.
@@ -411,6 +426,7 @@ mod tests {
             Some("2026-03-28 09:00:00"),
             Some(500),
             10000,
+            None,
         );
 
         assert_eq!(
@@ -429,6 +445,7 @@ mod tests {
             None,
             None,
             5000,
+            None,
         );
 
         assert_eq!(
@@ -447,6 +464,7 @@ mod tests {
             Some("2026-03-28 09:00:00"),
             Some(500),
             10000,
+            None,
         );
 
         assert_eq!(
@@ -469,6 +487,7 @@ mod tests {
             Some("2026-03-28 09:00:00"),
             Some(500),
             10000,
+            None,
         );
 
         assert!(sql.contains("`completed_at` = '2026-03-28 09:00:00'"));
@@ -593,6 +612,7 @@ mod tests {
             Some("2026-03-28 09:00:00"),
             Some(500),
             10000,
+            None,
         );
         assert!(sql_with_hwm.contains("WHERE `updated_at` IS NOT NULL AND"));
 
@@ -605,8 +625,82 @@ mod tests {
             None,
             None,
             10000,
+            None,
         );
         assert!(sql_without_hwm.contains("WHERE `updated_at` IS NOT NULL"));
+    }
+
+    // FA2: Stream B (two-stream update stream) caps the update window at the insert
+    // watermark so a row inserted past it isn't updated+re-appended across runs.
+    #[test]
+    fn incremental_query_with_key_upper_bound_caps_key() {
+        let sql = QueryBuilder::build_incremental_query(
+            "orders",
+            &["id".to_string()],
+            "updated_at",
+            "id",
+            Some("2026-03-28 09:00:00"),
+            Some(42),
+            10000,
+            Some(500),
+        );
+
+        assert!(
+            sql.contains("AND `id` <= 500"),
+            "expected key upper bound cap, got: {sql}"
+        );
+        let cap_pos = sql.find("AND `id` <= 500").unwrap();
+        let order_by_pos = sql.find("ORDER BY").unwrap();
+        assert!(
+            cap_pos < order_by_pos,
+            "cap clause must sit before ORDER BY, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn incremental_query_without_hwm_with_cap() {
+        let sql = QueryBuilder::build_incremental_query(
+            "orders",
+            &["id".to_string()],
+            "updated_at",
+            "id",
+            None,
+            None,
+            10000,
+            Some(500),
+        );
+
+        assert!(
+            sql.contains("WHERE `updated_at` IS NOT NULL AND `id` <= 500 ORDER BY"),
+            "expected cap directly after the NULL filter and before ORDER BY, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn incremental_query_none_cap_unchanged() {
+        let sql = QueryBuilder::build_incremental_query(
+            "orders",
+            &[
+                "id".to_string(),
+                "name".to_string(),
+                "updated_at".to_string(),
+            ],
+            "updated_at",
+            "id",
+            Some("2026-03-28 09:00:00"),
+            Some(500),
+            10000,
+            None,
+        );
+
+        assert!(
+            !sql.contains("<="),
+            "None cap must emit no upper-bound clause (byte-identical to pre-FA2), got: {sql}"
+        );
+        assert_eq!(
+            sql,
+            "SELECT `id`, `name`, `updated_at` FROM `orders` WHERE `updated_at` IS NOT NULL AND ((`updated_at` = '2026-03-28 09:00:00' AND `id` > 500) OR (`updated_at` > '2026-03-28 09:00:00')) ORDER BY `updated_at` ASC, `id` ASC LIMIT 10000"
+        );
     }
 
     #[test]

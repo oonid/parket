@@ -202,6 +202,9 @@ where
             let batch_size = self.extractor.batch_size();
             if self.progress { info!(table = table_name, after_hwm = ?update_hwm, "two-stream update: fetching chunk"); }
             let t_extract = Instant::now();
+            // FA2: cap the update window at the insert watermark so a row inserted past it
+            // isn't updated+re-appended across runs — a row with `insert_col > hwm_id` belongs
+            // to the next run's Stream A, which will capture its then-current state.
             let sql = QueryBuilder::build_incremental_query(
                 table_name,
                 columns,
@@ -210,6 +213,7 @@ where
                 update_hwm.as_ref().map(|h| h.updated_at.as_str()),
                 update_hwm.as_ref().map(|h| h.last_id),
                 batch_size,
+                hwm_id,
             );
             let extraction = self.extractor.extract(&sql)?;
             let truncated = extraction.truncated;
@@ -1412,5 +1416,125 @@ mod tests {
         let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
         let result = orch.run().await;
         assert!(matches!(result, ExitCode::Fatal), "sole table must fail: {result:?}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn two_stream_update_query_capped_at_insert_watermark() {
+        // FA2: Stream B's query must be capped at the insert watermark Stream A just
+        // established (`AND `id` <= <hwm>`), so a row inserted past it (belonging to the
+        // next run's insert stream) isn't updated+appended now and re-appended next run.
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_insert_cursor.insert("orders".to_string(), "id".to_string());
+        config.table_update_cursor.insert("orders".to_string(), "updated_at".to_string());
+
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| crate::state::AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(vec![]));
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        // No bootstrap seed: the update stream starts with no HWM at all, isolating the
+        // assertion to the insert-watermark cap rather than any HWM-derived clause.
+        schema_mock
+            .expect_max_timestamp()
+            .returning(|_, _| Ok(None));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        extract_mock
+            .expect_batch_size()
+            .returning(|| 10000);
+        writer_mock
+            .expect_ensure_table()
+            .returning(|_, _| Ok(()));
+        writer_mock
+            .expect_get_schema()
+            .returning(|_| Ok(None));
+        writer_mock
+            .expect_read_insert_hwm()
+            .returning(|_| Ok(None));
+        writer_mock
+            .expect_read_hwm()
+            .returning(|_| Ok(None));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        extract_mock
+            .expect_extract()
+            .returning(move |sql| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    // Stream A (insert stream): pages by `id` alone, no update-cursor cap
+                    // clause — this is the insert stream's own query, unaffected by FA2.
+                    assert!(
+                        !sql.contains("<="),
+                        "insert-stream query must carry no upper-bound cap, got: {sql}"
+                    );
+                    let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                        deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+                        deltalake::arrow::datatypes::Field::new("name", deltalake::arrow::datatypes::DataType::Utf8, false),
+                        deltalake::arrow::datatypes::Field::new(
+                            "updated_at",
+                            deltalake::arrow::datatypes::DataType::Timestamp(deltalake::arrow::datatypes::TimeUnit::Microsecond, None),
+                            false,
+                        ),
+                    ]));
+                    let batch = RecordBatch::try_new(
+                        schema,
+                        vec![
+                            Arc::new(deltalake::arrow::array::Int64Array::from(vec![1i64, 2i64, 3i64])),
+                            Arc::new(deltalake::arrow::array::StringArray::from(vec!["a", "b", "c"])),
+                            Arc::new(deltalake::arrow::array::TimestampMicrosecondArray::from(vec![
+                                1743158400000000i64,
+                                1743158400000000i64,
+                                1743158400000000i64,
+                            ])),
+                        ],
+                    )
+                    .unwrap();
+                    ok_batches(vec![batch])
+                } else if count == 1 {
+                    // Stream B (update stream): must be capped at the insert watermark
+                    // Stream A just established (max id 3), sitting right before ORDER BY.
+                    assert!(
+                        sql.contains("AND `id` <= 3"),
+                        "update-stream query must cap at the insert watermark, got: {sql}"
+                    );
+                    assert!(
+                        sql.contains("WHERE `updated_at` IS NOT NULL AND `id` <= 3 ORDER BY"),
+                        "cap must sit before ORDER BY with no stray HWM clause, got: {sql}"
+                    );
+                    ok_batches(vec![])
+                } else {
+                    ok_batches(vec![])
+                }
+            });
+
+        writer_mock
+            .expect_append_two_stream()
+            .times(1)
+            .returning(|_, _, _, _| Ok(()));
+        state_mock
+            .expect_update_table()
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success), "run must succeed: {result:?}");
+        assert_eq!(call_count.load(Ordering::SeqCst), 2, "expected exactly one insert-stream call and one update-stream call");
     }
 }
