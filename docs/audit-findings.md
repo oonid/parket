@@ -191,7 +191,7 @@ plan→implement→review remediation loop; none fixed yet.
   NULLs for every non-fitting value, exit 0. Directly undoes N5's discipline (`align_batches_to_schema`
   uses `CastOptions{safe:false}` and errors by table+column one step earlier). **Fix:** use
   `cast_with_options(.., {safe:false, ..})` in `coerce_batch_to_schema` (mirror `align_batches_to_schema`). **Resolved:** `coerce_batch_to_schema` now casts with `CastOptions{safe:false}` — a data-losing narrowing errors loud+actionable instead of NULLing; healthy full-refresh (identity/widening) unaffected (full 33-test Docker suite green); unit test covers widen-ok/narrow-errors.
-- **FA2** — **[Opus-verified] two-stream cross-window row duplication.** The update stream (Stream B,
+- **FA2** — **done** (`c6ea932`). [Opus-verified] two-stream cross-window row duplication. The update stream (Stream B,
   `orchestrator/two_stream.rs:199-267`) is bounded only by the UPDATE cursor — no upper bound on the insert
   key. A row `id=Y` inserted after Stream A's window (insert watermark `X`, `Y>X`) whose `update_col` lands
   in Stream B's window is appended by `delete_then_append` (delete finds nothing → append Y); the commit
@@ -200,7 +200,7 @@ plan→implement→review remediation loop; none fixed yet.
   (→ Clean), so it's invisible to the exit code and `--verify`. **Fix:** cap Stream B at the insert
   watermark (`AND {insert_col} <= {hwm_id}`) — rows beyond it belong to the next run's insert stream. (Do
   NOT advance the insert watermark past Stream B's max — that would lose not-yet-completed rows in `(X, maxB]`.)
-  Optionally make `two_stream_key_stats_outcome` treat `delta count > delta distinct` as a loud diagnostic.
+  Optionally make `two_stream_key_stats_outcome` treat `delta count > delta distinct` as a loud diagnostic. **Resolved:** `build_incremental_query` gained an optional `key_upper_bound`; Stream B now passes the insert watermark `hwm_id`, so a row inserted past it (belonging to the next run's Stream A) isn't updated+appended now and re-appended next run. Plain incremental passes `None` (byte-identical, verified). In a quiescent DB the cap excludes nothing (Stream A ends at source max) so no behavior change — the race isn't deterministically Docker-reproducible; proof is the query-cap unit tests + a mock test asserting Stream A is uncapped while Stream B carries `AND \`id\` <= <hwm>`. Full 36-test Docker suite green, no regression. (The `two_stream_key_stats_outcome` diagnostic tweak was left as an optional follow-up.)
 
 ### 7.3 Open — Medium
 - **FA3** — **done** (`878d051`). Full refresh never evolved the Delta schema (confirmed). `coerce_batch_to_schema` iterates only
