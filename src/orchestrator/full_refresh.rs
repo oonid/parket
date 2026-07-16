@@ -155,7 +155,7 @@ where
         // end. Nothing is visible to readers (the prior snapshot stays live) until the final
         // `commit_overwrite`, so an interruption anywhere in the loop below is a clean,
         // non-destructive abandonment of the staged files rather than a partial rewrite.
-        self.writer.begin_overwrite(table_name).await?;
+        self.writer.begin_overwrite(table_name, schema.clone()).await?;
         let mut staged_chunks: u64 = 0;
 
         if let Some(key_col) = key_col.as_deref() {
@@ -386,7 +386,7 @@ mod tests {
             });
         writer_mock
             .expect_begin_overwrite()
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
         writer_mock
             .expect_stage_overwrite_chunk()
             .returning(|_, _| Ok(()));
@@ -451,7 +451,7 @@ mod tests {
         // O2-r CP2: three chunks (2, 2, 1 rows) are all staged via stage_overwrite_chunk
         // (parquet written, not committed) and the whole rewrite becomes visible with a
         // single commit_overwrite at the end.
-        writer_mock.expect_begin_overwrite().times(1).returning(|_| Ok(()));
+        writer_mock.expect_begin_overwrite().times(1).returning(|_, _| Ok(()));
         writer_mock.expect_stage_overwrite_chunk().times(3).returning(|_, _| Ok(()));
         writer_mock.expect_commit_overwrite().times(1).returning(|_, _| Ok(()));
         state_mock.expect_update_table().returning(|_, _, _| Ok(()));
@@ -510,7 +510,7 @@ mod tests {
             }
         });
 
-        writer_mock.expect_begin_overwrite().times(1).returning(|_| Ok(()));
+        writer_mock.expect_begin_overwrite().times(1).returning(|_, _| Ok(()));
         writer_mock.expect_stage_overwrite_chunk().times(2).returning(|_, _| Ok(()));
         writer_mock.expect_commit_overwrite().times(1).returning(|_, _| Ok(()));
         state_mock.expect_update_table().returning(|_, _, _| Ok(()));
@@ -572,7 +572,7 @@ mod tests {
             }
         });
 
-        writer_mock.expect_begin_overwrite().times(1).returning(|_| Ok(()));
+        writer_mock.expect_begin_overwrite().times(1).returning(|_, _| Ok(()));
         writer_mock.expect_stage_overwrite_chunk().times(2).returning(|_, _| Ok(()));
         writer_mock.expect_commit_overwrite().times(1).returning(|_, _| Ok(()));
         state_mock.expect_update_table().returning(|_, _, _| Ok(()));
@@ -633,7 +633,7 @@ mod tests {
             }
         });
 
-        writer_mock.expect_begin_overwrite().times(1).returning(|_| Ok(()));
+        writer_mock.expect_begin_overwrite().times(1).returning(|_, _| Ok(()));
         writer_mock.expect_stage_overwrite_chunk().times(2).returning(|_, _| Ok(()));
         writer_mock.expect_commit_overwrite().times(1).returning(|_, _| Ok(()));
         state_mock.expect_update_table().returning(|_, _, _| Ok(()));
@@ -667,7 +667,7 @@ mod tests {
         // no expectations registered for either means any call into them would panic,
         // proving the table is left unchanged (matching the pre-CP2 behavior where an
         // empty chunk 0 never called overwrite_table).
-        writer_mock.expect_begin_overwrite().returning(|_| Ok(()));
+        writer_mock.expect_begin_overwrite().returning(|_, _| Ok(()));
         extract_mock.expect_extract().returning(|_| ok_batches(vec![]));
         state_mock.expect_update_table()
             .withf(|_, state, _| {
@@ -721,7 +721,7 @@ mod tests {
         // O2-r CP2: the first chunk stages fine; the second chunk's stage_overwrite_chunk
         // call fails — must propagate just like the old second-chunk append_batch failure
         // did, and commit_overwrite must never be reached.
-        writer_mock.expect_begin_overwrite().times(1).returning(|_| Ok(()));
+        writer_mock.expect_begin_overwrite().times(1).returning(|_, _| Ok(()));
         let stage_count = Arc::new(AtomicUsize::new(0));
         let stage_count_clone = stage_count.clone();
         writer_mock.expect_stage_overwrite_chunk().times(2).returning(move |_, _| {
@@ -850,7 +850,7 @@ mod tests {
             }
         });
 
-        writer_mock.expect_begin_overwrite().times(1).returning(|_| Ok(()));
+        writer_mock.expect_begin_overwrite().times(1).returning(|_, _| Ok(()));
         writer_mock.expect_stage_overwrite_chunk().times(1).returning(|_, _| Ok(()));
         // The whole point of O2-r: the previous snapshot must stay intact, so the final
         // commit must NEVER be reached when the run is interrupted mid-refresh.
@@ -902,7 +902,7 @@ mod tests {
         tx.send(true).unwrap();
 
         extract_mock.expect_batch_size().returning(|| 2);
-        writer_mock.expect_begin_overwrite().returning(|_| Ok(()));
+        writer_mock.expect_begin_overwrite().returning(|_, _| Ok(()));
 
         let mut orch = Orchestrator::new(
             config,
@@ -944,7 +944,7 @@ mod tests {
         let (_tx, rx) = watch::channel(false);
 
         extract_mock.expect_batch_size().returning(|| 5);
-        writer_mock.expect_begin_overwrite().returning(|_| Ok(()));
+        writer_mock.expect_begin_overwrite().returning(|_, _| Ok(()));
         extract_mock.expect_extract().returning(|_| {
             let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
                 deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
@@ -1038,7 +1038,7 @@ mod tests {
             }
         });
 
-        writer_mock.expect_begin_overwrite().times(1).returning(|_| Ok(()));
+        writer_mock.expect_begin_overwrite().times(1).returning(|_, _| Ok(()));
         writer_mock.expect_stage_overwrite_chunk().times(2).returning(|_, _| Ok(()));
         writer_mock.expect_commit_overwrite().times(1).returning(|_, _| Ok(()));
 

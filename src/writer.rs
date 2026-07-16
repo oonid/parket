@@ -8,7 +8,7 @@ use deltalake::arrow::array::{Int64Array, StringArray};
 use deltalake::arrow::datatypes::{DataType, Schema as ArrowSchema};
 use deltalake::arrow::record_batch::RecordBatch;
 use deltalake::DeltaTable;
-use deltalake::kernel::Action;
+use deltalake::kernel::{Action, MetadataExt, StructType};
 use deltalake::kernel::transaction::CommitBuilder;
 use deltalake::operations::write::SchemaMode;
 use deltalake::protocol::{DeltaOperation, SaveMode};
@@ -61,6 +61,11 @@ struct OverwriteSession {
     /// snapshot's file list (the Removes) and the log store.
     table: DeltaTable,
     adds: Vec<deltalake::kernel::Add>,
+    /// FA3: `Some(new_struct)` when `begin_overwrite` found the current source schema differs
+    /// from the table's stored Delta schema — `commit_overwrite` then folds a `Metadata` action
+    /// carrying `new_struct` into the same atomic commit, REPLACING the schema. `None` in the
+    /// common (unchanged-schema) case, where behavior is byte-identical to before FA3.
+    schema_change: Option<StructType>,
 }
 
 /// O2-r: coerce a batch to `RecordBatchWriter`'s exact target schema. Unlike the old
@@ -363,15 +368,48 @@ impl DeltaWriter {
         Ok(())
     }
 
-    /// O2-r CP1: start a staged-overwrite session for `table_name`. Loads the table's current
-    /// handle fresh and builds a `RecordBatchWriter` from its schema; the caller streams chunks
-    /// through `stage_overwrite_chunk` (parquet files written, nothing committed) and finishes
-    /// with `commit_overwrite` (one atomic commit swaps the whole snapshot). The table must
-    /// already exist (callers run `ensure_table` first, as full-refresh does today). Replaces
-    /// any stale session for this table (e.g. from a prior aborted run).
-    pub async fn begin_overwrite(&self, table_name: &str) -> Result<()> {
+    /// O2-r CP1 / FA3: start a staged-overwrite session for `table_name`. Loads the table's
+    /// current handle fresh, then decides what schema the staged `RecordBatchWriter` targets:
+    ///
+    /// A full refresh rewrites 100% of the data, so it SHOULD always adopt the CURRENT source
+    /// schema (`target_schema`) — a new source column appears, a dropped one disappears, and a
+    /// type widening is adopted, all atomically. `target_schema` is converted to Delta's
+    /// `StructType` and compared (in Delta type-space, so an N5 widening the table was already
+    /// created with doesn't look like a change) against the table's CURRENTLY STORED schema:
+    /// - unchanged: behavior is byte-identical to before FA3 — `RecordBatchWriter::for_table`
+    ///   (targets the table's existing schema), no `Metadata` action at commit.
+    /// - changed: the writer targets `target_schema` directly (`RecordBatchWriter::try_new`, not
+    ///   `for_table`), and `commit_overwrite` will fold a `Metadata` action replacing the Delta
+    ///   schema into the same atomic commit as the Remove/Add actions.
+    ///
+    /// The caller streams chunks through `stage_overwrite_chunk` (parquet files written, nothing
+    /// committed) and finishes with `commit_overwrite` (one atomic commit swaps the whole
+    /// snapshot). The table must already exist (callers run `ensure_table` first, as full-refresh
+    /// does today). Replaces any stale session for this table (e.g. from a prior aborted run).
+    pub async fn begin_overwrite(&self, table_name: &str, target_schema: SchemaRef) -> Result<()> {
         let table = self.open_table(table_name).await?;
-        let writer = RecordBatchWriter::for_table(&table)?;
+
+        let target_struct = arrow_schema_to_delta(&target_schema)?;
+        let current_struct = table.snapshot()?.schema().as_ref().clone();
+        let schema_changed = target_struct != current_struct;
+
+        let (writer, schema_change) = if schema_changed {
+            let url = self.table_url(table_name)?;
+            let w = RecordBatchWriter::try_new(
+                url.as_str(),
+                target_schema.clone(),
+                None,
+                Some(self.storage_options.clone()),
+            )?;
+            info!(
+                table = table_name,
+                "begin_overwrite: source schema differs from the stored Delta schema — this \
+                 overwrite will REPLACE the schema (FA3)"
+            );
+            (w, Some(target_struct))
+        } else {
+            (RecordBatchWriter::for_table(&table)?, None)
+        };
 
         self.overwrite_sessions.lock().await.insert(
             table_name.to_string(),
@@ -379,6 +417,7 @@ impl DeltaWriter {
                 writer,
                 table,
                 adds: Vec::new(),
+                schema_change,
             },
         );
 
@@ -437,7 +476,7 @@ impl DeltaWriter {
                 )
             })?
         };
-        let OverwriteSession { table, adds, .. } = session;
+        let OverwriteSession { table, adds, schema_change, .. } = session;
 
         // Current file list, synchronously from the already-loaded (eager) snapshot — no new
         // I/O and no async stream needed. Every current file becomes a Remove; on a brand-new
@@ -449,6 +488,23 @@ impl DeltaWriter {
             .map(|file_view| Action::Remove(file_view.remove_action(true)))
             .collect();
         let removed_files = actions.len();
+
+        // FA3: when `begin_overwrite` found the source schema differs from the table's stored
+        // schema, fold a `Metadata` action (carrying the new schema) into this SAME atomic
+        // commit, right alongside the Remove/Add actions below — this is the same bundling
+        // delta-rs's own `table.write()` uses for `SchemaMode::Overwrite` (Metadata + Add/Remove
+        // in one commit), so the schema replacement and the data rewrite land atomically together.
+        let schema_replaced = schema_change.is_some();
+        if let Some(new_struct) = &schema_change {
+            let current_meta = snapshot.metadata().clone();
+            let new_meta = current_meta.with_schema(new_struct).map_err(|e| {
+                anyhow::anyhow!(
+                    "commit_overwrite: failed to build Metadata with the new schema: {e}"
+                )
+            })?;
+            actions.push(Action::Metadata(new_meta));
+        }
+
         let added_files = adds.len();
         actions.extend(adds.into_iter().map(Action::Add));
 
@@ -476,6 +532,7 @@ impl DeltaWriter {
             version = finalized.version(),
             files_removed = removed_files,
             files_added = added_files,
+            schema_replaced,
             hwm_updated_at = ?hwm.as_ref().map(|h| h.updated_at.as_str()),
             hwm_last_id = ?hwm.as_ref().map(|h| h.last_id),
             "commit_overwrite: atomic overwrite committed (single commit swaps entire snapshot)"
@@ -1101,7 +1158,7 @@ mod tests {
         let version_before = writer.open_table("t").await.unwrap().version().unwrap();
 
         // Stage two chunks (ids 10,11 then 12,13) without ever committing per-chunk.
-        writer.begin_overwrite("t").await.unwrap();
+        writer.begin_overwrite("t", schema.clone()).await.unwrap();
         let chunk1 = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -1156,6 +1213,160 @@ mod tests {
         assert_eq!(ids, vec![10, 11, 12, 13]);
     }
 
+    /// FA3: a full refresh must ADOPT the current source schema, not stay frozen at
+    /// table-creation time — a NEW source column must appear in the Delta schema (not be
+    /// silently dropped) after `begin_overwrite` is given a WIDER target schema, with its
+    /// values present via a single atomic commit that folds in a `Metadata` action.
+    #[tokio::test]
+    async fn atomic_overwrite_adopts_new_column_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("val", DataType::Utf8, true),
+        ]));
+        writer.ensure_table("t", schema.clone()).await.unwrap();
+
+        let seed = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2i64])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+        writer.overwrite_table("t", vec![seed], None).await.unwrap();
+
+        // The current SOURCE schema now has a new `extra` column the Delta table (created
+        // above) doesn't have yet — the exact FA3 scenario.
+        let new_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("val", DataType::Utf8, true),
+            Field::new("extra", DataType::Int64, true),
+        ]));
+
+        writer.begin_overwrite("t", new_schema.clone()).await.unwrap();
+        let chunk = RecordBatch::try_new(
+            new_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![10i64, 11i64])),
+                Arc::new(StringArray::from(vec!["x", "y"])),
+                Arc::new(Int64Array::from(vec![100i64, 101i64])),
+            ],
+        )
+        .unwrap();
+        writer.stage_overwrite_chunk("t", vec![chunk]).await.unwrap();
+        writer.commit_overwrite("t", None).await.unwrap();
+
+        // Fresh-load (bypassing any cache) and verify the Delta schema now HAS `extra`.
+        let table = writer.open_table("t").await.unwrap();
+        let field_names: Vec<String> = table
+            .snapshot()
+            .unwrap()
+            .schema()
+            .fields()
+            .map(|f| f.name().clone())
+            .collect();
+        assert!(
+            field_names.contains(&"extra".to_string()),
+            "the Delta schema must adopt the new source column `extra`, got: {field_names:?}"
+        );
+
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        let provider = table.table_provider().await.unwrap();
+        ctx.register_table("t", provider).unwrap();
+        let batches = ctx
+            .sql("SELECT id, extra FROM t ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2, "old rows must be replaced by the 2 newly staged rows");
+        let extras: Vec<i64> = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        assert_eq!(extras, vec![100, 101], "the new column's values must round-trip");
+    }
+
+    /// FA3: the common (unchanged-schema) case must remain behaviorally identical to before —
+    /// `begin_overwrite` given the SAME schema the table already has takes the `for_table`
+    /// path (no `Metadata` action folded into the commit), and the overwrite still works.
+    #[tokio::test]
+    async fn atomic_overwrite_unchanged_schema_no_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("val", DataType::Utf8, true),
+        ]));
+        writer.ensure_table("t", schema.clone()).await.unwrap();
+
+        let seed = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2i64, 3i64])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+        writer.overwrite_table("t", vec![seed], None).await.unwrap();
+        let version_before = writer.open_table("t").await.unwrap().version().unwrap();
+
+        // begin_overwrite with the SAME schema the table already has — must take the
+        // for_table/no-Metadata path, exactly like before FA3.
+        writer.begin_overwrite("t", schema.clone()).await.unwrap();
+        let chunk = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![10i64])),
+                Arc::new(StringArray::from(vec!["z"])),
+            ],
+        )
+        .unwrap();
+        writer.stage_overwrite_chunk("t", vec![chunk]).await.unwrap();
+        writer.commit_overwrite("t", None).await.unwrap();
+
+        let table = writer.open_table("t").await.unwrap();
+        assert_eq!(
+            table.version().unwrap(),
+            version_before + 1,
+            "an unchanged-schema overwrite must still be a single atomic commit"
+        );
+        let field_names: Vec<String> = table
+            .snapshot()
+            .unwrap()
+            .schema()
+            .fields()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(
+            field_names,
+            vec!["id".to_string(), "val".to_string()],
+            "the schema must be unchanged when the source schema didn't change"
+        );
+
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        let provider = table.table_provider().await.unwrap();
+        ctx.register_table("t", provider).unwrap();
+        let batches = ctx
+            .sql("SELECT id FROM t ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 1, "old rows [1,2,3] must be gone; only the new row remains");
+    }
+
     #[tokio::test]
     async fn atomic_overwrite_coerces_non_nullable_source_batch() {
         // O2-r regression: a NOT NULL source column arrives as a NON-nullable Arrow field, but the
@@ -1170,9 +1381,9 @@ mod tests {
             Field::new("id", DataType::Int64, true),
             Field::new("val", DataType::Utf8, true),
         ]));
-        writer.ensure_table("t", table_schema).await.unwrap();
+        writer.ensure_table("t", table_schema.clone()).await.unwrap();
 
-        writer.begin_overwrite("t").await.unwrap();
+        writer.begin_overwrite("t", table_schema).await.unwrap();
         // Batch built with a NON-nullable schema, as a NOT NULL source column would produce.
         let non_nullable_schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -1273,7 +1484,7 @@ mod tests {
         let version_before = writer.open_table("t").await.unwrap().version().unwrap();
 
         // Begin + stage, but NEVER commit — simulates an interruption mid-rewrite.
-        writer.begin_overwrite("t").await.unwrap();
+        writer.begin_overwrite("t", schema.clone()).await.unwrap();
         let chunk = RecordBatch::try_new(
             schema,
             vec![

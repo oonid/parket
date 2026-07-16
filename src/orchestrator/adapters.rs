@@ -177,8 +177,8 @@ impl DeltaWrite for DeltaWriterAdapter {
             .await
     }
 
-    async fn begin_overwrite(&self, table_name: &str) -> Result<()> {
-        self.inner.begin_overwrite(table_name).await
+    async fn begin_overwrite(&self, table_name: &str, target_schema: SchemaRef) -> Result<()> {
+        self.inner.begin_overwrite(table_name, target_schema).await
     }
 
     async fn stage_overwrite_chunk(
@@ -300,8 +300,8 @@ impl DeltaWrite for LocalDeltaWriterAdapter {
             .await
     }
 
-    async fn begin_overwrite(&self, table_name: &str) -> Result<()> {
-        self.inner.begin_overwrite(table_name).await
+    async fn begin_overwrite(&self, table_name: &str, target_schema: SchemaRef) -> Result<()> {
+        self.inner.begin_overwrite(table_name, target_schema).await
     }
 
     async fn stage_overwrite_chunk(

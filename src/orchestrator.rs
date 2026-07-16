@@ -63,8 +63,12 @@ pub trait DeltaWrite: Send + Sync {
         batches: Vec<deltalake::arrow::record_batch::RecordBatch>,
         hwm: Option<Hwm>,
     ) -> Result<()>;
-    /// O2-r CP2: start a staged-overwrite session for `table_name` (see `DeltaWriter::begin_overwrite`).
-    async fn begin_overwrite(&self, table_name: &str) -> Result<()>;
+    /// O2-r CP2 / FA3: start a staged-overwrite session for `table_name`, targeting the CURRENT
+    /// source schema `target_schema` (see `DeltaWriter::begin_overwrite`) — a full refresh
+    /// rewrites 100% of the data, so it adopts the current source schema (new columns appear,
+    /// dropped columns disappear, type widenings adopted) via a `Metadata` action folded into
+    /// the final atomic commit when the source schema differs from the table's stored schema.
+    async fn begin_overwrite(&self, table_name: &str, target_schema: SchemaRef) -> Result<()>;
     /// O2-r CP2: write one chunk to parquet WITHOUT committing (see `DeltaWriter::stage_overwrite_chunk`).
     async fn stage_overwrite_chunk(
         &self,
@@ -1106,7 +1110,7 @@ mod tests {
         // now surfaces (the old chunk-0 overwrite_table is gone).
         writer_mock
             .expect_begin_overwrite()
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
         writer_mock
             .expect_stage_overwrite_chunk()
             .times(1)
@@ -1433,7 +1437,7 @@ mod tests {
         writer_mock.expect_get_schema().returning(|_| Ok(None));
         // O2-r CP2: begin_overwrite now runs unconditionally right before the extraction
         // loop, before the shutdown check inside the loop is ever reached.
-        writer_mock.expect_begin_overwrite().returning(|_| Ok(()));
+        writer_mock.expect_begin_overwrite().returning(|_, _| Ok(()));
 
         state_mock
             .expect_update_table()

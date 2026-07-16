@@ -568,6 +568,280 @@ async fn full_refresh_pk_less_ci_collation_extracts_all_rows_once() {
     );
 }
 
+/// Delta schema field names, in order, for a table (fresh-loaded, bypassing any cache).
+async fn delta_field_names(env: &TestEnv, table_name: &str) -> Vec<String> {
+    let mut table = env.open_delta_table(table_name).await;
+    table.load().await.expect("failed to load delta table");
+    let kernel_schema = table.snapshot().unwrap().schema();
+    let arrow_schema: deltalake::arrow::datatypes::Schema =
+        deltalake::kernel::engine::arrow_conversion::TryIntoArrow::try_into_arrow(
+            kernel_schema.as_ref(),
+        )
+        .expect("failed to convert schema");
+    arrow_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect()
+}
+
+/// FA3: a full refresh rewrites 100% of the data every run, so it must ADOPT the current
+/// source schema instead of staying frozen at table-creation time — a NEW source column added
+/// via `ALTER TABLE ... ADD COLUMN` between two runs must appear in the Delta schema (not be
+/// silently dropped, which was the pre-FA3 bug) with its values present after the second run.
+#[tokio::test]
+#[serial_test::serial]
+async fn full_refresh_adopts_added_source_column() {
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let env = TestEnv::new(vec!["products"]).await;
+
+    sqlx::query(
+        "CREATE TABLE products (\
+            sku VARCHAR(50) PRIMARY KEY, \
+            description TEXT, \
+            price DOUBLE\
+        )"
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create products table");
+
+    sqlx::query(
+        "INSERT INTO products (sku, description, price) VALUES \
+            ('W-001', 'Widget', 9.99), \
+            ('G-001', 'Gadget', 19.99)"
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert products");
+
+    let mut orchestrator_run1 = env.make_orchestrator();
+    let exit_code_run1 = orchestrator_run1.run().await;
+    assert!(
+        matches!(exit_code_run1, ExitCode::Success),
+        "run 1: expected Success, got {exit_code_run1:?}"
+    );
+    assert_eq!(count_delta_rows(&env, "products").await, 2, "run 1: expected 2 rows");
+    let field_names_run1 = delta_field_names(&env, "products").await;
+    assert!(
+        !field_names_run1.contains(&"weight".to_string()),
+        "run 1: Delta schema should not contain 'weight' yet, got {field_names_run1:?}"
+    );
+
+    // The source gains a column between runs — the exact FA3 scenario a full refresh must
+    // adopt, since it rewrites every row every run anyway.
+    sqlx::query("ALTER TABLE products ADD COLUMN weight DOUBLE")
+        .execute(&env.pool)
+        .await
+        .expect("failed to add weight column");
+    sqlx::query("UPDATE products SET weight = 1.5 WHERE sku = 'W-001'")
+        .execute(&env.pool)
+        .await
+        .expect("failed to set weight for W-001");
+    sqlx::query("UPDATE products SET weight = 2.5 WHERE sku = 'G-001'")
+        .execute(&env.pool)
+        .await
+        .expect("failed to set weight for G-001");
+
+    let mut orchestrator_run2 = env.make_orchestrator();
+    let exit_code_run2 = orchestrator_run2.run().await;
+    assert!(
+        matches!(exit_code_run2, ExitCode::Success),
+        "run 2: expected Success (schema adopted via a Metadata action), got {exit_code_run2:?}"
+    );
+
+    // Still 2 rows: a full refresh REPLACES, it does not grow, the table.
+    assert_eq!(count_delta_rows(&env, "products").await, 2, "run 2: expected 2 rows (replaced, not appended)");
+
+    let field_names_run2 = delta_field_names(&env, "products").await;
+    assert!(
+        field_names_run2.contains(&"weight".to_string()),
+        "run 2: Delta schema must now contain 'weight' (FA3 schema adoption), got {field_names_run2:?}"
+    );
+
+    assert_eq!(
+        count_matching(&env, "products", "sku = 'W-001' AND weight = 1.5").await,
+        1,
+        "W-001's weight must round-trip as 1.5"
+    );
+    assert_eq!(
+        count_matching(&env, "products", "sku = 'G-001' AND weight = 2.5").await,
+        1,
+        "G-001's weight must round-trip as 2.5"
+    );
+}
+
+/// FA3 + FA1 interaction: a column whose SOURCE type widens across a Delta type boundary
+/// (MariaDB INT -> BIGINT, i.e. Delta INTEGER -> LONG) between two full-refresh runs, now
+/// holding a value that would NOT fit the OLD Delta INTEGER column (out of i32 range). Before
+/// FA3, `begin_overwrite` targeted the table's OLD (frozen) schema, so CP1's `safe:false` cast
+/// would ERROR loudly on this value (a data-losing narrowing). After FA3, the schema is
+/// adopted (Metadata action replaces INTEGER with LONG in the same atomic commit as the
+/// rewrite), so the cast is an identity/no-op and the value round-trips correctly.
+#[tokio::test]
+#[serial_test::serial]
+async fn full_refresh_adopts_widened_source_column() {
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let env = TestEnv::new(vec!["widen_probe"]).await;
+
+    sqlx::query("CREATE TABLE widen_probe (id BIGINT PRIMARY KEY, qty INT NOT NULL)")
+        .execute(&env.pool)
+        .await
+        .expect("failed to create widen_probe table");
+
+    sqlx::query("INSERT INTO widen_probe (id, qty) VALUES (1, 100), (2, 200)")
+        .execute(&env.pool)
+        .await
+        .expect("failed to insert widen_probe rows");
+
+    let mut orchestrator_run1 = env.make_orchestrator();
+    let exit_code_run1 = orchestrator_run1.run().await;
+    assert!(
+        matches!(exit_code_run1, ExitCode::Success),
+        "run 1: expected Success, got {exit_code_run1:?}"
+    );
+
+    let mut table = env.open_delta_table("widen_probe").await;
+    table.load().await.expect("failed to load delta table after run 1");
+    let kernel_schema = table.snapshot().unwrap().schema();
+    let arrow_schema: deltalake::arrow::datatypes::Schema =
+        deltalake::kernel::engine::arrow_conversion::TryIntoArrow::try_into_arrow(
+            kernel_schema.as_ref(),
+        )
+        .expect("failed to convert schema");
+    assert_eq!(
+        arrow_schema.field_with_name("qty").unwrap().data_type(),
+        &deltalake::arrow::datatypes::DataType::Int32,
+        "run 1: qty (MariaDB INT) must be Delta INTEGER (Arrow Int32)"
+    );
+
+    // The source column widens across a Delta type boundary, and a new row carries a value
+    // that overflows the OLD Delta INTEGER column (> i32::MAX).
+    sqlx::query("ALTER TABLE widen_probe MODIFY COLUMN qty BIGINT NOT NULL")
+        .execute(&env.pool)
+        .await
+        .expect("failed to widen qty to BIGINT");
+    sqlx::query("INSERT INTO widen_probe (id, qty) VALUES (3, 5000000000)")
+        .execute(&env.pool)
+        .await
+        .expect("failed to insert the widened-range row");
+
+    let mut orchestrator_run2 = env.make_orchestrator();
+    let exit_code_run2 = orchestrator_run2.run().await;
+    assert!(
+        matches!(exit_code_run2, ExitCode::Success),
+        "run 2: expected Success (schema adopted, not the FA1 narrowing error), got {exit_code_run2:?}"
+    );
+
+    let mut table2 = env.open_delta_table("widen_probe").await;
+    table2.load().await.expect("failed to load delta table after run 2");
+    let kernel_schema2 = table2.snapshot().unwrap().schema();
+    let arrow_schema2: deltalake::arrow::datatypes::Schema =
+        deltalake::kernel::engine::arrow_conversion::TryIntoArrow::try_into_arrow(
+            kernel_schema2.as_ref(),
+        )
+        .expect("failed to convert schema");
+    assert_eq!(
+        arrow_schema2.field_with_name("qty").unwrap().data_type(),
+        &deltalake::arrow::datatypes::DataType::Int64,
+        "run 2: qty must now be Delta LONG (Arrow Int64) after the widen"
+    );
+
+    assert_eq!(count_delta_rows(&env, "widen_probe").await, 3, "run 2: expected all 3 rows");
+    assert_eq!(
+        count_matching(&env, "widen_probe", "id = 3 AND qty = 5000000000").await,
+        1,
+        "the out-of-i32-range value must round-trip exactly, not error or truncate"
+    );
+    assert_eq!(
+        count_matching(&env, "widen_probe", "id = 1 AND qty = 100").await,
+        1,
+        "pre-existing rows must still read back correctly under the new (widened) schema"
+    );
+}
+
+/// FA3: a source column DROPPED between two full-refresh runs must disappear from the Delta
+/// schema (adopted, not left stale) — the pre-FA3 code would instead error every run trying to
+/// write under a schema that still expected the dropped column.
+#[tokio::test]
+#[serial_test::serial]
+async fn full_refresh_adopts_dropped_source_column() {
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let env = TestEnv::new(vec!["drop_probe"]).await;
+
+    sqlx::query(
+        "CREATE TABLE drop_probe (\
+            id BIGINT PRIMARY KEY, \
+            keep_me VARCHAR(50) NOT NULL, \
+            drop_me VARCHAR(50) NOT NULL\
+        )"
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create drop_probe table");
+
+    sqlx::query(
+        "INSERT INTO drop_probe (id, keep_me, drop_me) VALUES \
+            (1, 'alpha', 'will-vanish'), \
+            (2, 'beta', 'will-vanish-too')"
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert drop_probe rows");
+
+    let mut orchestrator_run1 = env.make_orchestrator();
+    let exit_code_run1 = orchestrator_run1.run().await;
+    assert!(
+        matches!(exit_code_run1, ExitCode::Success),
+        "run 1: expected Success, got {exit_code_run1:?}"
+    );
+    let field_names_run1 = delta_field_names(&env, "drop_probe").await;
+    assert!(
+        field_names_run1.contains(&"drop_me".to_string()),
+        "run 1: Delta schema must contain 'drop_me', got {field_names_run1:?}"
+    );
+
+    sqlx::query("ALTER TABLE drop_probe DROP COLUMN drop_me")
+        .execute(&env.pool)
+        .await
+        .expect("failed to drop drop_me column");
+
+    let mut orchestrator_run2 = env.make_orchestrator();
+    let exit_code_run2 = orchestrator_run2.run().await;
+    assert!(
+        matches!(exit_code_run2, ExitCode::Success),
+        "run 2: expected Success (dropped column adopted), got {exit_code_run2:?}"
+    );
+
+    let field_names_run2 = delta_field_names(&env, "drop_probe").await;
+    assert!(
+        !field_names_run2.contains(&"drop_me".to_string()),
+        "run 2: Delta schema must no longer contain 'drop_me', got {field_names_run2:?}"
+    );
+    assert!(
+        field_names_run2.contains(&"keep_me".to_string()),
+        "run 2: Delta schema must still contain 'keep_me', got {field_names_run2:?}"
+    );
+    assert_eq!(count_delta_rows(&env, "drop_probe").await, 2, "run 2: expected both rows still present");
+    assert_eq!(
+        count_matching(&env, "drop_probe", "keep_me = 'alpha'").await,
+        1,
+        "surviving column's values must round-trip"
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn incremental_extraction_creates_delta_table_with_hwm() {
