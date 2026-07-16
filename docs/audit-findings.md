@@ -151,10 +151,10 @@ design (see `docs/verify-checks.md`).
 - **N1-u** — upstream follow-up: connector_arrow `create_field` `todo!()` → proper `ConnectorError` (offered in PR #79's description; unreachable from parket since `ee09a7f`).
 - **N1-r2** — the allowlist↔mapping sync test proves allowlist ⊆ mapping + spot-checks known-excluded types; a NEW mapping arm added without allowlisting would be silently skipped (soft failure), not caught. Also: a source column ALTERed from an extractable to a non-extractable type yields a misleading "exists in Delta but not in MariaDB" evolution message (safe bail, wrong wording).
 - **L1** calendar: O(|years|) loop + `i64` overflow near extremes (`calendar.rs:7-19`).
-- **L2** negative pre-1970 timestamps: truncating vs euclid division mismatch in rendering (`writer/datetime.rs:62-82`).
-- **L4** dedup `ROW_NUMBER … ORDER BY key` keeps an arbitrary duplicate (order by version DESC).
-- **L5** index-hint check hardcodes `updated_at` (`discovery.rs:121-136`).
-- **L6** `extract_hwm_from_batch` builds three O(n) transient Vecs for a single max.
+- **L2** — **already resolved** (verified 2026-07-16): `format_naive_datetime` (`writer/datetime.rs:85-86`) uses `div_euclid`/`rem_euclid`, the correct negative-timestamp handling — the truncating-vs-euclid mismatch was fixed (stale register entry).
+- **L4** — DEFERRED (Low, marginal): dedup `ROW_NUMBER … ORDER BY key` keeps an arbitrary row among same-key dupes; a within-window PK appears once so this is near-unreachable, and 'order by version DESC' needs a version column the batch may not have.
+- **L5** — **done** (`86a16f3`): removed the dead `check_updated_at_index` method (no callers — the index-hint feature was never wired up), eliminating the hardcoded `updated_at`.
+- **L6** — **done** (`7d186cc`): `extract_hwm_from_batch` folds to the max in one pass over the zipped vectors (removed the transient `candidates` Vec); behavior-preserving.
 - **L7** `read_hwm` reads only the latest commit — a later non-HWM commit (OPTIMIZE etc.) shadows a real HWM.
 - **O13** cosmetics: `inspect` prints PRIMARY without checking `key == "PRI"`; `state.json` path cwd-relative; second-signal exit(130) flushes nothing; VA6 `latest_key_stats` unscoped (V7 key path).
 
@@ -239,28 +239,28 @@ plan→implement→review remediation loop; none fixed yet.
   `UPDATE_STRATEGY=merge`) with a mixed-case `userId` + reserved-word column; full 38-test suite green.
 
 ### 7.4 Open — Low
-- **FA6** — adaptive batch sizing runs once per PROCESS not per table: `BatchExtractor.adapted`
+- **FA6** — **done** (`7d186cc`): `calculate_batch_size` resets the `adapted` latch per table so tables 2..N re-adapt. Was: `BatchExtractor.adapted`
   (`extractor.rs:20,149-151`) latches on the first non-empty batch ever and never resets, so tables 2..N
   keep a mis-sized LIMIT (repeated breaker truncations). **Fix:** reset `adapted=false` in
   `calculate_batch_size` (called once per table).
-- **FA7** — `extract_id_as_i64` (`writer/hwm.rs:123-152`) ignores NULL validity → a NULL key slot reads as
+- **FA7** — **done** (`7d186cc`): `extract_id_as_i64` returns `None` on any NULL key slot (fast `null_count()` check) instead of reading 0. Was: ignored NULL validity → a NULL key slot reads as
   0. Reachable only for a nullable fallback `id` key (explicit `TABLE_MODE=incremental`, no integer PK):
   yields `last_id: 0`, re-extracting rows at the max timestamp → duplicates. **Fix:** skip null slots / return None on null.
-- **FA8** — `delete_then_append` UInt64 key collection uses wrapping `as i64` (`writer/two_stream.rs:328-333`).
+- **FA8** — **done** (`7d186cc`): `delete_then_append`'s UInt64 key collection uses checked `i64::try_from` (bails on >i64::MAX) instead of wrapping `as i64`. (`writer/two_stream.rs:328-333`).
   Unreachable from the orchestrator (`align_batches_to_schema` errors on >i64::MAX first) but a public-API
   hazard and inconsistent with `extract_id_as_i64`/`extract_batch_max_key`. **Fix:** `i64::try_from` with an error.
-- **FA9** — undocumented/unvalidated env knobs read deep in the write path: `UPDATE_STRATEGY`
+- **FA9** — **done** (`86a16f3`): `Config::load`/`load_local` now bail on an unrecognized `UPDATE_STRATEGY` / non-numeric `MERGE_SORT_RESERVATION_MB` / non-positive `MERGE_TARGET_PARTITIONS` (validate_advanced_env_knobs) — a typo is loud at startup instead of silently ignored. Was: `UPDATE_STRATEGY`
   (`orchestrator/two_stream.rs:251`, exact-match `"merge"` — a typo silently selects the default);
   `MERGE_SORT_RESERVATION_MB`/`MERGE_TARGET_PARTITIONS` (`writer/two_stream.rs:97-116`, unparseable silently
   ignored). Bypass `Config` entirely (invisible to `--check`). **Fix:** parse/validate in `Config::load`, thread through.
-- **FA10** — `max_timestamp`/`count_null` (`discovery.rs:160,174`) interpolate identifiers WITHOUT the S2
+- **FA10** — **done** (`86a16f3`): `max_timestamp`/`count_null` route identifiers through `query::backtick` (S2 doubling on the extraction path). Was: interpolated WITHOUT the S2
   backtick-doubling — on the EXTRACTION path S2 claimed done (vs the verify path S2-r defers). Robustness
   (schema/config-derived names), not injection. **Fix:** route through a shared `backtick()` helper.
-- **FA11** — a failed full refresh leaves its `OverwriteSession` (RecordBatchWriter buffers + accumulated Add
+- **FA11** — DEFERRED (documented): a failed full refresh leaves its `OverwriteSession` (RecordBatchWriter buffers + accumulated Add
   metadata + table handle) resident until process exit (`writer.rs:112,356-371`; failure paths in
   `orchestrator/full_refresh.rs` never drain it). Bounded by table count; modest unaccounted retention.
   **Fix:** an `abort_overwrite(table)` on the table-failure path (also the natural spot for the vacuum-hint log).
-- **FA12** — cosmetic/latent: `writer/schema.rs:28` maps `UInt32→INTEGER` (range-lossy; currently unreachable
+- **FA12** — **done** (`86a16f3`): (a) `UInt32→LONG` not INTEGER (defense-in-depth; was unreachable but a real type hole); (b) `--inspect` now checks for any single-column integer PK (`select_integer_pk`) so a non-`id`-PK table gets an incremental recommendation, not a misleading full_refresh; (c) an interrupted full refresh reports 0 committed rows (nothing was committed). Original: `writer/schema.rs:28` mapped `UInt32→INTEGER` (range-lossy; currently unreachable
   — unsigned is widened first — but a defense-in-depth hole, map `→LONG`); `inspect.rs:78-79` still
   recommends full_refresh on "No `id` column" pre-dating N3-r's integer-PK generalization (O13-adjacent); an
   interrupted full refresh records the *staged* (uncommitted) row count in `state.json last_run_rows` (mildly misleading).
