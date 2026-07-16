@@ -5,6 +5,7 @@ use sqlx::MySqlPool;
 
 use crate::config::Config;
 use crate::config::ExtractionMode;
+use crate::query::backtick;
 
 /// Common timestamp cursor column names, in priority order. Used to auto-detect an
 /// incremental HWM cursor when no `TABLE_TIMESTAMP_<table>` override is configured.
@@ -157,7 +158,11 @@ impl SchemaInspector {
     /// MAX of a timestamp/datetime column as a string (CAST to CHAR so it comes back
     /// as text regardless of sqlx type mapping). None if the table is empty / all NULL.
     pub async fn max_timestamp(&self, table: &str, col: &str) -> Result<Option<String>> {
-        let sql = format!("SELECT CAST(MAX(`{col}`) AS CHAR) AS m FROM `{table}`");
+        // FA10/S2: route through `backtick` (doubles an embedded backtick) rather than raw
+        // interpolation, matching the S2 hardening already applied on the extraction path.
+        let qt = backtick(table);
+        let qc = backtick(col);
+        let sql = format!("SELECT CAST(MAX({qc}) AS CHAR) AS m FROM {qt}");
         let row: Option<(Option<String>,)> = sqlx::query_as(&sql)
             .fetch_optional(&self.pool)
             .await
@@ -171,29 +176,16 @@ impl SchemaInspector {
     /// and warns about them once per run instead of dropping them invisibly. `col` is
     /// backtick-quoted; this is only ever called with a discovered/validated cursor column.
     pub async fn count_null(&self, table: &str, col: &str) -> Result<i64> {
-        let sql = format!("SELECT COUNT(*) FROM `{table}` WHERE `{col}` IS NULL");
+        // FA10/S2: route through `backtick` (doubles an embedded backtick) rather than raw
+        // interpolation, matching the S2 hardening already applied on the extraction path.
+        let qt = backtick(table);
+        let qc = backtick(col);
+        let sql = format!("SELECT COUNT(*) FROM {qt} WHERE {qc} IS NULL");
         let row: (i64,) = sqlx::query_as(&sql)
             .fetch_one(&self.pool)
             .await
             .with_context(|| format!("failed to count NULL `{col}` rows for table {table}"))?;
         Ok(row.0)
-    }
-
-    pub async fn check_updated_at_index(&self, table: &str) -> Result<bool> {
-        let row: Option<(i64,)> = sqlx::query_as(
-            "SELECT COUNT(*) FROM information_schema.statistics WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = 'updated_at'"
-        )
-        .bind(&self.database)
-        .bind(table)
-        .fetch_optional(&self.pool)
-        .await
-        .with_context(|| format!("failed to query index info for table {table}"))?;
-
-        let count = row.map(|(c,)| c).unwrap_or(0);
-        if count == 0 {
-            warn!("table {table} has no index on updated_at — incremental queries may be slow");
-        }
-        Ok(count > 0)
     }
 
     pub async fn describe_columns(&self, table: &str) -> Result<Vec<ColumnDescribe>> {

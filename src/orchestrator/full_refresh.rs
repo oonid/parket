@@ -314,11 +314,18 @@ where
         // An empty source must leave the table unchanged (matching the pre-CP2 behavior, where
         // chunk 0 being empty meant `overwrite_table` was never called); on shutdown, skipping
         // the commit is exactly what leaves the prior snapshot intact.
-        if !self.check_shutdown() && staged_chunks > 0 {
+        let shutdown = self.check_shutdown();
+        if !shutdown && staged_chunks > 0 {
             self.writer.commit_overwrite(table_name, None).await?;
         }
 
-        Ok(total_rows)
+        // FA12c: `total_rows` only ever counts STAGED rows (parquet written, not yet visible).
+        // On the shutdown path above, nothing was committed — the atomic overwrite never ran —
+        // so reporting `total_rows` here would land a nonzero `last_run_rows` in state.json for
+        // an "interrupted" record even though zero rows actually made it into the table. Report
+        // 0 committed rows on that path; the normal (committed, or genuinely-empty-source) path
+        // still reports the real row count.
+        Ok(if shutdown { 0 } else { total_rows })
     }
 }
 
@@ -856,12 +863,16 @@ mod tests {
         // commit must NEVER be reached when the run is interrupted mid-refresh.
         writer_mock.expect_commit_overwrite().times(0);
 
+        // FA12c: nothing is committed on this interrupted path (the final commit_overwrite
+        // above is never reached), so the reported row count must be 0, not the staged
+        // (uncommitted) count — reporting a nonzero count here would misleadingly imply
+        // rows were written when the atomic overwrite never ran.
         state_mock
             .expect_update_table()
             .withf(|name, state, _| {
                 name == "products"
                     && state.last_run_status.as_deref() == Some("interrupted")
-                    && state.last_run_rows == Some(2)
+                    && state.last_run_rows == Some(0)
             })
             .times(1)
             .returning(|_, _, _| Ok(()));

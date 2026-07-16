@@ -25,7 +25,12 @@ pub(crate) fn arrow_type_to_delta(dt: &DataType) -> Result<deltalake::kernel::Da
         DataType::Boolean => Ok(D::BOOLEAN),
         DataType::Int8 | DataType::Int16 | DataType::Int32 => Ok(D::INTEGER),
         DataType::Int64 => Ok(D::LONG),
-        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 => Ok(D::INTEGER),
+        DataType::UInt8 | DataType::UInt16 => Ok(D::INTEGER),
+        // FA12a: UInt32's max (~4.29e9) does NOT fit Delta INTEGER (Int32, max ~2.15e9) —
+        // mapping it to INTEGER would silently truncate/overflow on write. Currently
+        // unreachable in practice (unsigned columns are widened to a signed type before
+        // schema build), but this is defense-in-depth against that invariant ever lapsing.
+        DataType::UInt32 => Ok(D::LONG),
         DataType::UInt64 => Ok(D::LONG),
         DataType::Float16 | DataType::Float32 => Ok(D::FLOAT),
         DataType::Float64 => Ok(D::DOUBLE),
@@ -147,9 +152,11 @@ mod tests {
 
     #[test]
     fn arrow_type_to_delta_uint32() {
+        // FA12a: UInt32's max (~4.29e9) overflows Delta INTEGER (Int32, max ~2.15e9) — it
+        // must map to LONG, not INTEGER.
         assert!(matches!(
             arrow_type_to_delta(&DataType::UInt32),
-            Ok(deltalake::kernel::DataType::INTEGER)
+            Ok(deltalake::kernel::DataType::LONG)
         ));
     }
 

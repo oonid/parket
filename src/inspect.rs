@@ -39,6 +39,24 @@ pub fn evaluate_cursor(
     let has_id = id_col.is_some();
     let id_type = id_col.map(|c| c.data_type.clone());
 
+    // FA12b/N3-r: incremental auto-detection isn't limited to a column literally named
+    // `id` — ANY single-column integer PRIMARY key qualifies (see
+    // `discovery::select_integer_pk` / `discovery::detect_mode`). Reuse that same check
+    // here so the recommendation doesn't misleadingly imply full_refresh is the only
+    // option for a table whose integer PK just happens to be named something else (e.g.
+    // `code_id`).
+    let column_infos: Vec<crate::discovery::ColumnInfo> = columns
+        .iter()
+        .map(|c| crate::discovery::ColumnInfo {
+            name: c.name.clone(),
+            data_type: c.data_type.clone(),
+            column_type: c.column_type.clone(),
+            nullable: c.nullable,
+        })
+        .collect();
+    let has_integer_key =
+        has_id || crate::discovery::select_integer_pk(&column_infos, indexes).is_some();
+
     // Find timestamp candidates (datetime/timestamp columns)
     let candidates_raw: Vec<&ColumnDescribe> = columns
         .iter()
@@ -75,8 +93,8 @@ pub fn evaluate_cursor(
     }
 
     // Build recommendation
-    let recommendation = if !has_id {
-        "No `id` column — use full_refresh.".to_string()
+    let recommendation = if !has_integer_key {
+        "No `id` column or other single-column integer PRIMARY key — use full_refresh.".to_string()
     } else {
         // Find best non-Unsafe candidate by rank Ideal > Ok > UsableButSlow
         let best_safe = candidates
@@ -574,5 +592,62 @@ mod tests {
         let indexes = &[idx("PRIMARY", true, &["id"])];
         let report = evaluate_cursor("orders", columns, indexes, None);
         assert_eq!(report.id_type.as_deref(), Some("int"));
+    }
+
+    // FA12b/N3-r: a table with no column literally named `id` but WITH a single-column
+    // integer PRIMARY key (named e.g. `code_id`) must not be told "use full_refresh" as
+    // if that were the only option — N3-r auto-detects incremental for ANY single-column
+    // integer PK, not just one named `id`.
+
+    #[test]
+    fn no_id_but_integer_pk_recommends_incremental_when_cursor_viable() {
+        let columns = &[
+            col("code_id", "bigint", "bigint(20)", false, "PRI"),
+            col("updated_at", "timestamp", "timestamp", false, "MUL"),
+        ];
+        let indexes = &[
+            idx("PRIMARY", true, &["code_id"]),
+            idx("idx_updated_at", false, &["updated_at"]),
+        ];
+        let report = evaluate_cursor("orders", columns, indexes, None);
+        assert!(!report.has_id, "no column literally named `id`");
+        assert!(
+            report.recommendation.contains("TABLE_TIMESTAMP") && report.recommendation.contains("updated_at"),
+            "expected an incremental recommendation despite no `id` column, got: {}",
+            report.recommendation
+        );
+        assert!(
+            !report.recommendation.to_lowercase().contains("full_refresh"),
+            "must not recommend full_refresh when a non-id integer PK + viable cursor exist, got: {}",
+            report.recommendation
+        );
+    }
+
+    #[test]
+    fn no_id_and_no_integer_pk_recommends_full_refresh() {
+        let columns = &[
+            col("name", "varchar", "varchar(255)", false, ""),
+            col("updated_at", "timestamp", "timestamp", false, "MUL"),
+        ];
+        // No PRIMARY index at all — genuinely no integer key to key off of.
+        let indexes = &[idx("idx_updated_at", false, &["updated_at"])];
+        let report = evaluate_cursor("orders", columns, indexes, None);
+        assert!(!report.has_id);
+        assert!(report.recommendation.contains("full_refresh"));
+        assert!(report.recommendation.contains("PRIMARY key"));
+    }
+
+    #[test]
+    fn no_id_with_integer_pk_but_no_cursor_still_recommends_full_refresh() {
+        // Non-id integer PK exists, but no timestamp/datetime candidate at all — still
+        // genuinely full_refresh (no cursor to use), not misleading either way.
+        let columns = &[
+            col("code_id", "bigint", "bigint(20)", false, "PRI"),
+            col("name", "varchar", "varchar(255)", false, ""),
+        ];
+        let indexes = &[idx("PRIMARY", true, &["code_id"])];
+        let report = evaluate_cursor("orders", columns, indexes, None);
+        assert!(!report.has_id);
+        assert!(report.recommendation.contains("full_refresh"));
     }
 }

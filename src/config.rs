@@ -74,6 +74,39 @@ pub enum ExtractionMode {
     TwoStream,
 }
 
+/// FA9: `UPDATE_STRATEGY`, `MERGE_SORT_RESERVATION_MB`, and `MERGE_TARGET_PARTITIONS` are
+/// read deep in the write path (orchestrator/two_stream.rs, writer/two_stream.rs) with no
+/// validation — a typo'd or malformed value there silently falls back to a default instead
+/// of being reported, so the operator's intent is lost without any indication. Validated here
+/// at config load (both `Config::load` and `Config::load_local`) so a bad value bails loudly at
+/// startup; the write path's direct env reads then only ever observe a validated value or unset.
+fn validate_advanced_env_knobs() -> Result<()> {
+    if let Ok(v) = std::env::var("UPDATE_STRATEGY")
+        && !v.is_empty()
+        && v != "merge"
+    {
+        bail!(
+            "UPDATE_STRATEGY='{v}' is not recognized (only 'merge' selects the MERGE update \
+             strategy; unset = default delete_then_append)"
+        );
+    }
+    if let Ok(v) = std::env::var("MERGE_SORT_RESERVATION_MB")
+        && !v.is_empty()
+        && v.trim().parse::<usize>().is_err()
+    {
+        bail!("MERGE_SORT_RESERVATION_MB='{v}' must be a positive integer (MB)");
+    }
+    if let Ok(v) = std::env::var("MERGE_TARGET_PARTITIONS")
+        && !v.is_empty()
+    {
+        let valid = v.trim().parse::<usize>().is_ok_and(|n| n > 0);
+        if !valid {
+            bail!("MERGE_TARGET_PARTITIONS='{v}' must be a positive integer greater than 0");
+        }
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn timestamp_col(&self, table: &str) -> &str {
         self.table_timestamp_col.get(table).map(|s| s.as_str()).unwrap_or("updated_at")
@@ -132,6 +165,7 @@ impl Config {
             bail!("MERGE_MEMORY_MB must be greater than 0");
         }
         validate_memory_budget(target_memory_mb, merge_memory_mb, detect_total_ram_mb())?;
+        validate_advanced_env_knobs()?;
         let merge_spill_dir = std::env::var("MERGE_SPILL_DIR")
             .ok()
             .filter(|s| !s.is_empty())
@@ -224,6 +258,7 @@ impl Config {
             bail!("MERGE_MEMORY_MB must be greater than 0");
         }
         validate_memory_budget(target_memory_mb, merge_memory_mb, detect_total_ram_mb())?;
+        validate_advanced_env_knobs()?;
         let merge_spill_dir = std::env::var("MERGE_SPILL_DIR")
             .ok()
             .filter(|s| !s.is_empty())
@@ -319,6 +354,9 @@ mod tests {
         "S3_PREFIX",
         "DEFAULT_BATCH_SIZE",
         "RUST_LOG",
+        "UPDATE_STRATEGY",
+        "MERGE_SORT_RESERVATION_MB",
+        "MERGE_TARGET_PARTITIONS",
     ];
 
     fn clear_config_env() {
@@ -1531,5 +1569,219 @@ mod tests {
             config.two_stream("customers"),
             Some(("customers_insert".to_string(), "customers_update".to_string()))
         );
+    }
+
+    // FA9: UPDATE_STRATEGY / MERGE_SORT_RESERVATION_MB / MERGE_TARGET_PARTITIONS are read
+    // deep in the write path with no validation there — a typo'd value silently falls back
+    // to the default instead of being reported. These are now validated at config load so a
+    // bad value bails loudly at startup.
+
+    #[test]
+    #[serial]
+    fn update_strategy_unset_is_ok() {
+        let _cwd = no_dotenv();
+        clear_config_env();
+        set_required_vars();
+
+        assert!(Config::load().is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn update_strategy_merge_is_ok() {
+        let _cwd = no_dotenv();
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("UPDATE_STRATEGY", "merge");
+        }
+
+        assert!(Config::load().is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn update_strategy_invalid_value_bails() {
+        let _cwd = no_dotenv();
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("UPDATE_STRATEGY", "Merge");
+        }
+
+        let result = Config::load();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("UPDATE_STRATEGY"), "got: {err}");
+        assert!(err.contains("Merge"), "should echo the invalid value, got: {err}");
+        assert!(err.contains("merge"), "should mention the only accepted value, got: {err}");
+    }
+
+    #[test]
+    #[serial]
+    fn update_strategy_delete_append_typo_bails() {
+        let _cwd = no_dotenv();
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("UPDATE_STRATEGY", "delete_append");
+        }
+
+        assert!(Config::load().is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn merge_sort_reservation_mb_unset_is_ok() {
+        let _cwd = no_dotenv();
+        clear_config_env();
+        set_required_vars();
+
+        assert!(Config::load().is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn merge_sort_reservation_mb_valid_is_ok() {
+        let _cwd = no_dotenv();
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("MERGE_SORT_RESERVATION_MB", "64");
+        }
+
+        assert!(Config::load().is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn merge_sort_reservation_mb_non_numeric_bails() {
+        let _cwd = no_dotenv();
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("MERGE_SORT_RESERVATION_MB", "lots");
+        }
+
+        let result = Config::load();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("MERGE_SORT_RESERVATION_MB"), "got: {err}");
+    }
+
+    #[test]
+    #[serial]
+    fn merge_target_partitions_unset_is_ok() {
+        let _cwd = no_dotenv();
+        clear_config_env();
+        set_required_vars();
+
+        assert!(Config::load().is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn merge_target_partitions_valid_is_ok() {
+        let _cwd = no_dotenv();
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("MERGE_TARGET_PARTITIONS", "4");
+        }
+
+        assert!(Config::load().is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn merge_target_partitions_non_numeric_bails() {
+        let _cwd = no_dotenv();
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("MERGE_TARGET_PARTITIONS", "abc");
+        }
+
+        let result = Config::load();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("MERGE_TARGET_PARTITIONS"), "got: {err}");
+    }
+
+    #[test]
+    #[serial]
+    fn merge_target_partitions_zero_bails() {
+        let _cwd = no_dotenv();
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("MERGE_TARGET_PARTITIONS", "0");
+        }
+
+        let result = Config::load();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("MERGE_TARGET_PARTITIONS"), "got: {err}");
+    }
+
+    #[test]
+    #[serial]
+    fn merge_target_partitions_negative_bails() {
+        let _cwd = no_dotenv();
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("MERGE_TARGET_PARTITIONS", "-1");
+        }
+
+        assert!(Config::load().is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn load_local_update_strategy_invalid_value_bails() {
+        let _cwd = no_dotenv();
+        clear_config_env();
+        unsafe {
+            env::set_var("DATABASE_URL", "mysql://user:pass@host:3306/dbname");
+            env::set_var("TABLES", "orders");
+            env::set_var("TARGET_MEMORY_MB", "512");
+            env::set_var("UPDATE_STRATEGY", "bogus");
+        }
+
+        let result = Config::load_local();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("UPDATE_STRATEGY"), "got: {err}");
+    }
+
+    #[test]
+    #[serial]
+    fn load_local_merge_sort_reservation_mb_non_numeric_bails() {
+        let _cwd = no_dotenv();
+        clear_config_env();
+        unsafe {
+            env::set_var("DATABASE_URL", "mysql://user:pass@host:3306/dbname");
+            env::set_var("TABLES", "orders");
+            env::set_var("TARGET_MEMORY_MB", "512");
+            env::set_var("MERGE_SORT_RESERVATION_MB", "nope");
+        }
+
+        assert!(Config::load_local().is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn load_local_merge_target_partitions_zero_bails() {
+        let _cwd = no_dotenv();
+        clear_config_env();
+        unsafe {
+            env::set_var("DATABASE_URL", "mysql://user:pass@host:3306/dbname");
+            env::set_var("TABLES", "orders");
+            env::set_var("TARGET_MEMORY_MB", "512");
+            env::set_var("MERGE_TARGET_PARTITIONS", "0");
+        }
+
+        assert!(Config::load_local().is_err());
     }
 }
