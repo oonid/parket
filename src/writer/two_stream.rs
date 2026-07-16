@@ -8,11 +8,26 @@ use deltalake::datafusion::datasource::MemTable;
 use deltalake::datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use deltalake::datafusion::execution::memory_pool::FairSpillPool;
 use deltalake::datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use deltalake::datafusion::prelude::{SessionConfig, SessionContext};
+use deltalake::datafusion::prelude::{Column, Expr, SessionConfig, SessionContext};
 use deltalake::kernel::transaction::CommitBuilder;
 use deltalake::operations::write::SchemaMode;
 use deltalake::protocol::{DeltaOperation, SaveMode};
 use tracing::info;
+
+use crate::query::backtick;
+
+/// FA5/Part C: pick a ROW_NUMBER() alias guaranteed not to collide with any real source
+/// column name. Starts from `__parket_rownum`; if a batch happens to carry a column with
+/// that exact name (however unlikely), keeps appending `_` until it's unique. The alias is
+/// our own bareword (never user data), so it's safe unquoted in the dedup SQL as long as it
+/// doesn't collide with a real column name.
+fn dedup_rownum_alias(col_names: &[String]) -> String {
+    let mut alias = "__parket_rownum".to_string();
+    while col_names.iter().any(|c| c == &alias) {
+        alias.push('_');
+    }
+    alias
+}
 
 impl DeltaWriter {
     /// Upsert `batches` into the table, matching on `key_col`: existing keys updated
@@ -82,14 +97,26 @@ impl DeltaWriter {
         ctx.register_table("merge_source_raw", std::sync::Arc::new(provider))?;
 
         let col_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-        let col_list = col_names.join(", ");
+        // FA5: backtick-quote identifiers in the dedup SQL — an unquoted identifier is
+        // normalized (lowercased) by DataFusion's SQL parser, which breaks mixed-case
+        // columns (`userId` -> `userid`: "No field named userid") and reserved words
+        // (e.g. `order`). Mirrors query::backtick, already used by the verify probes for
+        // exactly this reason.
+        let quoted_cols: Vec<String> = col_names.iter().map(|c| backtick(c)).collect();
+        let col_list = quoted_cols.join(", ");
+        let qkey = backtick(key_col);
+        let rn = dedup_rownum_alias(&col_names);
         let dedup_sql = format!(
-            "SELECT {col_list} FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY {key_col} ORDER BY {key_col}) AS __rn FROM merge_source_raw) WHERE __rn = 1"
+            "SELECT {col_list} FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY {qkey} ORDER BY {qkey}) AS {rn} FROM merge_source_raw) WHERE {rn} = 1"
         );
         let source = ctx.sql(&dedup_sql).await?;
 
-        use deltalake::datafusion::prelude::col;
-        let predicate = col(format!("target.{key_col}")).eq(col(format!("source.{key_col}")));
+        // FA5: build the Column/Expr directly instead of `col(format!("source.{name}"))` —
+        // `col()` takes a plain string through `Column::from_qualified_name`, which parses
+        // and normalizes unquoted identifiers to lowercase. `Column::new(...)` stores the
+        // name verbatim (no parsing), preserving mixed case.
+        let predicate = Expr::Column(Column::new(Some("target"), key_col))
+            .eq(Expr::Column(Column::new(Some("source"), key_col)));
         let commit_properties = build_two_stream_commit_properties(insert_id, update_hwm);
 
         let (table, _metrics) = table
@@ -101,13 +128,19 @@ impl DeltaWriter {
             .when_matched_update(|mut update| {
                 for name in &col_names {
                     if name == key_col { continue; }
-                    update = update.update(name.clone(), col(format!("source.{name}")));
+                    update = update.update(
+                        name.clone(),
+                        Expr::Column(Column::new(Some("source"), name.clone())),
+                    );
                 }
                 update
             })?
             .when_not_matched_insert(|mut insert| {
                 for name in &col_names {
-                    insert = insert.set(name.clone(), col(format!("source.{name}")));
+                    insert = insert.set(
+                        name.clone(),
+                        Expr::Column(Column::new(Some("source"), name.clone())),
+                    );
                 }
                 insert
             })?
@@ -293,7 +326,7 @@ impl DeltaWriter {
         insert_id: Option<i64>,
         update_hwm: Option<&super::Hwm>,
     ) -> Result<()> {
-        use deltalake::datafusion::prelude::{cast, col, lit};
+        use deltalake::datafusion::prelude::{cast, lit};
 
         if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
             return Ok(());
@@ -312,9 +345,13 @@ impl DeltaWriter {
         ctx.register_table("delete_source_raw", std::sync::Arc::new(provider))?;
 
         let col_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-        let col_list = col_names.join(", ");
+        // FA5: same backtick-quoting as merge_batch's dedup SQL (see comment there).
+        let quoted_cols: Vec<String> = col_names.iter().map(|c| backtick(c)).collect();
+        let col_list = quoted_cols.join(", ");
+        let qkey = backtick(key_col);
+        let rn = dedup_rownum_alias(&col_names);
         let dedup_sql = format!(
-            "SELECT {col_list} FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY {key_col} ORDER BY {key_col}) AS __rn FROM delete_source_raw) WHERE __rn = 1"
+            "SELECT {col_list} FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY {qkey} ORDER BY {qkey}) AS {rn} FROM delete_source_raw) WHERE {rn} = 1"
         );
         let deduped_source = ctx.sql(&dedup_sql).await?;
         let deduped_batches = deduped_source.collect().await?;
@@ -367,7 +404,11 @@ impl DeltaWriter {
         if !ids.is_empty() {
             for chunk in ids.chunks(DELETE_KEYS_PER_CHUNK) {
                 let list: Vec<_> = chunk.iter().map(|id| lit(*id)).collect();
-                let predicate = cast(col(key_col), DataType::Int64).in_list(list, false);
+                // FA5: Column::new_unqualified stores the name verbatim (no parsing/
+                // normalization), unlike `col(key_col)` which would lowercase it.
+                let predicate =
+                    cast(Expr::Column(Column::new_unqualified(key_col)), DataType::Int64)
+                        .in_list(list, false);
                 let (t, _metrics) = table.delete().with_predicate(predicate).await?;
                 table = t;
             }
@@ -398,6 +439,31 @@ mod tests {
     use deltalake::arrow::datatypes::{DataType, Schema as ArrowSchema, Field};
     use deltalake::arrow::record_batch::RecordBatch;
     use std::sync::Arc;
+
+    // FA5/Part C: the ROW_NUMBER() alias must never collide with a real source column name.
+    #[test]
+    fn dedup_rownum_alias_is_collision_proof() {
+        // No collision: the default alias is used as-is.
+        let cols = vec!["id".to_string(), "value".to_string()];
+        assert_eq!(dedup_rownum_alias(&cols), "__parket_rownum");
+
+        // A source column literally named like the default alias must not collide —
+        // the chosen alias must differ from every entry in col_names.
+        let cols_with_collision =
+            vec!["id".to_string(), "__parket_rownum".to_string()];
+        let alias = dedup_rownum_alias(&cols_with_collision);
+        assert_ne!(alias, "__parket_rownum");
+        assert!(!cols_with_collision.contains(&alias));
+
+        // Even a chain of collisions (unlikely, but defends against it) keeps extending.
+        let cols_with_chain = vec![
+            "__parket_rownum".to_string(),
+            "__parket_rownum_".to_string(),
+            "__parket_rownum__".to_string(),
+        ];
+        let alias = dedup_rownum_alias(&cols_with_chain);
+        assert!(!cols_with_chain.contains(&alias));
+    }
 
     #[tokio::test]
     async fn read_insert_hwm_nonexistent_table() {
@@ -1672,5 +1738,152 @@ mod tests {
         assert_eq!(c, n, "row count after upsert should equal seed count (no dupes)");
         assert_eq!(d, n, "all ids distinct");
         assert_eq!(old_cnt, 0, "every row must be updated to the new version");
+    }
+
+    /// FA5: `merge_batch`'s dedup SQL and merge predicate/update/insert exprs must handle a
+    /// mixed-case column (`userId`). Before the fix, the dedup SQL's unquoted `userId`
+    /// normalized to `userid` (DataFusion lowercases unquoted identifiers), producing "No
+    /// field named userid" and failing the table on every update window.
+    #[tokio::test]
+    async fn merge_batch_mixed_case_column_round_trips() {
+        use deltalake::arrow::array::StringViewArray;
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("userId", DataType::Utf8, false),
+        ]));
+
+        writer.ensure_table("t", schema.clone()).await.unwrap();
+
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2i64])),
+                Arc::new(StringArray::from(vec!["u1", "u2"])),
+            ],
+        )
+        .unwrap();
+        writer
+            .merge_batch("t", vec![batch1], "id", Some(2), None)
+            .await
+            .unwrap();
+
+        // Update id=1's userId, insert id=3 — exercises both the dedup SQL and the
+        // merge predicate/update/insert value exprs on the mixed-case column.
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 3i64])),
+                Arc::new(StringArray::from(vec!["u1-updated", "u3"])),
+            ],
+        )
+        .unwrap();
+        writer
+            .merge_batch("t", vec![batch2], "id", Some(3), None)
+            .await
+            .unwrap();
+
+        let t = writer.open_table("t").await.unwrap();
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        let provider = t.table_provider().await.unwrap();
+        ctx.register_table("t", provider).unwrap();
+        // Backtick-quote `userId` in the verification query too, matching verify/delta.rs's
+        // convention — an unquoted reference here would hit the same normalization bug.
+        let batches = ctx
+            .sql("SELECT id, `userId` FROM t ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 3);
+        let value_col = batch.column(1);
+        let value = |i: usize| -> String {
+            if let Some(a) = value_col.as_any().downcast_ref::<StringArray>() {
+                a.value(i).to_string()
+            } else if let Some(a) = value_col.as_any().downcast_ref::<StringViewArray>() {
+                a.value(i).to_string()
+            } else {
+                panic!("Unexpected value column type");
+            }
+        };
+        assert_eq!(value(0), "u1-updated", "id=1's userId should be merge-updated");
+        assert_eq!(value(1), "u2", "id=2's userId should be unchanged");
+        assert_eq!(value(2), "u3", "id=3's userId should be inserted");
+    }
+
+    /// FA5: same mixed-case coverage as `merge_batch_mixed_case_column_round_trips`, but for
+    /// `delete_then_append` (the default two-stream update strategy) — its dedup SQL and
+    /// delete predicate must also survive an unquoted mixed-case column.
+    #[tokio::test]
+    async fn delete_then_append_mixed_case_column_round_trips() {
+        use deltalake::arrow::array::StringViewArray;
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("userId", DataType::Utf8, false),
+        ]));
+
+        writer.ensure_table("t", schema.clone()).await.unwrap();
+
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2i64])),
+                Arc::new(StringArray::from(vec!["u1", "u2"])),
+            ],
+        )
+        .unwrap();
+        writer
+            .append_two_stream("t", vec![batch1], Some(2), None)
+            .await
+            .unwrap();
+
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 3i64])),
+                Arc::new(StringArray::from(vec!["u1-updated", "u3"])),
+            ],
+        )
+        .unwrap();
+        writer
+            .delete_then_append("t", vec![batch2], "id", Some(3), None)
+            .await
+            .unwrap();
+
+        let t = writer.open_table("t").await.unwrap();
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        let provider = t.table_provider().await.unwrap();
+        ctx.register_table("t", provider).unwrap();
+        let batches = ctx
+            .sql("SELECT id, `userId` FROM t ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 3);
+        let value_col = batch.column(1);
+        let value = |i: usize| -> String {
+            if let Some(a) = value_col.as_any().downcast_ref::<StringArray>() {
+                a.value(i).to_string()
+            } else if let Some(a) = value_col.as_any().downcast_ref::<StringViewArray>() {
+                a.value(i).to_string()
+            } else {
+                panic!("Unexpected value column type");
+            }
+        };
+        assert_eq!(value(0), "u1-updated", "id=1's userId should be updated");
+        assert_eq!(value(1), "u2", "id=2's userId should be unchanged");
+        assert_eq!(value(2), "u3", "id=3's userId should be inserted");
     }
 }

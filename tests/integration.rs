@@ -1383,6 +1383,147 @@ async fn two_stream_inserts_and_merges_mutations_across_runs() {
     run_two_stream_upsert_scenario(Some("merge")).await;
 }
 
+/// FA5: a two-stream table with a mixed-case non-key column (`userId`) and a reserved-word
+/// column (backtick-quoted `` `order` `` in MariaDB) must not hard-fail the update window.
+/// Before the fix, `merge_batch`/`delete_then_append` built their dedup SQL and merge/delete
+/// predicates with RAW, unquoted identifiers; DataFusion normalizes an unquoted `userId` to
+/// `userid`, so the second run's update window died with a "No field named userid" plan
+/// error — a hard per-table failure (exit 1/2), not data corruption. After the fix (backtick
+/// quoting in the dedup SQL + non-normalizing `Expr::Column` in the predicate/value exprs),
+/// both runs succeed and the mixed-case / reserved-word values round-trip correctly.
+async fn run_two_stream_mixed_case_scenario(update_strategy: Option<&str>) {
+    if let Some(s) = update_strategy {
+        unsafe { std::env::set_var("UPDATE_STRATEGY", s); }
+    }
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let mut env = TestEnv::new(vec!["mixedcase_orders"]).await;
+    // Enable two-stream: insert cursor = id (PK), update cursor = completed_at.
+    env.config
+        .table_insert_cursor
+        .insert("mixedcase_orders".to_string(), "id".to_string());
+    env.config
+        .table_update_cursor
+        .insert("mixedcase_orders".to_string(), "completed_at".to_string());
+
+    sqlx::query(
+        "CREATE TABLE mixedcase_orders (\
+            id BIGINT PRIMARY KEY, \
+            userId VARCHAR(255), \
+            `order` INT, \
+            completed_at DATETIME(6) NULL\
+        )",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create mixedcase_orders table");
+
+    sqlx::query(
+        "CREATE INDEX idx_mixedcase_orders_completed_at ON mixedcase_orders (completed_at, id)",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create index");
+
+    // Run 1 seed.
+    sqlx::query(
+        "INSERT INTO mixedcase_orders (id, userId, `order`, completed_at) VALUES \
+            (1, 'user-one', 10, '2026-01-01 10:00:00.000000'), \
+            (2, 'user-two', 20, '2026-01-02 09:00:00.000000')",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert run-1 rows");
+
+    let mut run1 = env.make_orchestrator();
+    let exit1 = run1.run().await;
+    assert!(matches!(exit1, ExitCode::Success), "run 1: expected Success, got {exit1:?}");
+    assert_eq!(
+        count_delta_rows(&env, "mixedcase_orders").await,
+        2,
+        "run 1: expected 2 rows"
+    );
+
+    // --- between runs: mutate the mixed-case + reserved-word columns, insert a new row ---
+    // This is the FA5 regression trigger: run 2's update window exercises merge_batch's (or
+    // delete_then_append's) dedup SQL and value exprs on `userId`.
+    sqlx::query(
+        "UPDATE mixedcase_orders SET userId = 'user-one-updated', `order` = 99, \
+            completed_at = '2026-01-05 09:00:00.000000' WHERE id = 1",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to mutate row 1");
+    sqlx::query(
+        "INSERT INTO mixedcase_orders (id, userId, `order`, completed_at) VALUES \
+            (3, 'user-three', 30, '2026-01-03 11:00:00.000000')",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert run-2 row");
+
+    let mut run2 = env.make_orchestrator();
+    let exit2 = run2.run().await;
+    // Before the FA5 fix, this run failed with a "No field named userid"-class plan error on
+    // every two-stream update window — this is the core regression assertion.
+    assert!(
+        matches!(exit2, ExitCode::Success),
+        "run 2: expected Success on the mixed-case/reserved-word update window (FA5 regression), got {exit2:?}"
+    );
+
+    assert_eq!(
+        count_delta_rows(&env, "mixedcase_orders").await,
+        3,
+        "run 2: expected 3 distinct rows"
+    );
+    // Mixed-case column upserted correctly (dedup SQL + merge/delete value exprs on `userId`):
+    assert_eq!(
+        count_matching(&env, "mixedcase_orders", "id = 1 AND `userId` = 'user-one-updated'")
+            .await,
+        1,
+        "run 2: row 1's userId should be upserted"
+    );
+    // Reserved-word column upserted correctly:
+    assert_eq!(
+        count_matching(&env, "mixedcase_orders", "id = 1 AND `order` = 99").await,
+        1,
+        "run 2: row 1's `order` should be upserted"
+    );
+    // Untouched row's mixed-case value is unchanged:
+    assert_eq!(
+        count_matching(&env, "mixedcase_orders", "id = 2 AND `userId` = 'user-two'").await,
+        1,
+        "run 2: row 2's userId should be unchanged"
+    );
+    // New row inserted with the correct mixed-case value:
+    assert_eq!(
+        count_matching(&env, "mixedcase_orders", "id = 3 AND `userId` = 'user-three'").await,
+        1,
+        "run 2: row 3 should be inserted with correct userId"
+    );
+
+    if update_strategy.is_some() {
+        unsafe { std::env::remove_var("UPDATE_STRATEGY"); }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn two_stream_handles_mixed_case_and_reserved_columns() {
+    // default strategy = delete_then_append
+    run_two_stream_mixed_case_scenario(None).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn two_stream_handles_mixed_case_and_reserved_columns_merge() {
+    // opt-out: the legacy MERGE path (also builds col() exprs — must be fixed too)
+    run_two_stream_mixed_case_scenario(Some("merge")).await;
+}
+
 /// D1 STEP 1: validate the append + `SchemaMode::Merge` mechanism against a REAL Delta table
 /// on MinIO, through the exact writer path production uses (`DeltaWriter::append_batch`),
 /// before relying on it for the orchestrator flow. Creates a {id, name} table, appends a row,

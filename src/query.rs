@@ -1,7 +1,7 @@
 /// Quote a MySQL/MariaDB identifier. A backtick is a legal character inside an
 /// identifier and is escaped by doubling it (S2) so an embedded backtick cannot
 /// break out of the quoting.
-fn backtick(ident: &str) -> String {
+pub(crate) fn backtick(ident: &str) -> String {
     format!("`{}`", ident.replace('`', "``"))
 }
 
