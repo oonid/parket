@@ -377,9 +377,17 @@ impl DeltaWriter {
                     }
                 }
             } else if let Some(a) = c.as_any().downcast_ref::<UInt64Array>() {
+                // FA8: checked conversion — a BIGINT UNSIGNED value past i64::MAX must not
+                // silently wrap negative into the delete predicate (mirrors
+                // extract_id_as_i64's / extract_batch_max_key's UInt64 handling).
                 for i in 0..a.len() {
                     if !a.is_null(i) {
-                        ids.push(a.value(i) as i64);
+                        ids.push(i64::try_from(a.value(i)).map_err(|_| {
+                            anyhow::anyhow!(
+                                "delete_then_append: key column `{key_col}` value {} overflows i64",
+                                a.value(i)
+                            )
+                        })?);
                     }
                 }
             } else if let Some(a) = c.as_any().downcast_ref::<UInt32Array>() {
@@ -1320,6 +1328,39 @@ mod tests {
         // Check insert hwm
         let insert_hwm = writer.read_insert_hwm("t").await.unwrap();
         assert_eq!(insert_hwm, Some(3));
+    }
+
+    #[tokio::test]
+    async fn delete_then_append_uint64_key_overflow_errors_instead_of_wrapping() {
+        // FA8: a BIGINT UNSIGNED key value past i64::MAX must error out of the delete-key
+        // collection loop rather than silently wrapping negative via `as i64` — a wrapped
+        // negative key would build a wrong DELETE predicate.
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+
+        writer.ensure_table("t", schema.clone()).await.unwrap();
+
+        let huge = (i64::MAX as u64) + 1;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![huge])),
+                Arc::new(StringArray::from(vec!["a"])),
+            ],
+        )
+        .unwrap();
+
+        let result = writer
+            .delete_then_append("t", vec![batch], "id", Some(1), None)
+            .await;
+
+        assert!(result.is_err(), "a UInt64 key past i64::MAX must error, not wrap");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("id"), "error should name the key column: {msg}");
     }
 
     #[tokio::test]

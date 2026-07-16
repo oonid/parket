@@ -38,6 +38,12 @@ impl BatchExtractor {
     }
 
     pub fn calculate_batch_size(&mut self, avg_row_length: Option<u64>) -> u64 {
+        // FA6: this is the per-table entry point (called once per table before its first
+        // extract). `adapted` gates the ONE-TIME actual-bytes correction in
+        // `adapt_after_first_batch_ca` for the CURRENT table's first non-empty batch; without
+        // resetting it here, a `BatchExtractor` reused across tables would latch `adapted = true`
+        // on table 1 forever, so tables 2..N never get their own actual-bytes correction.
+        self.adapted = false;
         match avg_row_length {
             Some(row_len) if row_len > 0 => {
                 self.batch_size = (self.target_memory_mb * 1024 * 1024) / row_len;
@@ -508,6 +514,27 @@ mod tests {
         let batches2 = vec![make_large_batch(100)];
         let _ = ext.extract_from_stream_ca(batches2).unwrap();
         assert_eq!(ext.batch_size(), size_after_first_adapt);
+    }
+
+    #[test]
+    fn calculate_batch_size_resets_adapted_latch_per_table() {
+        // FA6: `adapted` gates the once-per-table actual-bytes correction. Without resetting
+        // it at the start of `calculate_batch_size` (the per-table entry point), a
+        // `BatchExtractor` reused across tables (as the orchestrator does) would latch
+        // `adapted = true` on table 1's first batch forever, so tables 2..N would never get
+        // their own actual-bytes correction.
+        let mut ext = BatchExtractor::new("mysql://u:p@h/db", 1, 10000);
+
+        // Table 1: its first batch sets the latch.
+        ext.calculate_batch_size(Some(8));
+        let batch = make_batch(100, 42);
+        let _ = ext.extract_from_stream_ca(vec![batch]).unwrap();
+        assert!(ext.adapted, "the first batch of table 1 must set the latch");
+
+        // Table 2: calculate_batch_size is the per-table entry point — it must reset the
+        // latch so table 2's own first batch gets its actual-bytes correction too.
+        ext.calculate_batch_size(Some(8));
+        assert!(!ext.adapted, "calculate_batch_size must reset the latch for the new table");
     }
 
     #[test]

@@ -21,29 +21,35 @@ pub fn extract_hwm_from_batch(batch: &RecordBatch, timestamp_col: &str, key_col:
     let timestamp_strings = extract_timestamp_as_strings(timestamp_col_data)?;
     let ids = extract_id_as_i64(key_col_data)?;
 
-    // Build candidate list filtering out empty (NULL) timestamps
-    let candidates: Vec<(usize, &str, i64)> = timestamp_strings
-        .iter()
-        .enumerate()
-        .filter(|(_, ts)| !ts.is_empty())
-        .map(|(i, ts)| (i, ts.as_str(), ids[i]))
-        .collect();
-
-    if candidates.is_empty() {
-        return None;
+    // L6: fold directly to the max (ts, id) pair over the zipped vectors, filtering out
+    // empty (NULL) timestamps as we go — avoids materializing an intermediate `candidates`
+    // Vec just to immediately reduce it to a single winner. Ordering matches the old
+    // `max_by` exactly: primary key is the timestamp string, tie-broken by id, and on an
+    // exact tie the LATER element in iteration order wins (same as `Iterator::max_by`,
+    // which returns the last of several equally-maximum elements).
+    let mut best: Option<(&str, i64)> = None;
+    for (ts, &id) in timestamp_strings.iter().zip(ids.iter()) {
+        if ts.is_empty() {
+            continue;
+        }
+        let candidate = (ts.as_str(), id);
+        best = match best {
+            None => Some(candidate),
+            Some(cur) => {
+                let ord = match candidate.0.cmp(cur.0) {
+                    std::cmp::Ordering::Equal => candidate.1.cmp(&cur.1),
+                    other => other,
+                };
+                if ord == std::cmp::Ordering::Less { Some(cur) } else { Some(candidate) }
+            }
+        };
     }
 
-    // Find max by (ts, id)
-    let (_, max_ts, max_id) = candidates.iter().max_by(|a, b| {
-        match a.1.cmp(b.1) {
-            std::cmp::Ordering::Equal => a.2.cmp(&b.2),
-            other => other,
-        }
-    })?;
+    let (max_ts, max_id) = best?;
 
     Some(Hwm {
         updated_at: max_ts.to_string(),
-        last_id: *max_id,
+        last_id: max_id,
     })
 }
 
@@ -120,20 +126,42 @@ pub fn extract_max_id(batch: &RecordBatch, key_col: &str) -> Option<i64> {
 // BIGINT → Int64, and the UNSIGNED variants to the matching UInt* type. All but
 // BIGINT UNSIGNED fit safely in i64; BIGINT UNSIGNED is checked and returns None
 // on overflow past i64::MAX rather than silently wrapping negative.
+//
+// FA7: a NULL slot in the key column makes the whole batch's key data unreliable for HWM
+// purposes (a bare `a.value(i)` on a NULL slot reads as 0, which would produce a bogus
+// `last_id: 0` and cause the next window's `id > 0` predicate to re-extract already-appended
+// rows). Each arm bails out with None as soon as it sees ANY null, via a fast `null_count()`
+// check up front — the caller (`extract_hwm_from_batch`) already treats None as "couldn't
+// extract" and its callers bail loudly on a None HWM for a non-empty batch.
 pub(crate) fn extract_id_as_i64(col: &std::sync::Arc<dyn Array>) -> Option<Vec<i64>> {
     if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+        if a.null_count() > 0 {
+            return None;
+        }
         return Some((0..a.len()).map(|i| a.value(i)).collect());
     }
     if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
+        if a.null_count() > 0 {
+            return None;
+        }
         return Some((0..a.len()).map(|i| a.value(i) as i64).collect());
     }
     if let Some(a) = col.as_any().downcast_ref::<Int16Array>() {
+        if a.null_count() > 0 {
+            return None;
+        }
         return Some((0..a.len()).map(|i| i64::from(a.value(i))).collect());
     }
     if let Some(a) = col.as_any().downcast_ref::<Int8Array>() {
+        if a.null_count() > 0 {
+            return None;
+        }
         return Some((0..a.len()).map(|i| i64::from(a.value(i))).collect());
     }
     if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
+        if a.null_count() > 0 {
+            return None;
+        }
         let mut out = Vec::with_capacity(a.len());
         for i in 0..a.len() {
             out.push(i64::try_from(a.value(i)).ok()?);
@@ -141,12 +169,21 @@ pub(crate) fn extract_id_as_i64(col: &std::sync::Arc<dyn Array>) -> Option<Vec<i
         return Some(out);
     }
     if let Some(a) = col.as_any().downcast_ref::<UInt32Array>() {
+        if a.null_count() > 0 {
+            return None;
+        }
         return Some((0..a.len()).map(|i| i64::from(a.value(i))).collect());
     }
     if let Some(a) = col.as_any().downcast_ref::<UInt16Array>() {
+        if a.null_count() > 0 {
+            return None;
+        }
         return Some((0..a.len()).map(|i| i64::from(a.value(i))).collect());
     }
     if let Some(a) = col.as_any().downcast_ref::<UInt8Array>() {
+        if a.null_count() > 0 {
+            return None;
+        }
         return Some((0..a.len()).map(|i| i64::from(a.value(i))).collect());
     }
     None
@@ -587,6 +624,58 @@ mod tests {
         ]));
         let id_arr = Int64Array::from(vec![1i64, 2i64, 3i64]);
         let ts_arr = StringArray::from(vec![None as Option<&str>, None, None]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(ts_arr)]).unwrap();
+
+        assert!(extract_hwm_from_batch(&batch, "updated_at", "id").is_none());
+    }
+
+    #[test]
+    fn extract_hwm_ties_on_timestamp_broken_by_max_id() {
+        // L6 regression pin: several rows share the max timestamp; the winner must be the
+        // one with the max id among that tie, regardless of row order.
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("updated_at", DataType::Utf8, false),
+        ]));
+        let id_arr = Int64Array::from(vec![5i64, 9i64, 7i64, 9i64, 1i64]);
+        let ts_arr = StringArray::from(vec![
+            "2026-01-01 10:00:00",
+            "2026-01-01 12:00:00",
+            "2026-01-01 11:00:00",
+            "2026-01-01 12:00:00",
+            "2026-01-01 09:00:00",
+        ]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(ts_arr)]).unwrap();
+
+        let hwm = extract_hwm_from_batch(&batch, "updated_at", "id").unwrap();
+        assert_eq!(hwm.updated_at, "2026-01-01 12:00:00");
+        assert_eq!(hwm.last_id, 9);
+    }
+
+    #[test]
+    fn extract_id_as_i64_null_slot_returns_none() {
+        // FA7: a NULL key slot must not silently read as 0 — extract_id_as_i64 must bail
+        // with None so the caller treats the batch's key data as unreliable for HWM purposes.
+        let id_arr = Int64Array::from(vec![Some(1i64), None, Some(3i64)]);
+        let col: std::sync::Arc<dyn Array> = Arc::new(id_arr);
+        assert!(extract_id_as_i64(&col).is_none());
+    }
+
+    #[test]
+    fn extract_hwm_from_batch_null_key_slot_returns_none() {
+        // FA7: end-to-end through extract_hwm_from_batch — a NULL in the key column (e.g. a
+        // nullable fallback `id` column) must make the whole batch unusable for HWM
+        // extraction, not silently yield last_id: 0.
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("updated_at", DataType::Utf8, false),
+        ]));
+        let id_arr = Int64Array::from(vec![Some(1i64), None, Some(3i64)]);
+        let ts_arr = StringArray::from(vec![
+            "2026-01-01 10:00:00",
+            "2026-01-01 11:00:00",
+            "2026-01-01 12:00:00",
+        ]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(ts_arr)]).unwrap();
 
         assert!(extract_hwm_from_batch(&batch, "updated_at", "id").is_none());
