@@ -181,7 +181,7 @@ plan→implement→review remediation loop; none fixed yet.
 *(none — the prior audit's Critical class re-traced and confirmed still closed.)*
 
 ### 7.2 Open — High
-- **FA1** — **[Opus-verified] silent NULL-corruption on full-refresh type drift.** `coerce_batch_to_schema`
+- **FA1** — **done** (`db45d91`). [Opus-verified] silent NULL-corruption on full-refresh type drift. `coerce_batch_to_schema`
   (`writer.rs:73-93`, used by `stage_overwrite_chunk`) casts each batch column to the *existing* Delta
   schema with arrow's plain `cast()` = `safe: true` → an out-of-range/unparseable value becomes **NULL**
   instead of erroring. Full refresh never runs `schema_evolution_check` (`orchestrator.rs:310-319` gates it
@@ -190,7 +190,7 @@ plan→implement→review remediation loop; none fixed yet.
   migration for a pre-N5 `int unsigned` table where Delta is Int32 but batches arrive Int64) silently writes
   NULLs for every non-fitting value, exit 0. Directly undoes N5's discipline (`align_batches_to_schema`
   uses `CastOptions{safe:false}` and errors by table+column one step earlier). **Fix:** use
-  `cast_with_options(.., {safe:false, ..})` in `coerce_batch_to_schema` (mirror `align_batches_to_schema`).
+  `cast_with_options(.., {safe:false, ..})` in `coerce_batch_to_schema` (mirror `align_batches_to_schema`). **Resolved:** `coerce_batch_to_schema` now casts with `CastOptions{safe:false}` — a data-losing narrowing errors loud+actionable instead of NULLing; healthy full-refresh (identity/widening) unaffected (full 33-test Docker suite green); unit test covers widen-ok/narrow-errors.
 - **FA2** — **[Opus-verified] two-stream cross-window row duplication.** The update stream (Stream B,
   `orchestrator/two_stream.rs:199-267`) is bounded only by the UPDATE cursor — no upper bound on the insert
   key. A row `id=Y` inserted after Stream A's window (insert watermark `X`, `Y>X`) whose `update_col` lands
@@ -203,7 +203,7 @@ plan→implement→review remediation loop; none fixed yet.
   Optionally make `two_stream_key_stats_outcome` treat `delta count > delta distinct` as a loud diagnostic.
 
 ### 7.3 Open — Medium
-- **FA3** — full refresh never evolves the Delta schema (confirmed). `coerce_batch_to_schema` iterates only
+- **FA3** — **done** (`878d051`). Full refresh never evolved the Delta schema (confirmed). `coerce_batch_to_schema` iterates only
   *target* fields (extra batch columns silently dropped, no log); `commit_overwrite` emits only Remove+Add,
   no `Metadata` action, so schema can't change. Consequences: (a) a NEW source column is extracted then
   silently discarded every run (Incremental/TwoStream capture it via D1's `SchemaMode::Merge`; full refresh
@@ -212,7 +212,7 @@ plan→implement→review remediation loop; none fixed yet.
   Delta dir; (c) the register's N5 "full-refresh to rebuild" advice doesn't actually rebuild the schema (and
   per FA1 silently NULLs the very values it was meant to fix). **Fix:** emit a `Metadata` action on
   overwrite when the schema differs (delta-rs `Overwrite + SchemaMode::Overwrite`), or at least warn (new
-  col) / bail accurately (dropped col) in `process_full_refresh`; correct the N5 migration note. (Pairs with FA1.)
+  col) / bail accurately (dropped col) in `process_full_refresh`; correct the N5 migration note. (Pairs with FA1.) **Resolved:** the staged overwrite now targets the current SOURCE schema — `begin_overwrite` compares it to the stored schema in Delta StructType space (N5-widening-safe), and when it differs builds the writer with the new schema (`RecordBatchWriter::try_new`) and `commit_overwrite` folds an `Action::Metadata(meta.with_schema(new))` into the same atomic commit → added columns appear, dropped disappear, type widenings adopted; unchanged-schema path is byte-identical (`for_table`, no Metadata). Docker-proven (add/drop/widen), full 36-test suite green. **N5 migration note now VALID** — a full refresh genuinely rebuilds the schema (and with FA1's safe cast, adopts the wider type rather than NULLing).
 - **FA4** — `delete_then_append` (the DEFAULT two-stream update strategy) dedups in an UNBOUNDED DataFusion
   session (`writer/two_stream.rs:294-306`: `SessionContext::new()`, no `FairSpillPool`/spill dir) and
   `.collect()`s the deduped output while the input `MemTable` is still resident → transient peak ~2–3× the
