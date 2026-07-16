@@ -213,13 +213,19 @@ plan→implement→review remediation loop; none fixed yet.
   per FA1 silently NULLs the very values it was meant to fix). **Fix:** emit a `Metadata` action on
   overwrite when the schema differs (delta-rs `Overwrite + SchemaMode::Overwrite`), or at least warn (new
   col) / bail accurately (dropped col) in `process_full_refresh`; correct the N5 migration note. (Pairs with FA1.) **Resolved:** the staged overwrite now targets the current SOURCE schema — `begin_overwrite` compares it to the stored schema in Delta StructType space (N5-widening-safe), and when it differs builds the writer with the new schema (`RecordBatchWriter::try_new`) and `commit_overwrite` folds an `Action::Metadata(meta.with_schema(new))` into the same atomic commit → added columns appear, dropped disappear, type widenings adopted; unchanged-schema path is byte-identical (`for_table`, no Metadata). Docker-proven (add/drop/widen), full 36-test suite green. **N5 migration note now VALID** — a full refresh genuinely rebuilds the schema (and with FA1's safe cast, adopts the wider type rather than NULLing).
-- **FA4** — `delete_then_append` (the DEFAULT two-stream update strategy) dedups in an UNBOUNDED DataFusion
-  session (`writer/two_stream.rs:294-306`: `SessionContext::new()`, no `FairSpillPool`/spill dir) and
+- **FA4** — **done** (`ba36a35`). `delete_then_append` (the DEFAULT two-stream update strategy) previously
+  deduped in an UNBOUNDED DataFusion session (`SessionContext::new()`, no `FairSpillPool`/spill dir) and
   `.collect()`s the deduped output while the input `MemTable` is still resident → transient peak ~2–3× the
   window (so ~4–6× `TARGET_MEMORY_MB` with the breaker's 2× admission), uncovered by M4's RAM validation.
-  `merge_batch` (the opt-out path) was hardened with a bounded pool; the default path was not. OOM-risk on
-  the 8 GB target for large update windows. **Fix:** give `delete_then_append`'s dedup the same bounded
-  runtime `merge_batch` builds; or dedup without full materialization (metadata-only when no dupes).
+  `merge_batch` (the opt-out path) was hardened with a bounded pool; the default path was not — OOM-risk on
+  the 8 GB target for large update windows. **Resolved:** extracted `merge_batch`'s bounded-session
+  construction into a shared `build_bounded_session` helper (`FairSpillPool(merge_memory_mb)` + MERGE_SPILL_DIR
+  + spillable SortMergeJoin + single partition) and used it in `delete_then_append` too, so the default path's
+  dedup ROW_NUMBER sort spills to disk instead of OOMing; `merge_batch` behavior-preserving (same session).
+  Full 36-test Docker suite green. **FA4-r (Low):** the `.collect()` still materializes the deduped window
+  alongside the input MemTable (~2× window, bounded by the breaker) — dedup-without-materialization
+  (distinct-keys-first, re-materialize only on actual dupes) is a deferred perf optimization, not required to
+  close the OOM-risk (the bounded pool + spill does).
 - **FA5** — unquoted, case-normalized identifiers in `merge_batch`/`delete_then_append` DataFusion SQL +
   `col()` exprs (`writer/two_stream.rs:132-161, 300-356`). DataFusion normalizes unquoted identifiers to
   lowercase → a mixed-case column (`userId`), a reserved-word column (`order`), or a source column named
