@@ -5,14 +5,18 @@ process — it consolidates `docs/audit-2026-07-04.md` and `docs/handoff-2026-07
 content carried forward here) and the second-pass results in `docs/audit-2026-07-06.md` (kept for its
 detailed analysis; finding IDs below reference it). Target runtime: an **8 GB RAM** VM.
 
-**Completion status (2026-07-15, tagged `v0.2.0`):** every **Critical, High, and Medium** finding is
-**resolved or closed** — including the full O-series (O12/O11/O9/O7 + O7-rest-b), N-series
-(N2-r/N7/N8/N3-r), P1 (both halves), M4, D1-r, the atomic full-refresh (O2-r), and the entire verify
-V-series (V8, VA1-r, V3-r Tier 1+2, V5, V6, V6-r). What remains open is exclusively **Low tier /
-deferred residuals**, each documented below: V8-r, T6-r, M2-r2, D1-r/-r2/-r3 (D1-r done; -r2/-r3
-low/info), P1-r-a2, P1-r-b, S2-r, VA1-r (done), N1-u, N1-r2, O2-r (done), O13, and the §5 Lows.
-Verify's verdict-gating vs diagnostic layers are documented in `docs/verify-checks.md`. `crates/mysql-metadata-probe`
-gained a PK-classification survey (V3-r input; local diagnostic tool, not part of the parket gate).
+**Completion status (2026-07-16, tagged `v0.2.1`):** BOTH audit passes are resolved. The original audit
+(§1–§6): every **Critical, High, and Medium** finding is resolved or closed — the full O-series
+(O12/O11/O9/O7 + O7-rest-b), N-series (N2-r/N7/N8/N3-r), P1 (both halves), M4, D1-r, the atomic
+full-refresh (O2-r), and the entire verify V-series (V8, VA1-r, V3-r Tier 1+2, V5, V6, V6-r). The
+**fresh `fable` audit (§7)**: every **Critical, High, and Medium** resolved — FA1/FA3 (full-refresh
+safe-cast + source-schema adoption via a Metadata action), FA2 (two-stream update-window cap), FA4
+(bounded default `delete_then_append` session), FA5 (quoted two-stream identifiers) — plus the
+worthwhile Lows FA6/FA7/FA8/FA9/FA10/FA12 and §5's L5/L6 (L2 found already-fixed). What remains open is
+exclusively **Low-tier / deferred residuals**, each documented below with rationale: FA11, FA4-r, V8-r,
+T6-r, M2-r2, D1-r2/-r3, P1-r-a2/-b, S2-r, N1-u, N1-r2, L1, L4, L7, O13, V6-r. Verify's verdict-gating vs
+diagnostic layers are documented in `docs/verify-checks.md`; `crates/mysql-metadata-probe` carries a
+PK-classification survey (V3-r input; local diagnostic tool, not part of the parket gate).
 
 ## 0. Process, gate, and state
 
@@ -32,16 +36,16 @@ a plan → confirm → implement+test → review → commit loop, stopping for c
 snapshot branch (`snapshot/pre-<step>-<date>`) before starting each fix; small reviewable diffs; never
 weaken an existing test assertion to make it pass.
 
-**Branch state (2026-07-15):** `master` and the active `test/verify-docker-integration` branch share
-the same head, now tagged **`v0.2.0`** (bumped from `0.1.2`). All work through the full audit sweep
-is on `master`, **62 commits ahead of `origin/master`** and prepared for the operator to push
-(remote gitops run manually with an SSH key). `vendor/connector_arrow`: upstream PR #79 **merged**
-and released as v0.12.1 — submodule on aljazerzen upstream at `3e98df6`; the temporary fork pin is
-retired. Coverage gate (re-measured 2026-07-15 at release time): `cargo llvm-cov --lib -p parket
---fail-under-lines 90` reports **91.32% lines** (regions 89.20%, functions 92.10%), exit 0 — passes
-(`verify/source.rs` reads 0% under `--lib`: it is Docker-integration-only, covered by the 33-test
+**Branch state (2026-07-16):** `master` and the active `test/verify-docker-integration` branch share
+the same head, now tagged **`v0.2.1`** (bumped from `0.2.0` — the fresh `fable`-audit fixes). All work
+is on `master`, ahead of `origin/master` and prepared for the operator to push (remote gitops run
+manually with an SSH key). `vendor/connector_arrow`: upstream PR #79 **merged** and released as
+v0.12.1 — submodule on aljazerzen upstream at `3e98df6`; the temporary fork pin is retired.
+Coverage gate (re-measured 2026-07-16 at v0.2.1 release time): `cargo llvm-cov --lib -p parket
+--fail-under-lines 90` reports **91.59% lines** (regions 92.35%, functions 89.52%), exit 0 — passes
+(`verify/source.rs` reads 0% under `--lib`: it is Docker-integration-only, covered by the 38-test
 Docker suite instead). Local gate at release: `cargo build` clean, `cargo clippy --all-targets -D
-warnings` clean, `cargo test --lib` **589 passed**, full Docker integration suite **33 passed**.
+warnings` clean, `cargo test --lib` **622 passed**, full Docker integration suite **38 passed**.
 
 **Cross-engine status (updated after `108d9e3`):** the verify value-aggregate SQL is now
 **execution-proven** against real MariaDB + MinIO for: full-refresh/basic deep verify across
