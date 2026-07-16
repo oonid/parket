@@ -62,22 +62,35 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Generate SHA256 checksums
+      - name: Package binaries into per-target tar.gz + checksums
         run: |
           cd artifacts
-          sha256sum ${{ env.BINARY_NAME }}-* > ../checksums-sha256.txt
-          mv ../checksums-sha256.txt .
-          echo "## SHA256 Checksums" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cat checksums-sha256.txt >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          # Version from the tag (v0.2.1 -> 0.2.1); the archive name carries the version and
+          # target, but the binary INSIDE stays a plain version-less `parket`.
+          VERSION="${GITHUB_REF_NAME#v}"
+          PREFIX="${BINARY_NAME}-"
+          # Snapshot the raw per-target binaries BEFORE any tarball exists (so the glob below
+          # can't re-match a just-created .tar.gz).
+          mapfile -t BINS < <(ls "${BINARY_NAME}"-*)
+          for f in "${BINS[@]}"; do
+            target="${f#$PREFIX}"                 # e.g. x86_64-unknown-linux-musl
+            cp "$f" "${BINARY_NAME}"              # binary itself: no version, no target
+            chmod +x "${BINARY_NAME}"
+            tar -czf "${BINARY_NAME}-${VERSION}-${target}.tar.gz" "${BINARY_NAME}"
+            rm -f "${BINARY_NAME}"
+          done
+          sha256sum "${BINARY_NAME}"-*.tar.gz > checksums-sha256.txt
+          echo "## SHA256 Checksums (tar.gz)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat checksums-sha256.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
-            artifacts/${{ env.BINARY_NAME }}-*
+            artifacts/${{ env.BINARY_NAME }}-*.tar.gz
             artifacts/checksums-sha256.txt
 
   docker:
