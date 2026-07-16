@@ -226,12 +226,17 @@ plan→implement→review remediation loop; none fixed yet.
   alongside the input MemTable (~2× window, bounded by the breaker) — dedup-without-materialization
   (distinct-keys-first, re-materialize only on actual dupes) is a deferred perf optimization, not required to
   close the OOM-risk (the bounded pool + spill does).
-- **FA5** — unquoted, case-normalized identifiers in `merge_batch`/`delete_then_append` DataFusion SQL +
-  `col()` exprs (`writer/two_stream.rs:132-161, 300-356`). DataFusion normalizes unquoted identifiers to
-  lowercase → a mixed-case column (`userId`), a reserved-word column (`order`), or a source column named
-  `__rn` (the dedup alias) fails the table on every update window (hard error, not corruption). verify's
-  probes backtick-quote for exactly this reason; the writer path doesn't. **Fix:** backtick-quote all
-  identifiers in the dedup SQL; use `Expr::Column`/`ident()` to bypass normalization; pick a collision-proof alias.
+- **FA5** — **done** (`7ce3132`). Unquoted, case-normalized identifiers in `merge_batch`/`delete_then_append`
+  DataFusion SQL + `col()` exprs. DataFusion normalizes unquoted identifiers to lowercase → a mixed-case
+  column (`userId`), a reserved-word column (`order`), or a source column named like the dedup alias failed
+  the table on every update window (hard error, not corruption). **Resolved:** the dedup SQL now
+  backtick-quotes column identifiers (reusing `query::backtick`, made `pub(crate)`); the merge
+  predicate/update-insert value exprs + delete predicate use non-normalizing `Expr::Column(Column::new(...))`
+  instead of `col(format!(...))`; the rownum alias is collision-proof (`dedup_rownum_alias` picks a name not
+  among the columns). Verified the merge `.update/.set` TARGET-column arg already preserves case
+  (`DeltaColumn::from` → `Column::from_qualified_name_ignore_case`), so only the source value-expr needed the
+  fix. Lowercase behavior unchanged. Docker-proven under BOTH strategies (`delete_then_append` +
+  `UPDATE_STRATEGY=merge`) with a mixed-case `userId` + reserved-word column; full 38-test suite green.
 
 ### 7.4 Open — Low
 - **FA6** — adaptive batch sizing runs once per PROCESS not per table: `BatchExtractor.adapted`
