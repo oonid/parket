@@ -94,6 +94,50 @@ TABLE_UPDATE_CURSOR_events=completed_at
 
 In this config, the `events` table runs two-stream mode: the insert stream fetches new `events` by `id > last_id`, and the update stream fetches rows where `completed_at` has advanced. Both are merged into the Delta table keyed on `id`, ensuring the lake reflects the latest state of every row without a full refresh.
 
+## Per-Table One-Shot Reconcile (`TABLE_RECONCILE`)
+
+Over time a two-stream table accumulates drift the update stream cannot heal — mutations that never advance the update cursor (e.g. a `completed_at` cursor misses edits to already-completed rows, and rows whose `completed_at` is still NULL). To re-align the Delta copy with the source **without** permanently switching the table to full refresh, run a **one-shot reconcile**:
+
+```
+TABLE_RECONCILE_<TABLENAME>=true
+```
+
+### What it does
+
+For a single run, the flagged table is extracted as a **full snapshot** and atomically overwritten (the same commit protocol as `full_refresh`) — and the overwrite commit is stamped with the two-stream high watermarks so the **next** run resumes as normal two-stream incremental:
+
+- `hwm_insert_id` = the snapshot's max primary-key id (insert stream resumes at `id >` this).
+- `hwm_updated_at` = the source's current `MAX(<update_cursor>)`, or `1970-01-01 00:00:00` if the cursor is currently all-NULL. The update stream is an idempotent upsert, so resuming here only re-writes identical rows in a small overlap window.
+- `hwm_last_id` = `i64::MAX` (tie-break sentinel).
+
+So a reconcile is a **repair, not a mode**: it heals accumulated drift in one full pass and hands the table straight back to cheap two-stream incremental — **no manual `TABLE_HWM` re-seed required** (this is what distinguishes it from a manual `full_refresh` round-trip).
+
+### One-shot usage
+
+Set the flag for a single run, then remove it:
+
+```env
+# normal days: two-stream incremental (cheap)
+TABLE_INSERT_CURSOR_events=id
+TABLE_UPDATE_CURSOR_events=completed_at
+
+# repair day: add the flag for ONE run, then delete it
+TABLE_RECONCILE_events=true
+```
+
+The next run (flag removed) is normal two-stream incremental again, resuming from the stamped watermarks.
+
+### Requirements & validation (fail at startup)
+
+- Value must be exactly `true` or `false` (case/whitespace-insensitive); anything else errors.
+- The table **must** have two-stream cursor config (`TABLE_INSERT_CURSOR_<t>` **and** `TABLE_UPDATE_CURSOR_<t>`) — reconcile currently supports only two-stream tables.
+- `TABLE_MODE_<t>` must **not** be set alongside `TABLE_RECONCILE_<t>` — they are conflicting ways of steering the same table.
+- The insert cursor must be an integer primary key (keyset pagination is required to seed `hwm_insert_id`; a table with no integer PK bails at commit time).
+
+### Cost
+
+A reconcile reads the entire table (one full snapshot) — expensive relative to a normal incremental run. Run it **occasionally** (to clear accumulated drift), not every run; between reconciles, two-stream incremental carries the load.
+
 ## Per-Table Initial High Watermark (HWM)
 
 For incremental tables, you can predefine a starting High Watermark (HWM) to seed the first incremental run:

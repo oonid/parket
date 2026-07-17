@@ -18,6 +18,22 @@ T6-r, M2-r2, D1-r2/-r3, P1-r-a2/-b, S2-r, N1-u, N1-r2, L1, L4, L7, O13, V6-r. Ve
 diagnostic layers are documented in `docs/verify-checks.md`; `crates/mysql-metadata-probe` carries a
 PK-classification survey (V3-r input; local diagnostic tool, not part of the parket gate).
 
+**Post-sync operational evaluation (2026-07-16, `fable` model, live DB+S3 verified) — see §8.** A full
+production sync of all 8 configured tables to `s3://dcdanalytics/parket/` (v0.2.1 release binary, run
+under an enforced 8 GB cgroup cap) was evaluated end-to-end against the live source. Result: **provably
+consistent at the sync frontier** (exact row parity incl. the 114.3M-row two-stream table; sane HWMs;
+atomic commit trail; FA2/D3 fixes confirmed working in production; 2.58 GB peak vs 8 GB). The residual
+risks are **semantic, not mechanical** — chiefly the `completed_at` update-cursor blind spot on
+`developer_journey_trackings` (§8). New/operator findings recorded in §8: **PS-M1** (a genuine new
+verify false-DISCREPANCY bug), **PS-H-A** (the trackings freshness-contract decision), **PS-H-B**
+(= the un-implemented fix (b) of H-2026-07-11-1), and PS-M2/M3/L1–L3. **PS-H-B is now resolved**
+(`bd13be5` — the `TABLE_RECONCILE` one-shot reconcile flag; see §8.2); the rest are recorded for the
+remediation loop when bandwidth is available. A `fable` follow-up investigation established that the
+trackings engagement drift is a **frozen historical backlog** (`last_viewed` stopped advancing
+~2025-02-03), so a *dynamic/multi-field* update cursor would catch ≈0 rows/day and can't heal the
+backlog — the PS-H-A remedy is a one-time reconcile (now clean via PS-H-B), not a cursor change; a new
+`crates/trackings-drift-census` diagnostic tracks the backlog day-by-day.
+
 ## 0. Process, gate, and state
 
 **Gate (run after every change; never trust a sub-agent's self-reported exit codes — re-run yourself
@@ -279,3 +295,140 @@ SQL parity (DECIMAL(65)/i128/BINARY consistent on both probes), discovery/mode-r
 explored: the ~2,700 lines of test bodies (function lists only), vendored connector_arrow internals, and
 whether delta-rs's Overwrite `CommitBuilder` does any protocol-level schema validation that would incidentally
 catch FA3(a) (staged parquet is written against the old schema regardless).
+
+## 8. Post-sync operational evaluation — 2026-07-16 (`fable` model, live DB + S3 verified)
+
+Not a code audit: an evaluation of the RESULTS of the first full production sync (all 8 configured
+tables, v0.2.1 release binary, 8 GB cgroup cap). DB tunnel was UP; evidence = `--check`/`--inspect`/
+`--verify` (7 light tables + 4 forced-deep + trackings non-deep), all 8 `_delta_log`s parsed for exact
+live-row counts + HWM metadata, read-only source `COUNT`/single-pass aggregates, `state.json`, `s3cmd
+du`. IDs prefixed **`PS`** (post-sync). All findings are CANDIDATES / operator decisions — **none
+actioned**.
+
+### 8.0 Consistency verdict (evidence)
+All 8 tables **consistent at the sync frontier**; Delta rows = Σ live-file `numRecords` from `_delta_log`:
+
+| Table | Mode | Delta rows | Frontier/verify check |
+|---|---|---|---|
+| developer_journeys | full_refresh | 229 | `--verify` PASS (counts+aggregates+census+sample) |
+| partner_programs | incremental | 577 | PASS; a later re-run appended 0 rows (idempotent resume) |
+| developer_journey_completions | full_refresh | 1,018,523 | deep verify → DRIFT = expected snapshot lag (+114 post-sync inserts) |
+| users | full_refresh | 1,438,175 | deep verify → DRIFT (+195 post-sync) — expected lag |
+| multi_course_tokens | incremental | 1,623,997 | frontier `COUNT(id≤6765879)` **exact**; deep verify DISCREPANCY = **PS-M1 false alarm** |
+| multi_course_token_courses | incremental | 4,576,482 | frontier `COUNT(id≤19504722)` **exact**; deep verify PASS |
+| developer_journey_tutorials | full_refresh | 11,475 | `--verify` PASS |
+| **developer_journey_trackings** | **two_stream** | **114,314,708** | frontier `COUNT(id≤499855374)` = **114,314,708 exact**; verdict SKIPPED (>1M cap, by design) |
+
+HWMs read back exactly what each run wrote; every trackings commit re-stamps all watermark keys (so
+latest-commit-only `read_hwm` is coherent). `state.json`: all 8 `success`; trackings `last_run_rows =
+114,315,491` = 114,314,708 inserts + 783 updates. The four full_refresh fallbacks (nullable
+`updated_at`) are the correct self-healing choice (O2-r single-commit overwrite = exact snapshot each
+run); their per-run cost is trivial vs trackings (users 225 s/1.44M, completions 44 s, tutorials 51 s,
+journeys 3 s). Memory: 2.58 GB peak vs 8 GB (peak at Stream B's FA4 bounded merge, not the bulk insert).
+
+### 8.1 The `developer_journey_trackings` update-cursor blind spot (quantified)
+Schema ground truth (`--inspect` + full-table aggregate): columns are `id, journey_id, tutorial_id,
+developer_id, status(char), last_viewed, first_opened_at, completed_at, developer_journey_status_hash`
+— **no `created_at`/`updated_at` at all**; `completed_at` is nullable **and unindexed**. So
+`completed_at` was the only possible update cursor without a source schema change. It tracks
+**completions only**. The blind spot is wider than the NULL warning implies:
+- **NULL `completed_at` now: 22,920,651** (~22.92M; 22,920,128 in-frontier). **1,539,399 of them (~6.7%)
+  demonstrably mutate** (`last_viewed > first_opened_at`) — invisible until/unless the row completes.
+- **11,267,003 completed rows (12.3% of the 91.4M completed) have post-completion edits**
+  (`last_viewed > completed_at`) that **never re-sync** — `completed_at` doesn't advance, so Stream B
+  never re-selects them.
+- `status` is not derivable from `completed_at` (20,136,001 rows `status='1'` with NULL `completed_at`;
+  83,924 `status='0'` with a completion ts). Backdated `completed_at` (≤ HWM) and source-side DELETEs
+  would also never propagate (none observed in the 2.5 h window; frontier parity stayed exact).
+- **Self-healing works** (PS case 0): when a NULL row finally gets a `completed_at`, it jumps past the
+  HWM and Stream B re-captures the *entire current row* — erasing accumulated drift on it (~374 rows
+  healed in the hours after the sync). D3 first-run seed left no gap (persisted at v1 before either
+  stream wrote; every later commit carried watermarks forward). `delete_then_append` on 783 keys is
+  correct + idempotent (`writer/two_stream.rs:321-440`); FA2 cap held in production (v26 max id
+  499855371 ≤ 499855374). This is exactly the documented **D2/O3** trade-off, re-warned every run.
+- **Bottom line:** **exact if downstream consumes *completion facts*** (id/developer/tutorial/journey/
+  completed_at) — inserts complete + every completion re-syncs; **silently decays if it needs *current
+  engagement state*** (`last_viewed`/`status`/`status_hash`) — ~6.7% of NULL rows + every post-completion
+  edit go stale between full reconciles.
+
+### 8.2 Open — High
+- **PS-H-A** (High, **operator decision**) — close the trackings update blind spot per §8.1. Options,
+  best first: **(1)** source team adds `updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE
+  CURRENT_TIMESTAMP` (+index), then a **config-only** cursor swap `TABLE_UPDATE_CURSOR_developer_journey_trackings=updated_at`
+  (captures every mutation; needs a one-time full-refresh/`TABLE_HWM` baseline); **(2)** available today,
+  config-only: periodic (monthly) `TABLE_MODE=full_refresh` reconcile — temporarily remove the two cursor
+  vars (O5 bails on the conflict), run (~20–25 min, ~3.7 GB S3 rewrite, proven under 8 GB), then restore
+  two-stream config **with a fresh `TABLE_HWM_developer_journey_trackings=<MAX(completed_at)>,<MAX(id)>`
+  seed** (format per `docs/config.md`); flushes never-propagated DELETEs/backdated ts too; **(3)**
+  compound/COALESCE cursor = code change (`query.rs` cursors are backticked names only) — not worth it vs
+  (1); **(4)** accept-and-document — valid ONLY if downstream consumes completion facts (§8.1). The *loss*
+  is tracked+accepted (D2/O3); the *remediation choice* is unrecorded — pick one and record it here.
+- **PS-H-B** — **done** (`bd13be5`). Was: stamp the snapshot max-cursor HWM on full-refresh's final commit
+  (`orchestrator/full_refresh.rs` called `commit_overwrite(table_name, None)`) — fix (b) of H-2026-07-11-1,
+  left optional and unimplemented; without it every full_refresh→two-stream round-trip (incl. the PS-H-A
+  option-2 reconcile) needed a manual `TABLE_HWM` re-seed. **Resolved** — but the clean, correct fix turned
+  out **medium, not "small":** a *forced* full_refresh strips the cursor vars, so it can't know the future
+  two-stream cursors, and the two resume paths read different keys (`read_insert_hwm`→`hwm_insert_id`;
+  `read_hwm`→`hwm_updated_at`+`hwm_last_id`). Implemented as a dedicated one-shot flag **`TABLE_RECONCILE_<t>=true`**
+  (used alongside the retained two-stream cursor config, so no O5 conflict; see `docs/config.md`): it routes
+  the table through the O2-r atomic-overwrite path AND stamps all three two-stream HWM keys on that commit —
+  `hwm_insert_id` from a new `max_key_seen` tracker (NOT `last_key`, which is deliberately un-advanced on the
+  terminal chunk → `None` for single-chunk tables; a real bug caught in review), `hwm_updated_at` from source
+  `MAX(update_col)` (or a `1970-01-01 00:00:00` epoch sentinel when the cursor is currently all-NULL — edge
+  fixed so reconcile *always* stamps, never silently leaving an unstamped commit that would bail next run),
+  `hwm_last_id`=`i64::MAX`. Non-reconcile paths byte-identical (`commit_overwrite` gained an optional
+  `insert_id`; `None,None` = prior behavior). Strictly validated (requires two-stream cursors; rejects a
+  `TABLE_MODE` conflict). Gate: 641 lib tests, clippy `--all-targets` clean, coverage 92.54% lines. No Docker
+  test added — reuses the already-Docker-proven O2-r overwrite + two-stream HWM stamping. This makes the
+  PS-H-A option-2 reconcile a clean, mistake-proof one-shot (no manual seed).
+
+### 8.3 Open — Medium
+- **PS-M1** (Medium, **code**, NEW — not previously in the register) — `--verify` false-alarms
+  **DISCREPANCY** on update-active incremental tables. Observed live: `multi_course_tokens` deep verify
+  gave `delta_latest = 1,623,997 > source_scoped = 1,623,980` with identical min/max. The 17 "extra"
+  rows were updated *after* the sync: their source `updated_at` moved past the HWM (out of source scope)
+  while their pre-update versions remain in delta scope (`verify/delta.rs:493`). A benign steady-state
+  condition that currently exits non-zero → cries wolf on alerts. **Fix (`verify.rs`):** give incremental
+  the same conservative asymmetry the two-stream path already has (`two_stream_key_stats_outcome`,
+  `verify.rs:594` — delta-superset + range-contained ⇒ Drift), or re-probe the surplus keys against the
+  *unscoped* source before declaring Discrepancy. Trade-off: slightly weaker duplicate detection
+  (mitigated by the distinct-count check).
+- **PS-M2** (Medium, **ops/DBA**, no code) — add a source index on `developer_journey_trackings.completed_at`.
+  Stream B's window query AND the per-run D2 NULL census each full-scan ~114M rows (~3 min each) every
+  sync because `completed_at` is unindexed; an index makes both near-free and cuts tunnel/DB load as the
+  table grows. Trade-off: one-time build + marginal write overhead on a hot table (assess with DBA).
+- **PS-M3** (Medium, **ops**) — establish a vacuum/housekeeping cadence. Tombstoned parquet accumulates:
+  trackings carries 11 dead files; each `users` full_refresh adds ~280 MB of tombstones; failed
+  full-refresh runs orphan staged files (FA11, deferred). E.g. monthly Delta `VACUUM` at default
+  retention, after confirming no time-travel consumers.
+
+### 8.4 Open — Low
+- **PS-L1** (Low, doc; ties **L7** + H-2026-07-11-1) — runbook the two-stream delete/append crash
+  recovery: a run that dies between the DELETE commit (carries NO hwm metadata — confirmed in v25) and the
+  APPEND commit leaves the latest commit HWM-less → next run's `read_insert_hwm` returns None → has_data
+  guard bails "has data but no stored insert watermark" (`orchestrator/two_stream.rs:79-85`). Recovery:
+  read the last good commit's HWMs from `_delta_log` (plain JSON) and set `TABLE_HWM_<t>`. Optional code:
+  attach commit properties to the DELETE commit too (`writer/two_stream.rs`).
+- **PS-L2** (Low, doc; O1-adjacent) — document the sub-second HWM boundary race (a row completing in the
+  same wall-second as the HWM, after Stream B's query ran, with id ≤ the tie-break id, is skipped forever
+  — DATETIME second granularity) and the backdated-`completed_at` (≤ HWM) exclusion. Both bounded by the
+  PS-H-A periodic reconcile.
+- **PS-L3** (Low, no action) — keep the four full_refresh tables as-is: correct self-healing mode for
+  nullable-`updated_at` tables at this size. If the app ever makes `updated_at` NOT NULL, auto-detection
+  flips them to incremental by itself — re-baseline HWMs when that happens.
+
+### 8.5 Recurring verification plan (cheap-first; operator runbook)
+- **After every sync (~10 min):** (1) `--verify` on the 7 light tables (expect PASS/SKIPPED; a
+  DISCREPANCY with `delta_latest > source_scoped` + equal min/max = the benign PS-M1 signature); (2)
+  `TABLES=developer_journey_trackings --verify` (schema + counts; verdict SKIPPED expected; healthy =
+  source−delta gap ≈ new inserts, schema 9=9); (3) latest trackings `_delta_log` commit MUST carry all
+  three hwm keys (`hwm_insert_id`/`hwm_updated_at`/`hwm_last_id`) — a missing set ⇒ next run bails,
+  re-seed per PS-L1; (4) `state.json` all `last_run_status == "success"`.
+- **Weekly:** `--verify --verify-deep` on everything except trackings (≤4.6M each, ~3 min total).
+- **Monthly / pre-critical-use:** trackings frontier parity (far cheaper than deep verify on 114M):
+  read `hwm_insert_id` from the latest commit → source `COUNT(*) WHERE id <= <hwm_insert_id>` (~2 min, PK
+  range) vs Σ live-file `numRecords` from `_delta_log` (seconds). Any inequality = real drift (in-scope
+  deletes or sync loss) → schedule the PS-H-A reconcile. Blind-spot estimator: track growth of
+  `COUNT(completed_at IS NULL AND last_viewed > first_opened_at)` (now 1,539,399) and, if engagement
+  state matters downstream, `last_viewed > completed_at` (now 11,267,003). Reserve full `--verify-deep`
+  on trackings for right after each PS-H-A full reconcile, off-peak.
