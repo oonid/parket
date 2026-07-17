@@ -189,8 +189,13 @@ impl DeltaWrite for DeltaWriterAdapter {
         self.inner.stage_overwrite_chunk(table_name, batches).await
     }
 
-    async fn commit_overwrite(&self, table_name: &str, hwm: Option<&Hwm>) -> Result<()> {
-        self.inner.commit_overwrite(table_name, hwm).await
+    async fn commit_overwrite(
+        &self,
+        table_name: &str,
+        hwm: Option<&Hwm>,
+        insert_id: Option<i64>,
+    ) -> Result<()> {
+        self.inner.commit_overwrite(table_name, hwm, insert_id).await
     }
 
     async fn read_hwm(&self, table_name: &str) -> Result<Option<Hwm>> {
@@ -312,8 +317,13 @@ impl DeltaWrite for LocalDeltaWriterAdapter {
         self.inner.stage_overwrite_chunk(table_name, batches).await
     }
 
-    async fn commit_overwrite(&self, table_name: &str, hwm: Option<&Hwm>) -> Result<()> {
-        self.inner.commit_overwrite(table_name, hwm).await
+    async fn commit_overwrite(
+        &self,
+        table_name: &str,
+        hwm: Option<&Hwm>,
+        insert_id: Option<i64>,
+    ) -> Result<()> {
+        self.inner.commit_overwrite(table_name, hwm, insert_id).await
     }
 
     async fn read_hwm(&self, table_name: &str) -> Result<Option<Hwm>> {

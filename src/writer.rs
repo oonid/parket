@@ -22,7 +22,7 @@ mod hwm;
 mod schema;
 mod two_stream;
 
-use hwm::build_commit_properties;
+use hwm::{build_commit_properties, build_two_stream_commit_properties};
 pub use hwm::{extract_hwm_from_batch, extract_max_id, hwm_has_advanced};
 use schema::*;
 
@@ -467,7 +467,19 @@ impl DeltaWriter {
     /// interruption before it leaves the staged parquet orphaned (vacuum-able) with the live
     /// table untouched. Evicts the P1 table_cache entry afterward — the overwrite advanced the
     /// version outside that cached handle.
-    pub async fn commit_overwrite(&self, table_name: &str, hwm: Option<&Hwm>) -> Result<()> {
+    ///
+    /// PS-H-B: `insert_id` is the two-stream insert-cursor watermark to stamp ALONGSIDE `hwm`
+    /// (the two-stream update-cursor watermark) when a table reconcile's one-shot full snapshot
+    /// re-seeds BOTH streams in this same atomic commit. When both are `Some`, the commit is
+    /// stamped via `build_two_stream_commit_properties` (all three of `hwm_insert_id` /
+    /// `hwm_updated_at` / `hwm_last_id`); otherwise this is byte-identical to before PS-H-B —
+    /// `build_commit_properties(hwm)` alone (no `hwm_insert_id` key at all).
+    pub async fn commit_overwrite(
+        &self,
+        table_name: &str,
+        hwm: Option<&Hwm>,
+        insert_id: Option<i64>,
+    ) -> Result<()> {
         let session = {
             let mut sessions = self.overwrite_sessions.lock().await;
             sessions.remove(table_name).ok_or_else(|| {
@@ -508,7 +520,14 @@ impl DeltaWriter {
         let added_files = adds.len();
         actions.extend(adds.into_iter().map(Action::Add));
 
-        let commit_properties = build_commit_properties(hwm);
+        // PS-H-B: a reconcile commit carries BOTH watermarks (insert_id + hwm) in one atomic
+        // commit — build_two_stream_commit_properties stamps all three keys a two-stream resume
+        // needs. Any other combination (including a lone insert_id with no hwm, which reconcile
+        // never produces) falls back to the pre-PS-H-B single-stream stamping, unchanged.
+        let commit_properties = match (insert_id, hwm) {
+            (Some(id), Some(h)) => build_two_stream_commit_properties(Some(id), Some(h)),
+            _ => build_commit_properties(hwm),
+        };
         let log_store = table.log_store();
         let finalized = CommitBuilder::from(commit_properties)
             .with_actions(actions)
@@ -533,6 +552,7 @@ impl DeltaWriter {
             files_removed = removed_files,
             files_added = added_files,
             schema_replaced,
+            hwm_insert_id = ?insert_id,
             hwm_updated_at = ?hwm.as_ref().map(|h| h.updated_at.as_str()),
             hwm_last_id = ?hwm.as_ref().map(|h| h.last_id),
             "commit_overwrite: atomic overwrite committed (single commit swaps entire snapshot)"
@@ -1179,7 +1199,7 @@ mod tests {
         .unwrap();
         writer.stage_overwrite_chunk("t", vec![chunk2]).await.unwrap();
 
-        writer.commit_overwrite("t", None).await.unwrap();
+        writer.commit_overwrite("t", None, None).await.unwrap();
 
         // Fresh-load (bypassing any cache) and verify the swap.
         let table = writer.open_table("t").await.unwrap();
@@ -1256,7 +1276,7 @@ mod tests {
         )
         .unwrap();
         writer.stage_overwrite_chunk("t", vec![chunk]).await.unwrap();
-        writer.commit_overwrite("t", None).await.unwrap();
+        writer.commit_overwrite("t", None, None).await.unwrap();
 
         // Fresh-load (bypassing any cache) and verify the Delta schema now HAS `extra`.
         let table = writer.open_table("t").await.unwrap();
@@ -1331,7 +1351,7 @@ mod tests {
         )
         .unwrap();
         writer.stage_overwrite_chunk("t", vec![chunk]).await.unwrap();
-        writer.commit_overwrite("t", None).await.unwrap();
+        writer.commit_overwrite("t", None, None).await.unwrap();
 
         let table = writer.open_table("t").await.unwrap();
         assert_eq!(
@@ -1401,7 +1421,7 @@ mod tests {
             .stage_overwrite_chunk("t", vec![chunk])
             .await
             .expect("staging a non-nullable batch into the nullable table must be coerced, not rejected");
-        writer.commit_overwrite("t", None).await.unwrap();
+        writer.commit_overwrite("t", None, None).await.unwrap();
 
         let table = writer.open_table("t").await.unwrap();
         let ctx = deltalake::datafusion::prelude::SessionContext::new();
@@ -1525,5 +1545,79 @@ mod tests {
             .values()
             .to_vec();
         assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    /// PS-H-B: a table reconcile's final commit passes BOTH `hwm` (the two-stream update
+    /// watermark) and `insert_id` (the two-stream insert watermark) to `commit_overwrite` in
+    /// the SAME atomic commit — this must stamp all three `hwm_insert_id`/`hwm_updated_at`/
+    /// `hwm_last_id` keys so a two-stream resume (`read_insert_hwm` + `read_hwm`) finds every
+    /// key it needs, with no separate commit and no manual seed.
+    #[tokio::test]
+    async fn commit_overwrite_with_insert_id_stamps_two_stream_hwm() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Utf8, false),
+        ]));
+        writer.ensure_table("t", schema.clone()).await.unwrap();
+
+        writer.begin_overwrite("t", schema.clone()).await.unwrap();
+        let chunk = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2i64, 3i64])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+        writer.stage_overwrite_chunk("t", vec![chunk]).await.unwrap();
+
+        let hwm = Hwm { updated_at: "2026-07-01 00:00:00".to_string(), last_id: i64::MAX };
+        writer
+            .commit_overwrite("t", Some(&hwm), Some(3))
+            .await
+            .expect("reconcile commit must succeed");
+
+        let insert_hwm = writer.read_insert_hwm("t").await.unwrap();
+        assert_eq!(insert_hwm, Some(3), "hwm_insert_id must round-trip as the reconcile's max PK id");
+
+        let update_hwm = writer.read_hwm("t").await.unwrap().expect("hwm_updated_at/hwm_last_id must be stamped");
+        assert_eq!(update_hwm.updated_at, "2026-07-01 00:00:00");
+        assert_eq!(update_hwm.last_id, i64::MAX, "reconcile's update watermark uses the D3 tie-break sentinel");
+    }
+
+    /// PS-H-B regression: the non-reconcile path (`insert_id: None`) must remain byte-identical
+    /// to before — no `hwm_insert_id` key at all, even when a plain `hwm` is also stamped (the
+    /// normal single-stream incremental overwrite case, not exercised by full_refresh today but
+    /// guarded here since `commit_overwrite` is a shared, general-purpose method).
+    #[tokio::test]
+    async fn commit_overwrite_without_insert_id_stamps_no_insert_hwm_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Utf8, false),
+        ]));
+        writer.ensure_table("t", schema.clone()).await.unwrap();
+
+        writer.begin_overwrite("t", schema.clone()).await.unwrap();
+        let chunk = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1i64])),
+                Arc::new(StringArray::from(vec!["a"])),
+            ],
+        )
+        .unwrap();
+        writer.stage_overwrite_chunk("t", vec![chunk]).await.unwrap();
+
+        let hwm = Hwm { updated_at: "2026-07-01 00:00:00".to_string(), last_id: 1 };
+        writer.commit_overwrite("t", Some(&hwm), None).await.unwrap();
+
+        let insert_hwm = writer.read_insert_hwm("t").await.unwrap();
+        assert_eq!(insert_hwm, None, "no insert_id passed means no hwm_insert_id key, unchanged from before PS-H-B");
+        let update_hwm = writer.read_hwm("t").await.unwrap().expect("hwm_updated_at/hwm_last_id must still be stamped");
+        assert_eq!(update_hwm.last_id, 1);
     }
 }

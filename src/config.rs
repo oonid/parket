@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
@@ -32,6 +32,11 @@ pub struct Config {
     pub table_timestamp_col: HashMap<String, String>,
     pub table_insert_cursor: HashMap<String, String>,
     pub table_update_cursor: HashMap<String, String>,
+    /// PS-H-B: tables with `TABLE_RECONCILE_<table>=true` set for this run — a one-shot
+    /// full snapshot (reusing the full-refresh atomic-overwrite path) whose final commit is
+    /// ALSO stamped with the two-stream HWM keys, so the next (flag-removed) run resumes as
+    /// normal two-stream incremental with no manual HWM seed.
+    pub table_reconcile: HashSet<String>,
 }
 
 // S1: a derived Debug would print `database_url` (with password) and
@@ -62,6 +67,7 @@ impl std::fmt::Debug for Config {
             .field("table_timestamp_col", &self.table_timestamp_col)
             .field("table_insert_cursor", &self.table_insert_cursor)
             .field("table_update_cursor", &self.table_update_cursor)
+            .field("table_reconcile", &self.table_reconcile)
             .finish()
     }
 }
@@ -118,6 +124,12 @@ impl Config {
             (Some(i), Some(u)) => Some((i.clone(), u.clone())),
             _ => None,
         }
+    }
+
+    /// PS-H-B: true when `TABLE_RECONCILE_<table>=true` was set for this run — the table
+    /// should run its one-shot full-snapshot-plus-HWM-reseed path instead of its normal mode.
+    pub fn is_reconcile(&self, table: &str) -> bool {
+        self.table_reconcile.contains(table)
     }
 
     /// Minimal load for `--inspect`: only DATABASE_URL is required.
@@ -201,6 +213,8 @@ impl Config {
         let table_insert_cursor = parse_table_insert_cursor(&tables);
         let table_update_cursor = parse_table_update_cursor(&tables);
         validate_mode_conflicts(&tables, &table_modes, &table_insert_cursor, &table_update_cursor)?;
+        let table_reconcile = parse_table_reconcile(&tables)?;
+        validate_reconcile_requirements(&table_reconcile, &table_modes, &table_insert_cursor, &table_update_cursor)?;
 
         Ok(Self {
             database_url,
@@ -221,6 +235,7 @@ impl Config {
             table_timestamp_col,
             table_insert_cursor,
             table_update_cursor,
+            table_reconcile,
         })
     }
 
@@ -294,6 +309,8 @@ impl Config {
         let table_insert_cursor = parse_table_insert_cursor(&tables);
         let table_update_cursor = parse_table_update_cursor(&tables);
         validate_mode_conflicts(&tables, &table_modes, &table_insert_cursor, &table_update_cursor)?;
+        let table_reconcile = parse_table_reconcile(&tables)?;
+        validate_reconcile_requirements(&table_reconcile, &table_modes, &table_insert_cursor, &table_update_cursor)?;
 
         Ok(Self {
             database_url,
@@ -314,6 +331,7 @@ impl Config {
             table_timestamp_col,
             table_insert_cursor,
             table_update_cursor,
+            table_reconcile,
         })
     }
 
@@ -377,6 +395,9 @@ mod tests {
                 env::remove_var(&key);
             }
             for (key, _) in env::vars().filter(|(k, _)| k.starts_with("TABLE_UPDATE_CURSOR_")) {
+                env::remove_var(&key);
+            }
+            for (key, _) in env::vars().filter(|(k, _)| k.starts_with("TABLE_RECONCILE_")) {
                 env::remove_var(&key);
             }
         }
@@ -445,6 +466,11 @@ mod tests {
     #[test]
     #[serial]
     fn load_fails_when_s3_bucket_missing() {
+        // A real `.env` in an ancestor directory (this crate lives inside a larger workspace
+        // checkout) would otherwise re-populate S3_BUCKET via `dotenvy::dotenv()` right after
+        // this test removes it — `no_dotenv()` (cwd -> /tmp) defeats that upward search so the
+        // test observes a genuinely-missing var, matching the other `no_dotenv()` uses above.
+        let _guard = no_dotenv();
         clear_config_env();
         set_required_vars();
         unsafe {
@@ -463,6 +489,9 @@ mod tests {
     #[test]
     #[serial]
     fn load_fails_when_s3_access_key_id_missing() {
+        // See `load_fails_when_s3_bucket_missing` above: guard against an ancestor `.env`
+        // re-populating the var this test just removed.
+        let _guard = no_dotenv();
         clear_config_env();
         set_required_vars();
         unsafe {
@@ -481,6 +510,9 @@ mod tests {
     #[test]
     #[serial]
     fn load_fails_when_s3_secret_access_key_missing() {
+        // See `load_fails_when_s3_bucket_missing` above: guard against an ancestor `.env`
+        // re-populating the var this test just removed.
+        let _guard = no_dotenv();
         clear_config_env();
         set_required_vars();
         unsafe {
@@ -742,6 +774,9 @@ mod tests {
     #[test]
     #[serial]
     fn load_uses_defaults_for_optional_vars() {
+        // See `load_fails_when_s3_bucket_missing` above: guard against an ancestor `.env`
+        // setting S3_REGION (among others) and masking the actual defaulting behavior.
+        let _guard = no_dotenv();
         clear_config_env();
         set_required_vars();
 
@@ -1003,6 +1038,119 @@ mod tests {
 
         let result = Config::load();
         assert!(result.is_ok(), "cursors + explicit TABLE_MODE=auto should not conflict");
+    }
+
+    // PS-H-B: `TABLE_RECONCILE_<table>` one-shot reconcile flag.
+
+    #[test]
+    #[serial]
+    fn reconcile_true_with_two_stream_cursors_is_reconcile() {
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("TABLE_INSERT_CURSOR_orders", "id");
+            env::set_var("TABLE_UPDATE_CURSOR_orders", "updated_at");
+            env::set_var("TABLE_RECONCILE_orders", "true");
+        }
+
+        let config = Config::load().expect("reconcile with two-stream cursors should load");
+        assert!(config.is_reconcile("orders"));
+        assert!(!config.is_reconcile("customers"));
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_false_is_not_reconcile() {
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("TABLE_INSERT_CURSOR_orders", "id");
+            env::set_var("TABLE_UPDATE_CURSOR_orders", "updated_at");
+            env::set_var("TABLE_RECONCILE_orders", "false");
+        }
+
+        let config = Config::load().expect("reconcile=false should load");
+        assert!(!config.is_reconcile("orders"));
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_unset_is_not_reconcile() {
+        clear_config_env();
+        set_required_vars();
+
+        let config = Config::load().expect("load should succeed");
+        assert!(!config.is_reconcile("orders"));
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_invalid_value_bails() {
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("TABLE_INSERT_CURSOR_orders", "id");
+            env::set_var("TABLE_UPDATE_CURSOR_orders", "updated_at");
+            env::set_var("TABLE_RECONCILE_orders", "yes");
+        }
+
+        let result = Config::load();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("TABLE_RECONCILE_orders"), "got: {err}");
+        assert!(err.contains("yes"), "got: {err}");
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_without_two_stream_cursors_bails() {
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("TABLE_RECONCILE_orders", "true");
+        }
+
+        let result = Config::load();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("TABLE_INSERT_CURSOR_orders"), "got: {err}");
+        assert!(err.contains("TABLE_UPDATE_CURSOR_orders"), "got: {err}");
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_conflicts_with_table_mode_bails() {
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("TABLE_MODE_orders", "auto");
+            env::set_var("TABLE_INSERT_CURSOR_orders", "id");
+            env::set_var("TABLE_UPDATE_CURSOR_orders", "updated_at");
+            env::set_var("TABLE_RECONCILE_orders", "true");
+        }
+
+        let result = Config::load();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("TABLE_RECONCILE_orders"), "got: {err}");
+        assert!(err.contains("TABLE_MODE_orders"), "got: {err}");
+    }
+
+    #[test]
+    #[serial]
+    fn load_local_reconcile_without_cursors_bails() {
+        clear_config_env();
+        unsafe {
+            env::set_var("DATABASE_URL", "mysql://user:pass@host:3306/dbname");
+            env::set_var("TABLES", "orders");
+            env::set_var("TARGET_MEMORY_MB", "512");
+            env::set_var("TABLE_RECONCILE_orders", "true");
+        }
+
+        let result = Config::load_local();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("TABLE_RECONCILE_orders"), "got: {err}");
     }
 
     #[test]
@@ -1366,6 +1514,9 @@ mod tests {
     #[test]
     #[serial]
     fn load_local_uses_optional_defaults() {
+        // See `load_fails_when_s3_bucket_missing` above: guard against an ancestor `.env`
+        // setting S3_REGION (among others) and masking the actual defaulting behavior.
+        let _guard = no_dotenv();
         clear_config_env();
         unsafe {
             env::set_var("DATABASE_URL", "mysql://user:pass@host:3306/dbname");
@@ -1559,6 +1710,7 @@ mod tests {
             table_timestamp_col: HashMap::new(),
             table_insert_cursor: parse_table_insert_cursor(&["orders".to_string(), "customers".to_string()]),
             table_update_cursor: parse_table_update_cursor(&["orders".to_string(), "customers".to_string()]),
+            table_reconcile: HashSet::new(),
         };
 
         assert_eq!(

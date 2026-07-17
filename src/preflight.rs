@@ -359,6 +359,7 @@ mod tests {
             table_timestamp_col: HashMap::new(),
             table_insert_cursor: HashMap::new(),
             table_update_cursor: HashMap::new(),
+            table_reconcile: std::collections::HashSet::new(),
         }
     }
 

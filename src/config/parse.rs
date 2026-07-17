@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, Context, Result};
 
@@ -159,6 +159,64 @@ pub(crate) fn parse_table_update_cursor(tables: &[String]) -> HashMap<String, St
     map
 }
 
+/// PS-H-B: `TABLE_RECONCILE_<table>=true` selects the one-shot reconcile path for a single
+/// run — a full snapshot (reusing the full-refresh atomic-overwrite path) whose final commit
+/// is ALSO stamped with the two-stream HWM keys, so the next (flag-removed) run resumes as
+/// normal two-stream incremental. Strictly parsed like `validate_advanced_env_knobs`/FA9: only
+/// `"true"` (case/whitespace-insensitive) turns it on, only `"false"` explicitly turns it off,
+/// anything else bails actionably naming the offending key — no silent fallback.
+pub(crate) fn parse_table_reconcile(tables: &[String]) -> Result<HashSet<String>> {
+    let mut set = HashSet::new();
+    for table in tables {
+        let key = format!("TABLE_RECONCILE_{table}");
+        if let Ok(val) = std::env::var(&key) {
+            let normalized = val.trim().to_lowercase();
+            match normalized.as_str() {
+                "true" => {
+                    set.insert(table.clone());
+                }
+                "false" => {}
+                _ => bail!(
+                    "{key}={val}: must be 'true' or 'false' (one-shot table reconcile flag)"
+                ),
+            }
+        }
+    }
+    Ok(set)
+}
+
+/// PS-H-B: a reconcile-flagged table only makes sense for two-stream tables today (the
+/// reconcile commit stamps `hwm_insert_id` + `hwm_updated_at` + `hwm_last_id`, the exact set a
+/// two-stream resume needs) — bail actionably if the cursors aren't both configured, rather than
+/// silently no-op'ing the flag. `TABLE_MODE_<t>` is also rejected alongside reconcile: mode
+/// selection and the one-shot reconcile flag are two different ways of steering the same table,
+/// and letting both be set at once would leave the operator's intent ambiguous.
+pub(crate) fn validate_reconcile_requirements(
+    table_reconcile: &HashSet<String>,
+    table_modes: &HashMap<String, ExtractionMode>,
+    table_insert_cursor: &HashMap<String, String>,
+    table_update_cursor: &HashMap<String, String>,
+) -> Result<()> {
+    for table in table_reconcile {
+        let has_cursors =
+            table_insert_cursor.contains_key(table) && table_update_cursor.contains_key(table);
+        if !has_cursors {
+            bail!(
+                "TABLE_RECONCILE_{table} currently supports only two-stream tables; set \
+                 TABLE_INSERT_CURSOR_{table} and TABLE_UPDATE_CURSOR_{table}"
+            );
+        }
+        if table_modes.contains_key(table) {
+            bail!(
+                "TABLE_RECONCILE_{table} conflicts with TABLE_MODE_{table} being set; remove \
+                 TABLE_MODE_{table} — reconcile only applies to two-stream tables (selected via \
+                 TABLE_INSERT_CURSOR_{table}/TABLE_UPDATE_CURSOR_{table}, not TABLE_MODE)"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Detect total physical RAM in MB by reading `/proc/meminfo` (`MemTotal:  N kB`).
 /// Returns None on any failure or non-Linux platform, so callers never block when
 /// RAM is unknowable. NOTE: in a container this reports the HOST total, not the
@@ -251,5 +309,70 @@ mod tests {
             err.contains("MERGE_MEMORY_MB"),
             "error should mention MERGE_MEMORY_MB, got: {err}"
         );
+    }
+
+    // PS-H-B: `validate_reconcile_requirements` is a pure function of already-parsed maps, so
+    // it's exercised directly here (env-var-driven parsing itself is covered end-to-end via
+    // `Config::load` in config.rs, matching the existing convention for the other `parse_*`
+    // helpers in this module).
+
+    #[test]
+    fn validate_reconcile_requirements_ok_with_two_stream_cursors() {
+        let mut reconcile = HashSet::new();
+        reconcile.insert("orders".to_string());
+        let mut insert_cursor = HashMap::new();
+        insert_cursor.insert("orders".to_string(), "id".to_string());
+        let mut update_cursor = HashMap::new();
+        update_cursor.insert("orders".to_string(), "updated_at".to_string());
+
+        let result = validate_reconcile_requirements(&reconcile, &HashMap::new(), &insert_cursor, &update_cursor);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_reconcile_requirements_bails_without_cursors() {
+        let mut reconcile = HashSet::new();
+        reconcile.insert("orders".to_string());
+
+        let result = validate_reconcile_requirements(&reconcile, &HashMap::new(), &HashMap::new(), &HashMap::new());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("TABLE_INSERT_CURSOR_orders"), "got: {err}");
+        assert!(err.contains("TABLE_UPDATE_CURSOR_orders"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_reconcile_requirements_bails_with_only_one_cursor() {
+        let mut reconcile = HashSet::new();
+        reconcile.insert("orders".to_string());
+        let mut insert_cursor = HashMap::new();
+        insert_cursor.insert("orders".to_string(), "id".to_string());
+
+        let result = validate_reconcile_requirements(&reconcile, &HashMap::new(), &insert_cursor, &HashMap::new());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_reconcile_requirements_bails_when_table_mode_also_set() {
+        let mut reconcile = HashSet::new();
+        reconcile.insert("orders".to_string());
+        let mut insert_cursor = HashMap::new();
+        insert_cursor.insert("orders".to_string(), "id".to_string());
+        let mut update_cursor = HashMap::new();
+        update_cursor.insert("orders".to_string(), "updated_at".to_string());
+        let mut modes = HashMap::new();
+        modes.insert("orders".to_string(), ExtractionMode::Auto);
+
+        let result = validate_reconcile_requirements(&reconcile, &modes, &insert_cursor, &update_cursor);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("TABLE_RECONCILE_orders"), "got: {err}");
+        assert!(err.contains("TABLE_MODE_orders"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_reconcile_requirements_ok_when_no_reconcile_flagged() {
+        let result = validate_reconcile_requirements(&HashSet::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+        assert!(result.is_ok());
     }
 }

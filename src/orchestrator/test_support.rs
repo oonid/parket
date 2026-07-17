@@ -4,7 +4,7 @@ use crate::discovery::{ColumnInfo, IndexInfo};
 use crate::extractor::Extraction;
 use anyhow::Result;
 use deltalake::arrow::record_batch::RecordBatch;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tokio::sync::watch;
 
@@ -59,6 +59,7 @@ pub(crate) fn make_config(tables: Vec<String>) -> Config {
         table_timestamp_col: HashMap::new(),
         table_insert_cursor: HashMap::new(),
         table_update_cursor: HashMap::new(),
+        table_reconcile: HashSet::new(),
     }
 }
 
@@ -197,5 +198,6 @@ pub(crate) fn make_config_with_full_refresh(tables: Vec<String>) -> Config {
         table_timestamp_col: HashMap::new(),
         table_insert_cursor: HashMap::new(),
         table_update_cursor: HashMap::new(),
+        table_reconcile: HashSet::new(),
     }
 }

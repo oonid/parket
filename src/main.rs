@@ -650,6 +650,7 @@ mod tests {
             table_timestamp_col: std::collections::HashMap::new(),
             table_insert_cursor: std::collections::HashMap::new(),
             table_update_cursor: std::collections::HashMap::new(),
+            table_reconcile: std::collections::HashSet::new(),
         };
 
         log_startup_banner(&config, None);
@@ -682,6 +683,7 @@ mod tests {
             table_timestamp_col: std::collections::HashMap::new(),
             table_insert_cursor: std::collections::HashMap::new(),
             table_update_cursor: std::collections::HashMap::new(),
+            table_reconcile: std::collections::HashSet::new(),
         };
 
         log_startup_banner(&config, Some(std::path::Path::new("/tmp/delta")));

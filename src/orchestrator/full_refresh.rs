@@ -8,6 +8,7 @@ use tracing::info;
 
 use crate::discovery::{ColumnInfo, IndexInfo, select_integer_pk};
 use crate::query::QueryBuilder;
+use crate::writer::Hwm;
 
 use super::Orchestrator;
 use super::schema::align_batches_to_schema;
@@ -132,6 +133,13 @@ where
     W: DeltaWrite + Send + Sync,
     M: StateManage + Send,
 {
+    /// PS-H-B: `reconcile_update_seed` is `Some(<source MAX(update_col)>)` only when this full
+    /// refresh is a table reconcile's one-shot snapshot (routed here from the TwoStream branch
+    /// of `process_table` instead of `process_two_stream`) — the final commit then ALSO stamps
+    /// the two-stream HWM keys (`hwm_insert_id` from this run's max PK id, `hwm_updated_at`/
+    /// `hwm_last_id` from the seed + the D3 tie-break sentinel `i64::MAX`), so the next
+    /// (flag-removed) run resumes as normal two-stream incremental. `None` (every non-reconcile
+    /// caller) is byte-identical to before PS-H-B: `commit_overwrite(table_name, None, None)`.
     pub(super) async fn process_full_refresh(
         &mut self,
         table_name: &str,
@@ -139,12 +147,22 @@ where
         source_columns: &[ColumnInfo],
         indexes: &[IndexInfo],
         schema: &SchemaRef,
+        reconcile_update_seed: Option<String>,
     ) -> Result<u64> {
         let batch_size = self.extractor.batch_size();
         let mut total_rows = 0u64;
         let mut chunk_index: u64 = 0;
         let key_col = select_integer_pk(source_columns, indexes);
         let mut last_key = None;
+        // PS-H-B: the overall max key seen across EVERY staged chunk, for reconcile's
+        // `hwm_insert_id`. NOT the same thing as `last_key` below: `last_key` is the
+        // pagination CURSOR for the next request, and is deliberately left un-advanced on the
+        // terminal chunk (the one that ends the loop via the `chunk_rows < batch_size` break)
+        // since there's no next request to build — so `last_key` alone would silently miss the
+        // last chunk's rows for any table whose full result fits in that final under-`batch_size`
+        // chunk (the common case). This tracker updates unconditionally, every chunk, before
+        // that break, so it is always exact.
+        let mut max_key_seen: Option<i64> = None;
         let offset_order_terms = if key_col.is_none() {
             build_offset_order_terms(columns, source_columns, indexes)
         } else {
@@ -257,6 +275,11 @@ where
             } else {
                 None
             };
+            // PS-H-B: fold into the reconcile tracker unconditionally (every chunk, including
+            // the terminal one) — see `max_key_seen`'s doc comment above.
+            if let Some(nk) = next_key {
+                max_key_seen = Some(max_key_seen.map_or(nk, |cur| cur.max(nk)));
+            }
 
             self.writer
                 .stage_overwrite_chunk(table_name, batches)
@@ -316,7 +339,31 @@ where
         // the commit is exactly what leaves the prior snapshot intact.
         let shutdown = self.check_shutdown();
         if !shutdown && staged_chunks > 0 {
-            self.writer.commit_overwrite(table_name, None).await?;
+            match reconcile_update_seed {
+                Some(seed) => {
+                    // PS-H-B: reconcile needs the run's max PK id as the insert-stream
+                    // watermark — only the keyset (integer-PK) path tracks that (`max_key_seen`).
+                    // The OFFSET-fallback path never sets it, so bail actionably rather than
+                    // stamp a wrong/missing insert watermark that would silently duplicate rows
+                    // on the next two-stream run.
+                    let insert_id = max_key_seen.ok_or_else(|| {
+                        anyhow!(
+                            "reconcile for table `{table_name}` requires an integer primary key \
+                             (keyset pagination) to determine the insert-stream watermark; no \
+                             integer PK was found, so reconcile cannot safely re-seed \
+                             hwm_insert_id — add an integer PRIMARY key or run a plain \
+                             full_refresh instead"
+                        )
+                    })?;
+                    let hwm = Hwm { updated_at: seed, last_id: i64::MAX };
+                    self.writer
+                        .commit_overwrite(table_name, Some(&hwm), Some(insert_id))
+                        .await?;
+                }
+                None => {
+                    self.writer.commit_overwrite(table_name, None, None).await?;
+                }
+            }
         }
 
         // FA12c: `total_rows` only ever counts STAGED rows (parquet written, not yet visible).
@@ -399,7 +446,7 @@ mod tests {
             .returning(|_, _| Ok(()));
         writer_mock
             .expect_commit_overwrite()
-            .returning(|_, _| Ok(()));
+            .returning(|_, _, _| Ok(()));
         state_mock
             .expect_update_table()
             .withf(|_, state, _| {
@@ -460,7 +507,7 @@ mod tests {
         // single commit_overwrite at the end.
         writer_mock.expect_begin_overwrite().times(1).returning(|_, _| Ok(()));
         writer_mock.expect_stage_overwrite_chunk().times(3).returning(|_, _| Ok(()));
-        writer_mock.expect_commit_overwrite().times(1).returning(|_, _| Ok(()));
+        writer_mock.expect_commit_overwrite().times(1).returning(|_, _, _| Ok(()));
         state_mock.expect_update_table().returning(|_, _, _| Ok(()));
 
         let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
@@ -519,7 +566,7 @@ mod tests {
 
         writer_mock.expect_begin_overwrite().times(1).returning(|_, _| Ok(()));
         writer_mock.expect_stage_overwrite_chunk().times(2).returning(|_, _| Ok(()));
-        writer_mock.expect_commit_overwrite().times(1).returning(|_, _| Ok(()));
+        writer_mock.expect_commit_overwrite().times(1).returning(|_, _, _| Ok(()));
         state_mock.expect_update_table().returning(|_, _, _| Ok(()));
 
         let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
@@ -581,7 +628,7 @@ mod tests {
 
         writer_mock.expect_begin_overwrite().times(1).returning(|_, _| Ok(()));
         writer_mock.expect_stage_overwrite_chunk().times(2).returning(|_, _| Ok(()));
-        writer_mock.expect_commit_overwrite().times(1).returning(|_, _| Ok(()));
+        writer_mock.expect_commit_overwrite().times(1).returning(|_, _, _| Ok(()));
         state_mock.expect_update_table().returning(|_, _, _| Ok(()));
 
         let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
@@ -642,7 +689,7 @@ mod tests {
 
         writer_mock.expect_begin_overwrite().times(1).returning(|_, _| Ok(()));
         writer_mock.expect_stage_overwrite_chunk().times(2).returning(|_, _| Ok(()));
-        writer_mock.expect_commit_overwrite().times(1).returning(|_, _| Ok(()));
+        writer_mock.expect_commit_overwrite().times(1).returning(|_, _, _| Ok(()));
         state_mock.expect_update_table().returning(|_, _, _| Ok(()));
 
         let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
@@ -930,7 +977,7 @@ mod tests {
         let select_columns: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
         let indexes = make_full_refresh_indexes();
         let result = orch
-            .process_full_refresh("products", &select_columns, &columns, &indexes, &schema_from_columns(&columns))
+            .process_full_refresh("products", &select_columns, &columns, &indexes, &schema_from_columns(&columns), None)
             .await;
 
         let rows = result.expect("shutdown before any chunk must not bail — nothing was destroyed yet");
@@ -983,7 +1030,7 @@ mod tests {
         let select_columns: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
         let indexes = make_full_refresh_indexes(); // no PRIMARY key => OFFSET-fallback path
         let result = orch
-            .process_full_refresh("products", &select_columns, &columns, &indexes, &schema_from_columns(&columns))
+            .process_full_refresh("products", &select_columns, &columns, &indexes, &schema_from_columns(&columns), None)
             .await;
 
         let err = result.expect_err("a truncated window on the OFFSET-fallback path must bail");
@@ -1051,7 +1098,7 @@ mod tests {
 
         writer_mock.expect_begin_overwrite().times(1).returning(|_, _| Ok(()));
         writer_mock.expect_stage_overwrite_chunk().times(2).returning(|_, _| Ok(()));
-        writer_mock.expect_commit_overwrite().times(1).returning(|_, _| Ok(()));
+        writer_mock.expect_commit_overwrite().times(1).returning(|_, _, _| Ok(()));
 
         let mut orch = Orchestrator::new(
             config,
@@ -1068,12 +1115,193 @@ mod tests {
         let select_columns: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
         let indexes = make_full_refresh_primary_key("id");
         let result = orch
-            .process_full_refresh("products", &select_columns, &columns, &indexes, &schema_from_columns(&columns))
+            .process_full_refresh("products", &select_columns, &columns, &indexes, &schema_from_columns(&columns), None)
             .await;
 
         let rows = result.expect("a truncated keyset window must not fail the table");
         assert_eq!(rows, 3);
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+
+    // PS-H-B: reconcile's `reconcile_update_seed` param on `process_full_refresh` — the final
+    // commit must stamp the two-stream HWMs (insert_id from `last_key`, Hwm from the seed +
+    // the D3 tie-break sentinel `i64::MAX`), and must bail rather than stamp a wrong/absent
+    // insert watermark when no integer PK is available for keyset pagination.
+
+    #[tokio::test]
+    async fn plain_full_refresh_commit_overwrite_gets_no_hwm_no_insert_id() {
+        // PS-H-B regression: a normal (non-reconcile) full refresh must call
+        // `commit_overwrite(table_name, None, None)` — byte-identical to before PS-H-B, no
+        // `hwm_insert_id` key and no two-stream Hwm stamped.
+        let dir = TempDir::new().unwrap();
+        let config = make_config_with_full_refresh(vec!["products".to_string()]);
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
+        let mut state_mock = MockStateManage::new();
+
+        state_mock.expect_load_or_default().returning(|_| crate::state::AppState::default());
+        schema_mock.expect_discover_columns().returning(move |_| Ok(make_full_refresh_columns()));
+        schema_mock.expect_discover_indexes().returning(|_| Ok(make_full_refresh_indexes()));
+        schema_mock.expect_get_avg_row_length().returning(|_| Ok(Some(100)));
+        extract_mock.expect_calculate_batch_size().returning(|_| 10000);
+        extract_mock.expect_batch_size().returning(|| 10000);
+        writer_mock.expect_ensure_table().returning(|_, _| Ok(()));
+        writer_mock.expect_get_schema().returning(|_| Ok(None));
+        extract_mock.expect_extract().returning(|_| {
+            let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![1i64]))],
+            )
+            .unwrap();
+            ok_batches(vec![batch])
+        });
+        writer_mock.expect_begin_overwrite().returning(|_, _| Ok(()));
+        writer_mock.expect_stage_overwrite_chunk().returning(|_, _| Ok(()));
+        writer_mock
+            .expect_commit_overwrite()
+            .times(1)
+            .withf(|_, hwm, insert_id| hwm.is_none() && insert_id.is_none())
+            .returning(|_, _, _| Ok(()));
+        state_mock.expect_update_table().returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success));
+    }
+
+    #[tokio::test]
+    async fn reconcile_full_refresh_stamps_two_stream_hwm_on_commit() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config_with_full_refresh(vec!["orders".to_string()]);
+        let schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let state_mock = MockStateManage::new();
+        let (_tx, rx) = watch::channel(false);
+
+        extract_mock.expect_batch_size().returning(|| 10);
+        extract_mock.expect_extract().returning(|_| {
+            let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![1i64, 2i64, 3i64]))],
+            )
+            .unwrap();
+            ok_batches(vec![batch])
+        });
+
+        writer_mock.expect_begin_overwrite().times(1).returning(|_, _| Ok(()));
+        writer_mock.expect_stage_overwrite_chunk().times(1).returning(|_, _| Ok(()));
+        writer_mock
+            .expect_commit_overwrite()
+            .times(1)
+            .withf(|table, hwm, insert_id| {
+                table == "orders"
+                    && *insert_id == Some(3)
+                    && hwm.map(|h| h.updated_at.as_str()) == Some("2026-07-01 00:00:00")
+                    && hwm.map(|h| h.last_id) == Some(i64::MAX)
+            })
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = Orchestrator::new(
+            config,
+            schema_mock,
+            extract_mock,
+            writer_mock,
+            state_mock,
+            rx,
+            dir.path().to_path_buf(),
+            false,
+        );
+
+        let columns = make_full_refresh_columns();
+        let select_columns: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+        let indexes = make_full_refresh_primary_key("id");
+        let result = orch
+            .process_full_refresh(
+                "orders",
+                &select_columns,
+                &columns,
+                &indexes,
+                &schema_from_columns(&columns),
+                Some("2026-07-01 00:00:00".to_string()),
+            )
+            .await;
+
+        let rows = result.expect("reconcile full refresh must succeed");
+        assert_eq!(rows, 3);
+    }
+
+    #[tokio::test]
+    async fn reconcile_full_refresh_bails_without_integer_pk() {
+        // reconcile needs the run's max PK id as the insert-stream watermark, which only the
+        // keyset (integer-PK) path tracks via `last_key` — the OFFSET-fallback path never sets
+        // it, so reconcile must bail actionably rather than stamp a wrong/absent hwm_insert_id.
+        let dir = TempDir::new().unwrap();
+        let config = make_config_with_full_refresh(vec!["orders".to_string()]);
+        let schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let state_mock = MockStateManage::new();
+        let (_tx, rx) = watch::channel(false);
+
+        extract_mock.expect_batch_size().returning(|| 10);
+        extract_mock.expect_extract().times(1).returning(|_| {
+            let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![Arc::new(deltalake::arrow::array::Int64Array::from(vec![1i64, 2i64]))],
+            )
+            .unwrap();
+            ok_batches(vec![batch])
+        });
+
+        writer_mock.expect_begin_overwrite().times(1).returning(|_, _| Ok(()));
+        writer_mock.expect_stage_overwrite_chunk().times(1).returning(|_, _| Ok(()));
+        // The bail must happen BEFORE any commit — no expectation registered means a call
+        // into it would panic, proving the bail fires first.
+        writer_mock.expect_commit_overwrite().times(0);
+
+        let mut orch = Orchestrator::new(
+            config,
+            schema_mock,
+            extract_mock,
+            writer_mock,
+            state_mock,
+            rx,
+            dir.path().to_path_buf(),
+            false,
+        );
+
+        let columns = make_full_refresh_columns();
+        let select_columns: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+        let indexes = make_full_refresh_indexes(); // no PRIMARY key => OFFSET-fallback path
+        let result = orch
+            .process_full_refresh(
+                "orders",
+                &select_columns,
+                &columns,
+                &indexes,
+                &schema_from_columns(&columns),
+                Some("2026-07-01 00:00:00".to_string()),
+            )
+            .await;
+
+        let err = result.expect_err("reconcile without an integer PK must bail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("integer primary key") || msg.contains("integer PK"),
+            "expected an actionable no-integer-PK message, got: {msg}"
+        );
     }
 
     // N8: OFFSET-path ordering helpers.

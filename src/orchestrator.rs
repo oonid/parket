@@ -78,8 +78,18 @@ pub trait DeltaWrite: Send + Sync {
     /// O2-r CP2: finish the staged-overwrite session with ONE atomic commit (see `DeltaWriter::commit_overwrite`).
     /// The lifetime is named (not elided) because `mockall::automock` requires it to generate
     /// a correctly-typed mock for a by-reference, non-`&self` parameter on an async trait method.
+    ///
+    /// PS-H-B: `insert_id` is `Some(<max PK id>)` only for a table reconcile's one-shot commit
+    /// (see `DeltaWriter::commit_overwrite`), which stamps `hwm_insert_id` alongside `hwm`'s
+    /// `hwm_updated_at`/`hwm_last_id` in the SAME atomic commit. `None` (every other caller
+    /// today) is byte-identical to before PS-H-B.
     #[allow(clippy::needless_lifetimes)]
-    async fn commit_overwrite<'a>(&self, table_name: &str, hwm: Option<&'a Hwm>) -> Result<()>;
+    async fn commit_overwrite<'a>(
+        &self,
+        table_name: &str,
+        hwm: Option<&'a Hwm>,
+        insert_id: Option<i64>,
+    ) -> Result<()>;
     async fn read_hwm(&self, table_name: &str) -> Result<Option<Hwm>>;
     /// True when the Delta table exists and holds at least one data file — probe for
     /// the no-HWM duplication guard (audit H-2026-07-11-1).
@@ -346,7 +356,7 @@ where
                 self.process_incremental(table_name, &select_columns, &ts_col, &key_col, &schema, cursor_nullable).await?
             }
             ExtractionMode::FullRefresh => {
-                self.process_full_refresh(table_name, &select_columns, &columns, &indexes, &schema)
+                self.process_full_refresh(table_name, &select_columns, &columns, &indexes, &schema, None)
                     .await?
             }
             ExtractionMode::TwoStream => {
@@ -362,14 +372,48 @@ where
                         "two-stream table '{table_name}' update cursor column `{update_col}` is missing from the Delta table schema (the schema-evolution filter dropped it because the Delta schema lacks it); evolve the Delta schema to add `{update_col}` or run a full refresh for this table"
                     );
                 }
-                // D2: the update stream filters `WHERE <update_col> IS NOT NULL`, so a nullable
-                // update cursor silently drops NULL rows; only probe (COUNT(*)) when it can fire.
-                let update_cursor_nullable = columns
-                    .iter()
-                    .find(|c| c.name == update_col)
-                    .map(|c| c.nullable)
-                    .unwrap_or(false);
-                self.process_two_stream(table_name, &select_columns, &insert_col, &update_col, &schema, update_cursor_nullable).await?
+                if self.config.is_reconcile(table_name) {
+                    // PS-H-B: a one-shot reconcile — run the full-refresh atomic-overwrite path
+                    // instead of the normal two-stream incremental, and stamp the two-stream HWMs
+                    // on its final commit so the NEXT run (flag removed) resumes as normal
+                    // two-stream incremental with no manual seed and no has_data bail. The update
+                    // watermark seed is the source's CURRENT MAX(update_col), read here (before
+                    // the snapshot) — conservative-low is safe because the next run's update
+                    // stream is delete_then_append (idempotent).
+                    //
+                    // When the update cursor is currently ALL-NULL, `max_timestamp` returns None.
+                    // The reconcile path must STILL stamp the two-stream HWMs (otherwise the next
+                    // run finds no update watermark and hits the has_data bail — defeating the
+                    // whole point), so fall back to an epoch sentinel and always pass `Some(seed)`,
+                    // keeping `process_full_refresh` on the stamping branch. The sentinel is
+                    // written in the same `YYYY-MM-DD HH:MM:SS` shape `max_timestamp`
+                    // (`CAST(MAX(col) AS CHAR)`) produces, so it parses in `ts_components`
+                    // (`hwm_has_advanced`) and is a valid SQL datetime literal for Stream B's
+                    // `{update_col} > '<seed>'` filter. Cheap and correct in the all-NULL case:
+                    // Stream B's first window is empty (zero completions ≤ the epoch) and every
+                    // FUTURE completion is captured from the epoch forward.
+                    const RECONCILE_EPOCH_SENTINEL: &str = "1970-01-01 00:00:00";
+                    info!(
+                        table = table_name,
+                        "reconcile: one-shot full snapshot + two-stream HWM re-seed"
+                    );
+                    let reconcile_seed = self
+                        .schema_inspect
+                        .max_timestamp(table_name, &update_col)
+                        .await?
+                        .unwrap_or_else(|| RECONCILE_EPOCH_SENTINEL.to_string());
+                    self.process_full_refresh(table_name, &select_columns, &columns, &indexes, &schema, Some(reconcile_seed))
+                        .await?
+                } else {
+                    // D2: the update stream filters `WHERE <update_col> IS NOT NULL`, so a nullable
+                    // update cursor silently drops NULL rows; only probe (COUNT(*)) when it can fire.
+                    let update_cursor_nullable = columns
+                        .iter()
+                        .find(|c| c.name == update_col)
+                        .map(|c| c.nullable)
+                        .unwrap_or(false);
+                    self.process_two_stream(table_name, &select_columns, &insert_col, &update_col, &schema, update_cursor_nullable).await?
+                }
             }
             ExtractionMode::Auto => unreachable!(),
         };
@@ -1118,7 +1162,7 @@ mod tests {
         writer_mock
             .expect_commit_overwrite()
             .times(1)
-            .returning(|_, _| Err(anyhow::anyhow!("overwrite failed")));
+            .returning(|_, _, _| Err(anyhow::anyhow!("overwrite failed")));
         state_mock
             .expect_update_table()
             .withf(|_, state, _| state.last_run_status.as_deref() == Some("failed"))
@@ -1639,5 +1683,183 @@ mod tests {
             matches!(result, ExitCode::Fatal),
             "expected Fatal (single table failed actionably, not a panic), got {result:?}"
         );
+    }
+
+    // PS-H-B: `TABLE_RECONCILE_<table>` routes a two-stream table through the full-refresh
+    // atomic-overwrite path (instead of `process_two_stream`) and stamps the two-stream HWMs
+    // on the final commit, so the next (flag-removed) run resumes as normal two-stream
+    // incremental with no manual seed.
+
+    #[tokio::test]
+    async fn reconcile_flag_routes_two_stream_table_to_full_refresh() {
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_insert_cursor.insert("orders".to_string(), "id".to_string());
+        config.table_update_cursor.insert("orders".to_string(), "updated_at".to_string());
+        config.table_reconcile.insert("orders".to_string());
+
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock.expect_load_or_default().returning(|_| AppState::default());
+        schema_mock.expect_discover_columns().returning(|_| Ok(make_columns()));
+        schema_mock.expect_discover_indexes().returning(|_| Ok(make_full_refresh_primary_key("id")));
+        schema_mock.expect_get_avg_row_length().returning(|_| Ok(Some(100)));
+        // The reconcile seed is read from the source's CURRENT MAX(update_col) — this is the
+        // ONLY schema_inspect call the reconcile path needs beyond discovery; no `max_timestamp`
+        // call would happen on the normal two-stream path (that one seeds via a bootstrap query
+        // gated on "no stored update HWM", a different call site entirely).
+        schema_mock
+            .expect_max_timestamp()
+            .withf(|table, col| table == "orders" && col == "updated_at")
+            .times(1)
+            .returning(|_, _| Ok(Some("2026-07-01 00:00:00".to_string())));
+        extract_mock.expect_calculate_batch_size().returning(|_| 10000);
+        extract_mock.expect_batch_size().returning(|| 10000);
+        writer_mock.expect_ensure_table().returning(|_, _| Ok(()));
+        writer_mock.expect_get_schema().returning(|_| Ok(None));
+        extract_mock.expect_extract().returning(|_| {
+            let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+                deltalake::arrow::datatypes::Field::new("name", deltalake::arrow::datatypes::DataType::Utf8, false),
+                deltalake::arrow::datatypes::Field::new(
+                    "updated_at",
+                    deltalake::arrow::datatypes::DataType::Timestamp(deltalake::arrow::datatypes::TimeUnit::Microsecond, None),
+                    false,
+                ),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(deltalake::arrow::array::Int64Array::from(vec![1i64, 2i64, 3i64])),
+                    Arc::new(deltalake::arrow::array::StringArray::from(vec!["a", "b", "c"])),
+                    Arc::new(deltalake::arrow::array::TimestampMicrosecondArray::from(vec![
+                        1743158400000000i64,
+                        1743158400000000i64,
+                        1743158400000000i64,
+                    ])),
+                ],
+            )
+            .unwrap();
+            ok_batches(vec![batch])
+        });
+
+        // The full-refresh atomic-overwrite path (O2-r) — begin/stage/commit.
+        writer_mock.expect_begin_overwrite().times(1).returning(|_, _| Ok(()));
+        writer_mock.expect_stage_overwrite_chunk().times(1).returning(|_, _| Ok(()));
+        writer_mock
+            .expect_commit_overwrite()
+            .times(1)
+            .withf(|table, hwm, insert_id| {
+                table == "orders"
+                    && *insert_id == Some(3)
+                    && hwm.map(|h| h.updated_at.as_str()) == Some("2026-07-01 00:00:00")
+                    && hwm.map(|h| h.last_id) == Some(i64::MAX)
+            })
+            .returning(|_, _, _| Ok(()));
+        // Deliberately NO expectations for has_data / read_insert_hwm / read_hwm /
+        // append_two_stream / commit_hwm_only — those are process_two_stream's writer calls;
+        // any call into them would panic, proving the reconcile flag routed away from
+        // process_two_stream entirely instead of running it alongside/after.
+        state_mock
+            .expect_update_table()
+            .withf(|name, state, _| {
+                name == "orders"
+                    && state.last_run_status.as_deref() == Some("success")
+                    // The routing goes through process_full_refresh, so the recorded mode
+                    // string is still "two_stream" (resolve_ts_col_and_mode's mode, unaffected
+                    // by which processing function actually ran this run).
+                    && state.extraction_mode.as_deref() == Some("two_stream")
+            })
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success), "expected Success, got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn reconcile_flag_all_null_update_cursor_still_stamps_epoch_sentinel_hwm() {
+        // PS-H-B edge: when the update cursor is currently ALL-NULL, `max_timestamp` returns
+        // None. The reconcile path must STILL stamp the two-stream HWMs (otherwise the next
+        // run finds no update watermark and hits the has_data bail) — so it falls back to the
+        // `1970-01-01 00:00:00` epoch sentinel and always keeps process_full_refresh on the
+        // stamping branch. `hwm_insert_id` still comes from the run's max PK id.
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_insert_cursor.insert("orders".to_string(), "id".to_string());
+        config.table_update_cursor.insert("orders".to_string(), "updated_at".to_string());
+        config.table_reconcile.insert("orders".to_string());
+
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        let mut state_mock = MockStateManage::new();
+
+        state_mock.expect_load_or_default().returning(|_| AppState::default());
+        schema_mock.expect_discover_columns().returning(|_| Ok(make_columns()));
+        schema_mock.expect_discover_indexes().returning(|_| Ok(make_full_refresh_primary_key("id")));
+        schema_mock.expect_get_avg_row_length().returning(|_| Ok(Some(100)));
+        // All-NULL update cursor: the source's MAX(updated_at) is NULL → None.
+        schema_mock
+            .expect_max_timestamp()
+            .withf(|table, col| table == "orders" && col == "updated_at")
+            .times(1)
+            .returning(|_, _| Ok(None));
+        extract_mock.expect_calculate_batch_size().returning(|_| 10000);
+        extract_mock.expect_batch_size().returning(|| 10000);
+        writer_mock.expect_ensure_table().returning(|_, _| Ok(()));
+        writer_mock.expect_get_schema().returning(|_| Ok(None));
+        extract_mock.expect_extract().returning(|_| {
+            let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+                deltalake::arrow::datatypes::Field::new("name", deltalake::arrow::datatypes::DataType::Utf8, false),
+                deltalake::arrow::datatypes::Field::new(
+                    "updated_at",
+                    deltalake::arrow::datatypes::DataType::Timestamp(deltalake::arrow::datatypes::TimeUnit::Microsecond, None),
+                    true,
+                ),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(deltalake::arrow::array::Int64Array::from(vec![1i64, 2i64, 3i64])),
+                    Arc::new(deltalake::arrow::array::StringArray::from(vec!["a", "b", "c"])),
+                    // All-NULL update cursor.
+                    Arc::new(deltalake::arrow::array::TimestampMicrosecondArray::from(vec![
+                        None::<i64>,
+                        None,
+                        None,
+                    ])),
+                ],
+            )
+            .unwrap();
+            ok_batches(vec![batch])
+        });
+
+        writer_mock.expect_begin_overwrite().times(1).returning(|_, _| Ok(()));
+        writer_mock.expect_stage_overwrite_chunk().times(1).returning(|_, _| Ok(()));
+        writer_mock
+            .expect_commit_overwrite()
+            .times(1)
+            .withf(|table, hwm, insert_id| {
+                table == "orders"
+                    && *insert_id == Some(3)
+                    && hwm.map(|h| h.updated_at.as_str()) == Some("1970-01-01 00:00:00")
+                    && hwm.map(|h| h.last_id) == Some(i64::MAX)
+            })
+            .returning(|_, _, _| Ok(()));
+        state_mock
+            .expect_update_table()
+            .withf(|name, state, _| {
+                name == "orders" && state.last_run_status.as_deref() == Some("success")
+            })
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Success), "expected Success, got {result:?}");
     }
 }
