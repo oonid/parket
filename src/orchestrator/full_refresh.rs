@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow, bail};
 use deltalake::arrow::array::{Array, Int16Array, Int32Array, Int64Array, Int8Array, UInt16Array, UInt32Array, UInt64Array, UInt8Array};
 use deltalake::arrow::datatypes::SchemaRef;
 use deltalake::arrow::record_batch::RecordBatch;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::discovery::{ColumnInfo, IndexInfo, select_integer_pk};
 use crate::query::QueryBuilder;
@@ -133,6 +133,24 @@ where
     W: DeltaWrite + Send + Sync,
     M: StateManage + Send,
 {
+    /// FA11: release a staged-overwrite session that `process_full_refresh` will never commit —
+    /// a bail/error partway through staging, or a shutdown mid-refresh — so it doesn't linger in
+    /// the writer's `overwrite_sessions` map until process exit. Safe to call even when
+    /// `staged_chunks == 0` (nothing was ever staged, e.g. a shutdown before the first chunk);
+    /// the vacuum hint only fires when at least one chunk's parquet was actually flushed to
+    /// object storage without ever being committed (referenced by an `Add` action).
+    async fn abort_full_refresh(&self, table_name: &str, staged_chunks: u64) {
+        self.writer.abort_overwrite(table_name).await;
+        if staged_chunks > 0 {
+            warn!(
+                table = table_name,
+                staged_chunks,
+                "full refresh aborted after staging {staged_chunks} chunk(s); uncommitted \
+                 parquet may be orphaned in object storage — run VACUUM to reclaim"
+            );
+        }
+    }
+
     /// PS-H-B: `reconcile_update_seed` is `Some(<source MAX(update_col)>)` only when this full
     /// refresh is a table reconcile's one-shot snapshot (routed here from the TwoStream branch
     /// of `process_table` instead of `process_two_stream`) — the final commit then ALSO stamps
@@ -261,6 +279,7 @@ where
             // has no such assumption (`last_key` only ever advances over rows actually
             // received), so it continues safely below instead of bailing.
             if truncated && key_col.is_none() {
+                self.abort_full_refresh(table_name, staged_chunks).await;
                 bail!(
                     "full refresh for table `{table_name}`: window exceeded the memory ceiling \
                      mid-extraction on an OFFSET-paged table; lower TARGET_MEMORY_MB or add an \
@@ -281,9 +300,10 @@ where
                 max_key_seen = Some(max_key_seen.map_or(nk, |cur| cur.max(nk)));
             }
 
-            self.writer
-                .stage_overwrite_chunk(table_name, batches)
-                .await?;
+            if let Err(e) = self.writer.stage_overwrite_chunk(table_name, batches).await {
+                self.abort_full_refresh(table_name, staged_chunks).await;
+                return Err(e);
+            }
             staged_chunks += 1;
 
             total_rows += chunk_rows;
@@ -319,12 +339,17 @@ where
             }
 
             if let Some(key_col) = key_col.as_deref() {
-                let next_key = next_key.ok_or_else(|| {
-                    anyhow!(
-                        "full refresh keyset paging could not extract key `{key_col}` from a full batch for table `{table_name}`"
-                    )
-                })?;
+                let next_key = match next_key {
+                    Some(k) => k,
+                    None => {
+                        self.abort_full_refresh(table_name, staged_chunks).await;
+                        bail!(
+                            "full refresh keyset paging could not extract key `{key_col}` from a full batch for table `{table_name}`"
+                        );
+                    }
+                };
                 if Some(next_key) == last_key {
+                    self.abort_full_refresh(table_name, staged_chunks).await;
                     bail!(
                         "full refresh keyset paging did not advance key `{key_col}` for table `{table_name}`"
                     );
@@ -338,7 +363,12 @@ where
         // chunk 0 being empty meant `overwrite_table` was never called); on shutdown, skipping
         // the commit is exactly what leaves the prior snapshot intact.
         let shutdown = self.check_shutdown();
-        if !shutdown && staged_chunks > 0 {
+        if shutdown {
+            // O2-r CP2: nothing is committed on this path, so the session `begin_overwrite`
+            // started must be released here — else it lingers in the writer's session map
+            // until process exit (FA11).
+            self.abort_full_refresh(table_name, staged_chunks).await;
+        } else if staged_chunks > 0 {
             match reconcile_update_seed {
                 Some(seed) => {
                     // PS-H-B: reconcile needs the run's max PK id as the insert-stream
@@ -346,15 +376,19 @@ where
                     // The OFFSET-fallback path never sets it, so bail actionably rather than
                     // stamp a wrong/missing insert watermark that would silently duplicate rows
                     // on the next two-stream run.
-                    let insert_id = max_key_seen.ok_or_else(|| {
-                        anyhow!(
-                            "reconcile for table `{table_name}` requires an integer primary key \
-                             (keyset pagination) to determine the insert-stream watermark; no \
-                             integer PK was found, so reconcile cannot safely re-seed \
-                             hwm_insert_id — add an integer PRIMARY key or run a plain \
-                             full_refresh instead"
-                        )
-                    })?;
+                    let insert_id = match max_key_seen {
+                        Some(v) => v,
+                        None => {
+                            self.abort_full_refresh(table_name, staged_chunks).await;
+                            bail!(
+                                "reconcile for table `{table_name}` requires an integer primary key \
+                                 (keyset pagination) to determine the insert-stream watermark; no \
+                                 integer PK was found, so reconcile cannot safely re-seed \
+                                 hwm_insert_id — add an integer PRIMARY key or run a plain \
+                                 full_refresh instead"
+                            );
+                        }
+                    };
                     let hwm = Hwm { updated_at: seed, last_id: i64::MAX };
                     self.writer
                         .commit_overwrite(table_name, Some(&hwm), Some(insert_id))
@@ -787,6 +821,9 @@ mod tests {
             }
         });
         writer_mock.expect_commit_overwrite().times(0);
+        // FA11: the staging error propagates after `begin_overwrite` already started a
+        // session — it must be released, not left resident until process exit.
+        writer_mock.expect_abort_overwrite().times(1).returning(|_| ());
         state_mock.expect_update_table()
             .withf(|_, state, _| state.last_run_status.as_deref() == Some("failed"))
             .returning(|_, _, _| Ok(()));
@@ -909,6 +946,9 @@ mod tests {
         // The whole point of O2-r: the previous snapshot must stay intact, so the final
         // commit must NEVER be reached when the run is interrupted mid-refresh.
         writer_mock.expect_commit_overwrite().times(0);
+        // FA11: the shutdown-skip-commit path must release the session `begin_overwrite`
+        // started — else it lingers in the writer's session map until process exit.
+        writer_mock.expect_abort_overwrite().times(1).returning(|_| ());
 
         // FA12c: nothing is committed on this interrupted path (the final commit_overwrite
         // above is never reached), so the reported row count must be 0, not the staged
@@ -961,6 +1001,9 @@ mod tests {
 
         extract_mock.expect_batch_size().returning(|| 2);
         writer_mock.expect_begin_overwrite().returning(|_, _| Ok(()));
+        // FA11: even with zero chunks staged, the session `begin_overwrite` started above
+        // must still be released on the shutdown path.
+        writer_mock.expect_abort_overwrite().times(1).returning(|_| ());
 
         let mut orch = Orchestrator::new(
             config,
@@ -1003,6 +1046,9 @@ mod tests {
 
         extract_mock.expect_batch_size().returning(|| 5);
         writer_mock.expect_begin_overwrite().returning(|_, _| Ok(()));
+        // FA11: the OFFSET-truncation bail happens after `begin_overwrite` already started a
+        // session (even though nothing was staged yet) — it must be released.
+        writer_mock.expect_abort_overwrite().times(1).returning(|_| ());
         extract_mock.expect_extract().returning(|_| {
             let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
                 deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
@@ -1270,6 +1316,9 @@ mod tests {
         // The bail must happen BEFORE any commit — no expectation registered means a call
         // into it would panic, proving the bail fires first.
         writer_mock.expect_commit_overwrite().times(0);
+        // FA11: the missing-integer-PK bail happens after staging 1 chunk — the session
+        // must be released, not left committed-or-not in limbo.
+        writer_mock.expect_abort_overwrite().times(1).returning(|_| ());
 
         let mut orch = Orchestrator::new(
             config,

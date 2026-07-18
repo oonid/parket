@@ -202,6 +202,10 @@ impl DeltaWrite for DeltaWriterAdapter {
         self.inner.read_hwm(table_name).await
     }
 
+    async fn abort_overwrite(&self, table_name: &str) {
+        self.inner.abort_overwrite(table_name).await
+    }
+
     async fn has_data(&self, table_name: &str) -> Result<bool> {
         self.inner.has_data(table_name).await
     }
@@ -328,6 +332,10 @@ impl DeltaWrite for LocalDeltaWriterAdapter {
 
     async fn read_hwm(&self, table_name: &str) -> Result<Option<Hwm>> {
         self.inner.read_hwm(table_name).await
+    }
+
+    async fn abort_overwrite(&self, table_name: &str) {
+        self.inner.abort_overwrite(table_name).await
     }
 
     async fn has_data(&self, table_name: &str) -> Result<bool> {
@@ -499,6 +507,10 @@ mod tests {
             )
             .await
             .unwrap();
+
+        // FA11: the adapter delegates abort_overwrite too — a no-op here (no session in
+        // progress), just proving the delegation doesn't error or panic.
+        adapter.abort_overwrite("t").await;
     }
 
     /// O6: `DeltaWriterAdapter` (S3-backed) delegates to the same `DeltaWriter` used by
@@ -534,6 +546,9 @@ mod tests {
                 .is_ok()
         );
         assert!(adapter.read_insert_hwm("t").await.is_err());
+        // FA11: abort_overwrite never touches the network (it's a local session-map lookup),
+        // so it must complete without error even against an unroutable endpoint.
+        adapter.abort_overwrite("t").await;
         assert!(
             adapter
                 .append_two_stream("t", vec![], None, None)

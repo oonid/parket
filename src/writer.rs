@@ -8,7 +8,7 @@ use deltalake::arrow::array::{Int64Array, StringArray};
 use deltalake::arrow::datatypes::{DataType, Schema as ArrowSchema};
 use deltalake::arrow::record_batch::RecordBatch;
 use deltalake::DeltaTable;
-use deltalake::kernel::{Action, MetadataExt, StructType};
+use deltalake::kernel::{Action, CommitInfo, MetadataExt, StructType};
 use deltalake::kernel::transaction::CommitBuilder;
 use deltalake::operations::write::SchemaMode;
 use deltalake::protocol::{DeltaOperation, SaveMode};
@@ -42,6 +42,31 @@ pub(crate) fn is_missing_table_error(e: &anyhow::Error) -> bool {
     }
     let err_str = e.to_string();
     err_str.contains("does not exist") || err_str.contains("Invalid table location")
+}
+
+/// L7: how many of the most-recent commits `read_hwm`/`read_insert_hwm` scan backward through
+/// looking for the last commit that actually carries the watermark key(s). Bounds the lookback
+/// so a pathological history (many non-HWM commits in a row) can't make a read scan unboundedly
+/// far back. Not finding the key(s) within this window falls back to today's existing safe
+/// behavior: `None` (starts a from-scratch re-extract, exactly like a missing HWM always has).
+pub(crate) const HWM_LOOKBACK_COMMITS: usize = 64;
+
+/// L7: scan `history` (as returned by `DeltaTable::history`, which orders MOST-RECENT-FIRST) for
+/// the newest commit whose `info` carries every one of `keys`. A Delta `OPTIMIZE` / `VACUUM` /
+/// checkpoint housekeeping commit carries none of the `hwm_*` keys, so without this scan it would
+/// silently SHADOW the real watermark stamped by an older commit — `read_hwm`/`read_insert_hwm`
+/// would see the newest (keyless) commit and wrongly report "no HWM". Returns the matching commit
+/// alongside how many newer commits were skipped to reach it (0 = the newest commit itself
+/// carried the keys, the common case and today's pre-L7 behavior).
+pub(crate) fn find_commit_with_keys<'a>(
+    history: &'a [CommitInfo],
+    keys: &[&str],
+) -> Option<(&'a CommitInfo, usize)> {
+    history
+        .iter()
+        .enumerate()
+        .find(|(_, ci)| keys.iter().all(|k| ci.info.contains_key(*k)))
+        .map(|(idx, ci)| (ci, idx))
 }
 
 #[derive(Debug, Clone)]
@@ -560,6 +585,24 @@ impl DeltaWriter {
         Ok(())
     }
 
+    /// FA11: release a staged-overwrite session for `table_name` WITHOUT committing — for a
+    /// full refresh that fails or is shut down after `begin_overwrite` has already started a
+    /// session (so it isn't left resident in `overwrite_sessions` until process exit). Idempotent:
+    /// a no-op when no session is in progress for this table (nothing begun, already committed, or
+    /// already aborted). Does NOT touch any parquet already flushed by `stage_overwrite_chunk` —
+    /// those files are simply never referenced by an `Add` action, so an abort after staging
+    /// leaves them orphaned in object storage, reclaimable only by running VACUUM.
+    pub async fn abort_overwrite(&self, table_name: &str) {
+        let removed = self.overwrite_sessions.lock().await.remove(table_name);
+        if removed.is_some() {
+            info!(
+                table = table_name,
+                "abort_overwrite: staged-overwrite session released without committing \
+                 (any staged parquet is orphaned pending VACUUM)"
+            );
+        }
+    }
+
     pub async fn read_hwm(&self, table_name: &str) -> Result<Option<Hwm>> {
         let table = match self.open_table(table_name).await {
             Ok(t) => t,
@@ -574,14 +617,28 @@ impl DeltaWriter {
             }
         };
 
-        let mut history = table.history(Some(1)).await?.collect::<Vec<_>>();
-        let commit_info = match history.pop() {
-            Some(ci) => ci,
-            None => {
-                warn!(table = table_name, "Delta table has no commits, no HWM");
-                return Ok(None);
-            }
-        };
+        let history = table.history(Some(HWM_LOOKBACK_COMMITS)).await?.collect::<Vec<_>>();
+        if history.is_empty() {
+            warn!(table = table_name, "Delta table has no commits, no HWM");
+            return Ok(None);
+        }
+
+        // L7: scan backward from the newest commit — a Delta OPTIMIZE/VACUUM/checkpoint
+        // housekeeping commit between syncs carries no `hwm_*` keys and must not shadow an
+        // older commit's real watermark.
+        let (commit_info, skipped) =
+            match find_commit_with_keys(&history, &["hwm_updated_at", "hwm_last_id"]) {
+                Some(found) => found,
+                None => {
+                    warn!(
+                        table = table_name,
+                        lookback = history.len(),
+                        "Delta table exists but no HWM in commitInfo within the last {} commit(s), starting from beginning",
+                        history.len()
+                    );
+                    return Ok(None);
+                }
+            };
 
         let updated_at = commit_info.info.get("hwm_updated_at");
         let last_id = commit_info.info.get("hwm_last_id");
@@ -589,12 +646,23 @@ impl DeltaWriter {
         match (updated_at, last_id) {
             (Some(serde_json::Value::String(ua)), Some(serde_json::Value::String(id))) => {
                 let id: i64 = id.parse().context("invalid hwm_last_id in commitInfo")?;
-                info!(
-                    table = table_name,
-                    hwm_updated_at = %ua,
-                    hwm_last_id = id,
-                    "read HWM from Delta log"
-                );
+                if skipped > 0 {
+                    info!(
+                        table = table_name,
+                        hwm_updated_at = %ua,
+                        hwm_last_id = id,
+                        skipped_commits = skipped,
+                        "read HWM recovered from an older commit — {skipped} newer commit(s) \
+                         (e.g. OPTIMIZE/VACUUM/checkpoint) carried no HWM and were skipped"
+                    );
+                } else {
+                    info!(
+                        table = table_name,
+                        hwm_updated_at = %ua,
+                        hwm_last_id = id,
+                        "read HWM from Delta log"
+                    );
+                }
                 Ok(Some(Hwm {
                     updated_at: ua.clone(),
                     last_id: id,
@@ -1039,6 +1107,85 @@ mod tests {
         assert_eq!(read_back.last_id, 42);
     }
 
+    /// L7: a Delta OPTIMIZE/VACUUM/checkpoint-style housekeeping commit (simulated here with a
+    /// plain `hwm=None` append, which stamps NO `hwm_*` keys — the same shape as a housekeeping
+    /// commit) landing AFTER a real HWM commit must not shadow the real watermark. `read_hwm` must
+    /// scan backward and recover it from the older commit instead of reporting `None`.
+    #[tokio::test]
+    async fn read_hwm_recovers_past_a_shadowing_non_hwm_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+        ]));
+
+        writer.ensure_table("test_table", schema.clone()).await.unwrap();
+
+        let hwm = Hwm {
+            updated_at: "2026-03-28 10:00:00".to_string(),
+            last_id: 5,
+        };
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1i64]))],
+        )
+        .unwrap();
+        writer
+            .append_batch("test_table", vec![batch1], Some(&hwm))
+            .await
+            .unwrap();
+
+        // Simulate one or more housekeeping commits (e.g. OPTIMIZE/VACUUM) landing after the
+        // real HWM commit: they carry no `hwm_*` keys at all.
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![2i64]))],
+        )
+        .unwrap();
+        writer
+            .append_batch("test_table", vec![batch2], None)
+            .await
+            .unwrap();
+        let batch3 = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![3i64]))],
+        )
+        .unwrap();
+        writer
+            .append_batch("test_table", vec![batch3], None)
+            .await
+            .unwrap();
+
+        let read_back = writer
+            .read_hwm("test_table")
+            .await
+            .unwrap()
+            .expect("HWM must be recovered from the older commit, not shadowed by the newer non-HWM commits");
+        assert_eq!(read_back.updated_at, "2026-03-28 10:00:00");
+        assert_eq!(read_back.last_id, 5);
+    }
+
+    /// L7: still `None` (today's safe fallback) when NO commit within the lookback window
+    /// carries the HWM keys — proven here by a table whose only commit has none.
+    #[tokio::test]
+    async fn read_hwm_none_when_no_commit_in_window_carries_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+        ]));
+        writer.ensure_table("test_table", schema.clone()).await.unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![1i64]))],
+        )
+        .unwrap();
+        writer.append_batch("test_table", vec![batch], None).await.unwrap();
+
+        let hwm = writer.read_hwm("test_table").await.unwrap();
+        assert!(hwm.is_none());
+    }
+
     #[tokio::test]
     async fn read_hwm_returns_latest_after_multiple_appends() {
         let temp = tempfile::tempdir().unwrap();
@@ -1133,6 +1280,119 @@ mod tests {
 
         let result = writer.ensure_table("test_table", schema).await;
         assert!(result.is_err());
+    }
+
+    /// L7: `find_commit_with_keys` is the pure scan `read_hwm`/`read_insert_hwm` use — unit-test
+    /// it directly against a synthetic history so the "skip N shadowing commits, then find the
+    /// one that carries the key(s)" and "None found in the whole window" cases are both covered
+    /// without needing to fabricate a real 64-commit Delta history.
+    #[test]
+    fn find_commit_with_keys_skips_shadowing_commits() {
+        fn commit_info_with(pairs: &[(&str, &str)]) -> CommitInfo {
+            let mut info = HashMap::new();
+            for (k, v) in pairs {
+                info.insert((*k).to_string(), serde_json::Value::String((*v).to_string()));
+            }
+            CommitInfo { info, ..Default::default() }
+        }
+
+        // Most-recent-first, mirroring `DeltaTable::history`'s order: two shadowing
+        // (no hwm_* keys) commits, then the real HWM commit further back.
+        let history = vec![
+            commit_info_with(&[]), // newest: OPTIMIZE-like, no keys
+            commit_info_with(&[("some_other_key", "x")]), // VACUUM-like, no keys
+            commit_info_with(&[("hwm_updated_at", "2026-01-01 00:00:00"), ("hwm_last_id", "7")]),
+        ];
+
+        let (found, skipped) =
+            find_commit_with_keys(&history, &["hwm_updated_at", "hwm_last_id"])
+                .expect("must find the older commit that carries both keys");
+        assert_eq!(skipped, 2, "must report exactly 2 shadowing commits skipped");
+        assert_eq!(
+            found.info.get("hwm_last_id"),
+            Some(&serde_json::Value::String("7".to_string()))
+        );
+    }
+
+    #[test]
+    fn find_commit_with_keys_none_when_absent_from_every_commit() {
+        fn commit_info_with(pairs: &[(&str, &str)]) -> CommitInfo {
+            let mut info = HashMap::new();
+            for (k, v) in pairs {
+                info.insert((*k).to_string(), serde_json::Value::String((*v).to_string()));
+            }
+            CommitInfo { info, ..Default::default() }
+        }
+
+        let history = vec![commit_info_with(&[]), commit_info_with(&[("unrelated", "1")])];
+        assert!(find_commit_with_keys(&history, &["hwm_updated_at", "hwm_last_id"]).is_none());
+    }
+
+    /// FA11: `abort_overwrite` removes an in-progress session so a subsequent `begin_overwrite`
+    /// (a retry of the same table) doesn't inherit stale state, and completes normally.
+    #[tokio::test]
+    async fn abort_overwrite_removes_session_and_allows_clean_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+        ]));
+        writer.ensure_table("t", schema.clone()).await.unwrap();
+
+        writer.begin_overwrite("t", schema.clone()).await.unwrap();
+        let chunk = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![99i64]))],
+        )
+        .unwrap();
+        writer.stage_overwrite_chunk("t", vec![chunk]).await.unwrap();
+
+        // Abort instead of committing — the session (and its staged-but-uncommitted chunk)
+        // must be gone.
+        writer.abort_overwrite("t").await;
+
+        // A fresh begin/stage/commit for the same table must work cleanly — proves no stale
+        // session lingered to conflict with (or silently extend) this new one.
+        writer.begin_overwrite("t", schema.clone()).await.unwrap();
+        let chunk2 = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![1i64]))],
+        )
+        .unwrap();
+        writer.stage_overwrite_chunk("t", vec![chunk2]).await.unwrap();
+        writer.commit_overwrite("t", None, None).await.unwrap();
+
+        let table = writer.open_table("t").await.unwrap();
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        let provider = table.table_provider().await.unwrap();
+        ctx.register_table("t", provider).unwrap();
+        let batches = ctx
+            .sql("SELECT id FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let ids: Vec<i64> = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        assert_eq!(
+            ids,
+            vec![1],
+            "only the post-abort session's chunk must be present — the aborted one's chunk (99) must not leak in"
+        );
+    }
+
+    /// FA11: `abort_overwrite` on a table with no in-progress session is a harmless no-op.
+    #[tokio::test]
+    async fn abort_overwrite_is_noop_when_no_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        writer.abort_overwrite("never_started").await;
     }
 
     #[tokio::test]

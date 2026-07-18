@@ -91,6 +91,12 @@ pub trait DeltaWrite: Send + Sync {
         insert_id: Option<i64>,
     ) -> Result<()>;
     async fn read_hwm(&self, table_name: &str) -> Result<Option<Hwm>>;
+    /// FA11: release a staged-overwrite session that will never be committed — a full refresh
+    /// calls this on any failure/early-return or shutdown path AFTER `begin_overwrite` has
+    /// already started a session, so it isn't left resident in the writer's session map until
+    /// process exit (see `DeltaWriter::abort_overwrite`). Idempotent — a no-op if no session is
+    /// in progress for this table.
+    async fn abort_overwrite(&self, table_name: &str);
     /// True when the Delta table exists and holds at least one data file — probe for
     /// the no-HWM duplication guard (audit H-2026-07-11-1).
     async fn has_data(&self, table_name: &str) -> Result<bool>;
@@ -1482,6 +1488,9 @@ mod tests {
         // O2-r CP2: begin_overwrite now runs unconditionally right before the extraction
         // loop, before the shutdown check inside the loop is ever reached.
         writer_mock.expect_begin_overwrite().returning(|_, _| Ok(()));
+        // FA11: the shutdown-before-any-chunk path still releases the session begin_overwrite
+        // started (staged_chunks == 0, but the session itself must not linger).
+        writer_mock.expect_abort_overwrite().times(1).returning(|_| ());
 
         state_mock
             .expect_update_table()

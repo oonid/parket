@@ -143,6 +143,27 @@ where
                     "incremental batch for table `{table_name}` did not advance HWM on a full batch"
                 );
             }
+            // M2-r2: a breaker-TRUNCATED window (fewer rows than `batch_size`, so the guard
+            // above never fires) whose HWM ALSO failed to advance is not a legitimate final
+            // partial chunk — it's pagination stuck at the same cursor position (needs an
+            // unextractable-but-non-NULL cursor value, e.g. an unsupported type or a BIGINT
+            // UNSIGNED id past i64::MAX, since the query already filters `{ts_col} IS NOT
+            // NULL`). Left unguarded, `batch_rows < batch_size && !truncated` below never
+            // breaks the loop (truncated is true), so it would re-extract and re-append this
+            // exact non-advancing window forever. Mirrors the full-refresh keyset paging
+            // "did not advance" bail.
+            if truncated
+                && batch_hwm
+                    .as_ref()
+                    .is_some_and(|next_hwm| !hwm_has_advanced(current_hwm.as_ref(), next_hwm))
+            {
+                bail!(
+                    "incremental batch for table `{table_name}` was truncated by the memory \
+                     breaker but did not advance HWM — pagination is stuck at the same cursor \
+                     position and would loop forever; fix the cursor column type or lower \
+                     TARGET_MEMORY_MB"
+                );
+            }
 
             self.writer
                 .append_batch(table_name, batches, batch_hwm.clone())
@@ -408,6 +429,93 @@ mod tests {
             2,
             "loop must continue past the truncated window and stop after the genuinely-final one (both windows written, HWM advanced across both)"
         );
+    }
+
+    #[tokio::test]
+    async fn incremental_truncated_window_not_advancing_hwm_bails() {
+        // M2-r2: a breaker-truncated window (fewer rows than batch_size, so the
+        // `batch_rows == batch_size` full-batch guard never fires) whose extracted HWM does
+        // NOT advance past the current watermark must bail actionably — left unguarded, the
+        // loop's `batch_rows < batch_size && !truncated` break never fires either (truncated is
+        // true), so it would re-extract and re-append this exact non-advancing window forever.
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["orders".to_string()]);
+        // Seed an initial HWM so `current_hwm` is `Some` from the very first iteration (a `None`
+        // baseline always counts as "advanced", so the non-advance case needs a starting point).
+        config.table_initial_hwm.insert(
+            "orders".to_string(),
+            ("2026-03-28 10:00:00".to_string(), 5),
+        );
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| crate::state::AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(make_full_refresh_primary_key("id")));
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        writer_mock
+            .expect_ensure_table()
+            .returning(|_, _| Ok(()));
+        writer_mock
+            .expect_get_schema()
+            .returning(|_| Ok(None));
+        writer_mock
+            .expect_read_hwm()
+            .returning(|_| Ok(None));
+        extract_mock
+            .expect_batch_size()
+            .returning(|| 5);
+
+        // A single truncated call: 2 of the requested 5 rows came back, both sitting AT the
+        // seeded watermark (ts exactly equal, id <= the seeded last_id) — zero forward progress.
+        // 2026-03-28 10:00:00 UTC == 1774692000000000 micros.
+        extract_mock.expect_extract().times(1).returning(|_| {
+            let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+                deltalake::arrow::datatypes::Field::new(
+                    "updated_at",
+                    deltalake::arrow::datatypes::DataType::Timestamp(deltalake::arrow::datatypes::TimeUnit::Microsecond, None),
+                    false,
+                ),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(deltalake::arrow::array::Int64Array::from(vec![4i64, 5i64])),
+                    Arc::new(deltalake::arrow::array::TimestampMicrosecondArray::from(vec![
+                        1774692000000000i64,
+                        1774692000000000i64,
+                    ])),
+                ],
+            )
+            .unwrap();
+            Ok(crate::extractor::Extraction { batches: vec![batch], truncated: true })
+        });
+
+        // No expectation for append_batch: if the new guard didn't fire, this would be called
+        // and panic — proving the bail happens BEFORE any append.
+        state_mock
+            .expect_update_table()
+            .withf(|_, state, _| state.last_run_status.as_deref() == Some("failed"))
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Fatal));
     }
 
     #[tokio::test]

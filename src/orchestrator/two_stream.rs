@@ -166,6 +166,17 @@ where
                      cursor `{insert_col}` on a full chunk"
                 );
             }
+            // M2-r2: a breaker-TRUNCATED chunk whose insert cursor ALSO failed to advance is
+            // stuck pagination, not a legitimate final partial chunk — the
+            // `chunk_rows < batch_size && !truncated` break below never fires when truncated is
+            // true, so without this it would re-extract and re-append this exact chunk forever.
+            if truncated && new_max.is_some_and(|m| hwm_id.is_some_and(|current| m <= current)) {
+                bail!(
+                    "two-stream insert batch for table `{table_name}` was truncated by the \
+                     memory breaker but did not advance insert cursor `{insert_col}` — \
+                     pagination is stuck; fix the cursor column type or lower TARGET_MEMORY_MB"
+                );
+            }
             if self.progress { info!(table = table_name, rows = chunk_rows, extract_ms, "two-stream insert: extracted, appending"); }
             let t_write = Instant::now();
             self.writer.append_two_stream(table_name, batches, new_max.or(hwm_id), update_hwm.clone()).await?;
@@ -248,6 +259,20 @@ where
                 bail!(
                     "two-stream update batch for table `{table_name}` did not advance HWM on a \
                      full batch"
+                );
+            }
+            // M2-r2: a breaker-TRUNCATED window whose HWM ALSO failed to advance is stuck
+            // pagination, not a legitimate final partial chunk — see the insert-stream comment
+            // above for why this is unsafe to leave unguarded.
+            if truncated
+                && new_hwm
+                    .as_ref()
+                    .is_some_and(|next_hwm| !hwm_has_advanced(update_hwm.as_ref(), next_hwm))
+            {
+                bail!(
+                    "two-stream update batch for table `{table_name}` was truncated by the \
+                     memory breaker but did not advance HWM — pagination is stuck; fix the \
+                     cursor column type or lower TARGET_MEMORY_MB"
                 );
             }
             if self.progress { info!(table = table_name, rows = chunk_rows, extract_ms, "two-stream update: extracted, merging"); }
@@ -477,6 +502,98 @@ mod tests {
             .expect_append_two_stream()
             .times(0)
             .returning(|_, _, _, _| Ok(()));
+        state_mock
+            .expect_update_table()
+            .withf(|_, state, _| state.last_run_status.as_deref() == Some("failed"))
+            .returning(|_, _, _| Ok(()));
+
+        let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
+        let result = orch.run().await;
+        assert!(matches!(result, ExitCode::Fatal));
+    }
+
+    #[tokio::test]
+    async fn two_stream_insert_truncated_chunk_not_advancing_cursor_bails() {
+        // M2-r2: a breaker-truncated insert chunk (fewer rows than batch_size, so the
+        // `chunk_rows == batch_size` full-chunk guard never fires) whose insert cursor does NOT
+        // advance past the stored `hwm_id` must bail actionably — left unguarded, the loop's
+        // `chunk_rows < batch_size && !truncated` break never fires either (truncated is true),
+        // so it would re-extract and re-append this exact non-advancing chunk forever.
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_insert_cursor.insert("orders".to_string(), "id".to_string());
+        config.table_update_cursor.insert("orders".to_string(), "updated_at".to_string());
+
+        let mut schema_mock = MockSchemaInspect::new();
+        let mut extract_mock = MockExtract::new();
+        let mut writer_mock = MockDeltaWrite::new();
+        writer_mock.expect_has_data().returning(|_| Ok(false));
+        let mut state_mock = MockStateManage::new();
+
+        state_mock
+            .expect_load_or_default()
+            .returning(|_| crate::state::AppState::default());
+        schema_mock
+            .expect_discover_columns()
+            .returning(move |_| Ok(make_columns()));
+        schema_mock
+            .expect_discover_indexes()
+            .returning(|_| Ok(vec![]));
+        schema_mock
+            .expect_get_avg_row_length()
+            .returning(|_| Ok(Some(100)));
+        schema_mock
+            .expect_max_timestamp()
+            .returning(|_, _| Ok(None));
+        extract_mock
+            .expect_calculate_batch_size()
+            .returning(|_| 10000);
+        extract_mock
+            .expect_batch_size()
+            .returning(|| 5);
+        writer_mock
+            .expect_ensure_table()
+            .returning(|_, _| Ok(()));
+        writer_mock
+            .expect_get_schema()
+            .returning(|_| Ok(None));
+        // A stored insert-cursor watermark already at 5.
+        writer_mock
+            .expect_read_insert_hwm()
+            .returning(|_| Ok(Some(5)));
+        writer_mock
+            .expect_read_hwm()
+            .returning(|_| Ok(None));
+
+        extract_mock.expect_extract().times(1).returning(|_| {
+            // Truncated: 2 of the requested 5 rows came back, both with `id` <= the stored
+            // hwm_id (5) — zero forward progress.
+            let schema = Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+                deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+                deltalake::arrow::datatypes::Field::new("name", deltalake::arrow::datatypes::DataType::Utf8, false),
+                deltalake::arrow::datatypes::Field::new(
+                    "updated_at",
+                    deltalake::arrow::datatypes::DataType::Timestamp(deltalake::arrow::datatypes::TimeUnit::Microsecond, None),
+                    false,
+                ),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(deltalake::arrow::array::Int64Array::from(vec![4i64, 5i64])),
+                    Arc::new(deltalake::arrow::array::StringArray::from(vec!["a", "b"])),
+                    Arc::new(deltalake::arrow::array::TimestampMicrosecondArray::from(vec![
+                        1743158400000000i64,
+                        1743158400000000i64,
+                    ])),
+                ],
+            )
+            .unwrap();
+            Ok(crate::extractor::Extraction { batches: vec![batch], truncated: true })
+        });
+
+        // No expectation for append_two_stream: if the new guard didn't fire, this would be
+        // called and panic — proving the bail happens BEFORE any append.
         state_mock
             .expect_update_table()
             .withf(|_, state, _| state.last_run_status.as_deref() == Some("failed"))

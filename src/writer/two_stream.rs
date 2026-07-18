@@ -298,14 +298,37 @@ impl DeltaWriter {
                 ));
             }
         };
-        let mut history = table.history(Some(1)).await?.collect::<Vec<_>>();
-        let commit_info = match history.pop() {
-            Some(ci) => ci,
-            None => return Ok(None),
-        };
+        let history = table
+            .history(Some(super::HWM_LOOKBACK_COMMITS))
+            .await?
+            .collect::<Vec<_>>();
+        if history.is_empty() {
+            return Ok(None);
+        }
+
+        // L7: scan backward from the newest commit — see `DeltaWriter::read_hwm`'s doc comment
+        // for why a housekeeping commit (OPTIMIZE/VACUUM/checkpoint) must not shadow an older
+        // commit's real `hwm_insert_id`.
+        let (commit_info, skipped) =
+            match super::find_commit_with_keys(&history, &["hwm_insert_id"]) {
+                Some(found) => found,
+                None => return Ok(None),
+            };
         match commit_info.info.get("hwm_insert_id") {
-            Some(serde_json::Value::String(s)) =>
-                Ok(Some(s.parse().context("invalid hwm_insert_id in commitInfo")?)),
+            Some(serde_json::Value::String(s)) => {
+                let id: i64 = s.parse().context("invalid hwm_insert_id in commitInfo")?;
+                if skipped > 0 {
+                    tracing::info!(
+                        table = table_name,
+                        hwm_insert_id = id,
+                        skipped_commits = skipped,
+                        "read insert HWM recovered from an older commit — {skipped} newer \
+                         commit(s) (e.g. OPTIMIZE/VACUUM/checkpoint) carried no hwm_insert_id \
+                         and were skipped"
+                    );
+                }
+                Ok(Some(id))
+            }
             _ => Ok(None),
         }
     }
@@ -529,6 +552,52 @@ mod tests {
 
         let insert_hwm = writer.read_insert_hwm("test_table").await.unwrap();
         assert_eq!(insert_hwm, Some(42));
+    }
+
+    /// L7: mirrors `read_hwm_recovers_past_a_shadowing_non_hwm_commit` in `writer.rs` for the
+    /// insert-cursor watermark — a housekeeping commit (no `hwm_insert_id`) landing after the
+    /// real one must not shadow it.
+    #[tokio::test]
+    async fn read_insert_hwm_recovers_past_a_shadowing_non_hwm_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+        ]));
+
+        writer.ensure_table("test_table", schema.clone()).await.unwrap();
+
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1i64]))],
+        )
+        .unwrap();
+        let table = writer.open_table("test_table").await.unwrap();
+        table
+            .write(vec![batch1])
+            .with_save_mode(SaveMode::Append)
+            .with_commit_properties(build_two_stream_commit_properties(Some(42), None))
+            .await
+            .unwrap();
+
+        // Housekeeping-style commit with no `hwm_insert_id` at all (a plain append with no
+        // two-stream watermarks stamped).
+        let batch2 = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![2i64]))],
+        )
+        .unwrap();
+        writer
+            .append_batch("test_table", vec![batch2], None)
+            .await
+            .unwrap();
+
+        let insert_hwm = writer
+            .read_insert_hwm("test_table")
+            .await
+            .unwrap()
+            .expect("hwm_insert_id must be recovered from the older commit");
+        assert_eq!(insert_hwm, 42);
     }
 
     #[tokio::test]
