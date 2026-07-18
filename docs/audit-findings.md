@@ -403,14 +403,28 @@ developer_id, status(char), last_viewed, first_opened_at, completed_at, develope
   path still flags a superset as Discrepancy. 5 new unit tests; gate 646 lib tests, coverage 92.58% lines.
   Accepted residual: a genuine phantom id *within* source's range is masked as Drift — narrow, since
   `delta_latest` is deduped and value-aggregates run separately. Follow-up **PS-M1-r** (§8.4).
-- **PS-M2** (Medium, **ops/DBA**, no code) — add a source index on `developer_journey_trackings.completed_at`.
-  Stream B's window query AND the per-run D2 NULL census each full-scan ~114M rows (~3 min each) every
-  sync because `completed_at` is unindexed; an index makes both near-free and cuts tunnel/DB load as the
-  table grows. Trade-off: one-time build + marginal write overhead on a hot table (assess with DBA).
-- **PS-M3** (Medium, **ops**) — establish a vacuum/housekeeping cadence. Tombstoned parquet accumulates:
-  trackings carries 11 dead files; each `users` full_refresh adds ~280 MB of tombstones; failed
-  full-refresh runs orphan staged files (FA11, deferred). E.g. monthly Delta `VACUUM` at default
-  retention, after confirming no time-travel consumers.
+- **PS-M2** (Medium, **ops/DBA**, no code) — **DEFERRED** (2026-07-18, maintainer decision): a source index
+  is a **multi-team decision** (DDL on a shared, hot production table) and is out of parket's hands, so it's
+  documented and parked pending that cross-team sign-off. Finding stands: add a source index on
+  `developer_journey_trackings.completed_at` (ideally composite `(completed_at, id)` to also serve the
+  tie-break `ORDER BY`). Stream B's window query AND the per-run D2 NULL census each full-scan ~114M rows
+  every sync because `completed_at` is unindexed — **confirmed live at v0.2.2**: the PS-H-A reconcile and the
+  post-reconcile incremental run (#4) both spent minutes on that unindexed scan (compounded by the tunnel's
+  idle-connection churn). Trade-off: one-time online DDL (`ALGORITHM=INPLACE, LOCK=NONE` or
+  pt-online-schema-change) + marginal write overhead on a hot table. Suggested DDL when approved:
+  `ALTER TABLE developer_journey_trackings ADD INDEX idx_djt_completed_at_id (completed_at, id);`
+- **PS-M3** — **done** (2026-07-18, one-time reclaim executed + cadence set). Was: establish a
+  vacuum/housekeeping cadence; tombstoned parquet accumulates (reconcile/full_refresh leave old snapshots).
+  **Executed:** after the PS-H-A reconcile, a force VACUUM of `developer_journey_trackings`
+  (`retention_hours=0, enforce_retention_duration=false` via `deltalake` Python — parket has no vacuum
+  command) reclaimed **71 dead files** (~1.7 GB; footprint 3.7 GB→2.06 GB, 25 live parquet). Retention=0 was
+  a deliberate one-time choice: the reclaimed files were the pre-reconcile *drifted* snapshot (verified
+  superseded), so dropping its time-travel was intentional; a standard 168h VACUUM reclaimed 0 that day
+  (tombstones <7d). **L7 HWM-safety PROVEN in production:** the VACUUM added two no-HWM commits (v35/v36)
+  that shadow the watermark, and the next `--check` logged `read HWM recovered from an older commit — 2
+  newer commit(s) … skipped, skipped_commits=2` → recovered the correct latest HWM (`500147844 /
+  2026-07-18T17:17:23`), resolved `two_stream`, no bail, exit 0. **Ongoing cadence:** monthly `VACUUM …
+  RETAIN 168 HOURS` (default retention; L7 makes it safe) once tombstones age past 7 days.
 
 ### 8.4 Open — Low
 - **PS-M1-r** (Low, test; follow-up to PS-M1 `00afcd5`) — the PS-M1 fix is unit-tested at the pure-function
