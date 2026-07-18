@@ -1,6 +1,6 @@
 # Audit findings register (living document)
 
-**Status date:** 2026-07-15. This is the single source of truth for audit findings and remediation
+**Status date:** 2026-07-18. This is the single source of truth for audit findings and remediation
 process — it consolidates `docs/audit-2026-07-04.md` and `docs/handoff-2026-07-06.md` (both retired;
 content carried forward here) and the second-pass results in `docs/audit-2026-07-06.md` (kept for its
 detailed analysis; finding IDs below reference it). Target runtime: an **8 GB RAM** VM.
@@ -54,13 +54,15 @@ a plan → confirm → implement+test → review → commit loop, stopping for c
 snapshot branch (`snapshot/pre-<step>-<date>`) before starting each fix; small reviewable diffs; never
 weaken an existing test assertion to make it pass.
 
-**Branch state (2026-07-16):** `master` and the active `test/verify-docker-integration` branch share
-the same head, now tagged **`v0.2.1`** (bumped from `0.2.0` — the fresh `fable`-audit fixes). All work
-is on `master`, ahead of `origin/master` and prepared for the operator to push (remote gitops run
-manually with an SSH key). `vendor/connector_arrow`: upstream PR #79 **merged** and released as
-v0.12.1 — submodule on aljazerzen upstream at `3e98df6`; the temporary fork pin is retired.
-Coverage gate (re-measured 2026-07-16 at v0.2.1 release time): `cargo llvm-cov --lib -p parket
---fail-under-lines 90` reports **91.59% lines** (regions 92.35%, functions 89.52%), exit 0 — passes
+**Branch state (2026-07-18):** `master` and the active `test/verify-docker-integration` branch share
+the same head, now tagged **`v0.2.2`** (bumped from `0.2.1` — PS-H-B `TABLE_RECONCILE` one-shot
+reconcile, PS-M1 verify false-DISCREPANCY fix, the §9 Low-batch cleanup [L7/FA11/M2-r2/S2-r/N1-r2/
+D1-r2/L1/O13 + PS-L1/L2 docs], and the versioned-tar.gz release workflow). All work is on `master`,
+ahead of `origin/master` and prepared for the operator to push (remote gitops run manually with an SSH
+key). `vendor/connector_arrow`: upstream PR #79 **merged** and released as v0.12.1 — submodule on
+aljazerzen upstream at `3e98df6`; the temporary fork pin is retired.
+Coverage gate (re-measured 2026-07-18 at v0.2.2 release time): `cargo llvm-cov --lib -p parket
+--fail-under-lines 90` reports **92.59% lines** (regions 91.80%, functions 90.19%), exit 0 — passes
 (`verify/source.rs` reads 0% under `--lib`: it is Docker-integration-only, covered by the 38-test
 Docker suite instead). Local gate at release: `cargo build` clean, `cargo clippy --all-targets -D
 warnings` clean, `cargo test --lib` **622 passed**, full Docker integration suite **38 passed**.
