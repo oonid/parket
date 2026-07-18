@@ -28,8 +28,9 @@ risks are **semantic, not mechanical** — chiefly the `completed_at` update-cur
 verify false-DISCREPANCY bug), **PS-H-A** (the trackings freshness-contract decision), **PS-H-B**
 (= the un-implemented fix (b) of H-2026-07-11-1), and PS-M2/M3/L1–L3. **PS-H-B and PS-M1 are now
 resolved** (`bd13be5` — the `TABLE_RECONCILE` one-shot reconcile flag, §8.2; `00afcd5` — the verify
-false-DISCREPANCY fix, §8.3); the rest are recorded for the remediation loop when bandwidth is available.
-PS-M1-r (§8.4) is the low-priority end-to-end test follow-up. A `fable` follow-up investigation established that the
+false-DISCREPANCY fix, §8.3). A **pre-v0.2.2 Low-batch cleanup (§9, `391210d`/`758a2b0`)** then resolved
+L7, FA11, M2-r2, S2-r, N1-r2, D1-r2, L1, O13, and PS-L1/PS-L2; V8-r and O13/VA6 stay deferred with
+rationale, and PS-M1-r/T6-r remain Docker-pass follow-ups. A `fable` follow-up investigation established that the
 trackings engagement drift is a **frozen historical backlog** (`last_viewed` stopped advancing
 ~2025-02-03), so a *dynamic/multi-field* update cursor would catch ≈0 rows/day and can't heal the
 backlog — the PS-H-A remedy is a one-time reconcile (now clean via PS-H-B), not a cursor change; a new
@@ -418,16 +419,15 @@ developer_id, status(char), last_viewed, first_opened_at, completed_at, develope
   `delta_latest` but not `source_scoped`. **Fix:** add an integration test (sync → update an existing row's
   `updated_at` forward past the HWM → `--verify --verify-deep`) asserting **Drift**, not Discrepancy. No
   existing test asserts the old behavior, so nothing is broken meanwhile.
-- **PS-L1** (Low, doc; ties **L7** + H-2026-07-11-1) — runbook the two-stream delete/append crash
-  recovery: a run that dies between the DELETE commit (carries NO hwm metadata — confirmed in v25) and the
-  APPEND commit leaves the latest commit HWM-less → next run's `read_insert_hwm` returns None → has_data
-  guard bails "has data but no stored insert watermark" (`orchestrator/two_stream.rs:79-85`). Recovery:
-  read the last good commit's HWMs from `_delta_log` (plain JSON) and set `TABLE_HWM_<t>`. Optional code:
-  attach commit properties to the DELETE commit too (`writer/two_stream.rs`).
-- **PS-L2** (Low, doc; O1-adjacent) — document the sub-second HWM boundary race (a row completing in the
-  same wall-second as the HWM, after Stream B's query ran, with id ≤ the tie-break id, is skipped forever
-  — DATETIME second granularity) and the backdated-`completed_at` (≤ HWM) exclusion. Both bounded by the
-  PS-H-A periodic reconcile.
+- **PS-L1** — **done** (docs, `docs/config.md` "Two-Stream Recovery & Caveats"). The crash-between-DELETE-
+  and-APPEND case (DELETE commit carries no HWM) **now largely self-heals** thanks to **L7** (`391210d`):
+  `read_insert_hwm`/`read_hwm` scan back past the watermark-less DELETE commit to the last HWM-carrying
+  commit, so the run resumes (no bail) and the next update window re-appends the rows the aborted APPEND
+  missed (idempotent). Documented, with the manual `TABLE_HWM` re-seed retained only as the fallback for the
+  rare ">64 watermark-less commits since the last real sync" edge.
+- **PS-L2** — **done** (docs, `docs/config.md` "Two-Stream Recovery & Caveats"). Documented the two inherent
+  timestamp-cursor caveats — the sub-second HWM boundary race and the backdated-cursor (≤ HWM) exclusion —
+  as bounded by a periodic `TABLE_RECONCILE`/full refresh.
 - **PS-L3** (Low, no action) — keep the four full_refresh tables as-is: correct self-healing mode for
   nullable-`updated_at` tables at this size. If the app ever makes `updated_at` NOT NULL, auto-detection
   flips them to incremental by itself — re-baseline HWMs when that happens.
@@ -447,3 +447,46 @@ developer_id, status(char), last_viewed, first_opened_at, completed_at, develope
   `COUNT(completed_at IS NULL AND last_viewed > first_opened_at)` (now 1,539,399) and, if engagement
   state matters downstream, `last_viewed > completed_at` (now 11,267,003). Reserve full `--verify-deep`
   on trackings for right after each PS-H-A full reconcile, off-peak.
+
+## 9. Low-priority batch cleanup — 2026-07-18 (pre-v0.2.2)
+
+A sweep of the remaining actionable Low residuals across §4/§5/§7.4/§8.4, done in two reviewed
+sub-agent loops (each gated: `cargo build` / `clippy --all-targets -D warnings` / `test --lib` /
+`llvm-cov --lib --fail-under-lines 90`, Opus-verified independently). Full lib suite **662 passed**,
+line coverage **92.59%**.
+
+**Batch A — substantive (`391210d`):**
+- **L7** — `read_hwm`/`read_insert_hwm` now scan a bounded 64-commit lookback (`find_commit_with_keys`)
+  to recover the watermark past shadowing non-HWM commits (OPTIMIZE/VACUUM/checkpoint, or an aborted
+  two-stream DELETE commit); falls back to `None` unchanged when none carries the keys. Unblocks the
+  PS-M3 vacuum work and largely self-heals PS-L1.
+- **FA11** — `abort_overwrite` drains a failed/aborted full-refresh `OverwriteSession` (idempotent
+  remove) on every failure and shutdown path (`abort_full_refresh`), with a VACUUM hint when parquet
+  was already staged. Successful commit path (incl. PS-H-B reconcile stamping) unchanged.
+- **M2-r2** — incremental + both two-stream loops bail on a truncated window that fails to advance the
+  cursor/HWM (mirroring the keyset full-refresh guard) instead of looping.
+
+**Batch B — cosmetics/wording (`758a2b0`):**
+- **S2-r** — verify SOURCE-side SQL identifiers routed through `query::backtick`.
+- **N1-r2** — allowlist↔mapping sync test hardened (iterates the full known MariaDB type universe,
+  exact `mariadb_type_to_arrow` ⟺ `EXTRACTABLE_DATA_TYPES` agreement); the missing-column evolution
+  message no longer claims "table was dropped".
+- **D1-r2** — same reworded message (a column rename/drop no longer mislabeled as a dropped table).
+- **L1** — calendar date math is overflow-safe at `i64::MIN/MAX` (i128 400-year-cycle fast path).
+- **O13** — `inspect` labels PRIMARY only on a real `key=="PRI"`; stdout/stderr flushed before the
+  second-signal `exit(130)`; resolved absolute `state.json` path logged at startup.
+
+**Docs:** PS-L1/PS-L2 written into `docs/config.md` ("Two-Stream Recovery & Caveats"); this §9 + the
+resolved-markers (this commit).
+
+**Still deferred (assessed, deliberately not done):**
+- **V8-r** — the deep-sample key path is `i64`-typed end-to-end (`sample_ids -> Vec<i64>`,
+  `sample_rows(&[i64])`, mirrored on both probe traits + mocks + the `verify.rs` comparison). A
+  `u64 > i64::MAX` key can't be represented without re-typing that whole path to `i128`; a naive SQL
+  `DECIMAL` cast breaks the `try_get::<i64>` decode for normal keys. Multi-file public-API change —
+  out of scope for a cosmetics sweep; kept deferred (as the original §5 note already had it).
+- **O13 / VA6** (`latest_key_stats` HWM-scoping) — scoping it would disturb the deliberate
+  `source_scoped` vs `delta_latest` asymmetry `incremental_scoped_key_stats_outcome` (PS-M1) relies on;
+  left to avoid false-positive verdict risk.
+- **PS-M1-r, T6-r** — Docker integration-test follow-ups (out of the `--lib` loop; do in a Docker pass).
+- Info/perf/upstream residuals unchanged: FA4-r, D1-r3, P1-r-a2/-b, N1-u, L4.

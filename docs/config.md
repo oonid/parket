@@ -169,6 +169,48 @@ TABLE_HWM_orders=2026-05-01T00:00:00.000000,999
 # (updated_at, id) are extracted. Ignored once a real HWM is committed.
 ```
 
+## Two-Stream Recovery & Caveats
+
+### Recovery after a crash mid-upsert (PS-L1)
+
+Each two-stream run writes both data and watermark into Delta commits. The update stream's
+upsert is a **DELETE commit** (removes the incoming keys) followed by an **APPEND commit** (writes
+the new versions, carrying the watermarks). The DELETE commit deliberately carries **no** HWM
+metadata, so a crash *between* the DELETE and the APPEND leaves the newest commit watermark-less.
+
+**This now self-heals** and needs no manual action in the normal case: `read_hwm`/`read_insert_hwm`
+scan back a bounded window (64 commits) past any watermark-less commit — the aborted DELETE, or an
+`OPTIMIZE`/`VACUUM`/checkpoint — to the last commit that actually carries the HWM. The next run
+resumes from that watermark, and its update stream re-selects the same window and re-appends the
+rows the aborted APPEND missed (the upsert is idempotent).
+
+**Manual recovery is only needed** in the rare case where **no commit within the last 64** carries
+an HWM (e.g. many interleaved maintenance/DELETE commits since the last real sync). Symptom: the run
+bails with *"has data but no stored watermark"*. To recover, read the last good watermark from the
+Delta log and seed it:
+
+```bash
+# find the newest commit JSON that still contains the hwm_* keys
+s3cmd ls s3://<bucket>/<prefix>/<table>/_delta_log/ | tail -20
+s3cmd get s3://<bucket>/<prefix>/<table>/_delta_log/<NNNN>.json - | grep -o '"hwm_[^,]*'
+# then seed it (see "Per-Table Initial High Watermark" above) and re-run:
+#   TABLE_HWM_<table>=<hwm_updated_at>,<hwm_insert_id>
+```
+
+### Inherent timestamp-cursor caveats (PS-L2)
+
+Two limitations are inherent to any timestamp-cursor incremental/two-stream extraction and are
+**bounded by a periodic reconcile** (`TABLE_RECONCILE` / full refresh), not fixable by the cursor:
+
+- **Sub-second boundary race** — a row whose update cursor lands in the *same wall-clock second* as
+  the stored HWM, committed after that run's window query executed, with a key at/below the tie-break
+  id, can be skipped (DATETIME has one-second granularity). Extremely narrow.
+- **Backdated cursor values** — an update that sets the cursor to a value **≤ the current HWM** (a
+  data fix writing a past `completed_at`) is never re-selected, because the stream only advances
+  *forward* past the HWM.
+
+Run a periodic reconcile (see `TABLE_RECONCILE` above) if either matters for a given table.
+
 ## VM Sizing for `TARGET_MEMORY_MB`
 
 `TARGET_MEMORY_MB` sets the per-batch memory budget. The initial batch row count is `TARGET_MEMORY_MB × 1024 × 1024 / AVG_ROW_LENGTH`; after the first batch, adaptive sizing measures the actual Arrow footprint and corrects the estimate (see [Batch Extraction](batch-extraction.md)). It bounds memory the same way for both Incremental batches and FullRefresh chunks.
