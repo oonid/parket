@@ -460,6 +460,17 @@ where
 
 }
 
+/// O13: best-effort flush of stdout/stderr right before a `process::exit` — `process::exit`
+/// runs no destructors and flushes nothing on its own, and tracing's default fmt layer writes
+/// through these same handles, so skipping this risks losing the last log line(s) written
+/// just before a forced exit. Errors are intentionally swallowed: this already runs on the
+/// forced-shutdown path, where there is no better recovery than "exit anyway".
+fn flush_stdio() {
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+}
+
 pub struct SignalHandler {
     tx: watch::Sender<bool>,
 }
@@ -499,6 +510,12 @@ impl SignalHandler {
                         info!("received second signal (SIGTERM), forcing immediate exit");
                     }
                 }
+                // O13: `process::exit` runs no destructors and flushes no buffers — without
+                // an explicit flush here, the "forcing immediate exit" line above (and any
+                // other buffered log output) could still be sitting in stdout/stderr's
+                // buffer when the process dies, losing the final log lines an operator most
+                // needs to see. tracing's fmt layer writes through these same handles.
+                flush_stdio();
                 std::process::exit(130);
             }
             #[cfg(not(unix))]
@@ -508,6 +525,7 @@ impl SignalHandler {
                 let _ = self.tx.send(true);
                 tokio::signal::ctrl_c().await.ok();
                 info!("received second signal, forcing immediate exit");
+                flush_stdio();
                 std::process::exit(130);
             }
         });

@@ -401,6 +401,15 @@ async fn async_main() {
     signal_handler.install().await;
 
     let state_path = PathBuf::from("state.json");
+    // O13: `state_path` is resolved relative to the process's current working directory, not
+    // a fixed location — log the resolved absolute path (best-effort; falls back to the
+    // relative path if it can't be canonicalized, e.g. the file doesn't exist yet on a first
+    // run) so an operator who launched parket from an unexpected cwd notices which
+    // state.json is actually in play, instead of silently reading/writing the wrong one.
+    let resolved_state_path = std::env::current_dir()
+        .map(|cwd| cwd.join(&state_path))
+        .unwrap_or_else(|_| state_path.clone());
+    tracing::info!(state_path = %resolved_state_path.display(), "resolved state.json path");
 
     // Capture what --verify-after needs before `config` is moved into the orchestrator.
     let verify_after_cfg = if cli.verify_after {

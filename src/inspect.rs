@@ -22,6 +22,11 @@ pub struct CandidateVerdict {
 pub struct CursorReport {
     pub has_id: bool,
     pub id_type: Option<String>,
+    /// O13: whether the `id` column's index `key` flag is actually "PRI" — `has_id` alone
+    /// only means a column literally named `id` exists, not that it's the PRIMARY key. Used
+    /// to gate the "PRIMARY" label in `InspectCommand::run` so a same-named-but-not-primary
+    /// `id` column isn't mislabeled.
+    pub id_is_pri: bool,
     pub candidates: Vec<CandidateVerdict>,
     pub configured: Option<String>,
     pub recommendation: String,
@@ -38,6 +43,9 @@ pub fn evaluate_cursor(
     let id_col = columns.iter().find(|c| c.name == "id");
     let has_id = id_col.is_some();
     let id_type = id_col.map(|c| c.data_type.clone());
+    // O13: gate the "PRIMARY" label on the column's actual PRI key flag, not just its name —
+    // a column named `id` that isn't the PRIMARY key must not be printed as one.
+    let id_is_pri = id_col.is_some_and(|c| c.key == "PRI");
 
     // FA12b/N3-r: incremental auto-detection isn't limited to a column literally named
     // `id` — ANY single-column integer PRIMARY key qualifies (see
@@ -162,6 +170,7 @@ pub fn evaluate_cursor(
     CursorReport {
         has_id,
         id_type,
+        id_is_pri,
         candidates,
         configured: configured_ts.map(|s| s.to_string()),
         recommendation,
@@ -262,7 +271,13 @@ impl<I: InspectIntrospect> InspectCommand<I> {
 
         if report.has_id {
             let id_type_str = report.id_type.as_deref().unwrap_or("unknown");
-            println!("  id column:        present  ({}, PRIMARY)            ✓", id_type_str);
+            // O13: only label it "PRIMARY" when the index actually says PRI — an `id` column
+            // that isn't the PRIMARY key must not be printed as if it were.
+            if report.id_is_pri {
+                println!("  id column:        present  ({}, PRIMARY)            ✓", id_type_str);
+            } else {
+                println!("  id column:        present  ({}, not PRIMARY)        ✓", id_type_str);
+            }
         } else {
             println!("  id column:        NOT PRESENT                      ✗");
         }
@@ -465,6 +480,35 @@ mod tests {
         let indexes = &[idx("PRIMARY", true, &["id"])];
         let report = evaluate_cursor("orders", columns, indexes, None);
         assert_eq!(report.id_type.as_deref(), Some("bigint"));
+    }
+
+    /// O13: a column literally named `id` that is NOT the PRIMARY key (e.g. a plain
+    /// non-indexed `id` column, `key == ""`) must report `has_id == true` but
+    /// `id_is_pri == false` — the PRIMARY label in `InspectCommand::run` is gated on this,
+    /// not on the column merely being named `id`.
+    #[test]
+    fn id_column_not_primary_key() {
+        let columns = &[
+            col("id", "bigint", "bigint(20)", false, ""), // named `id` but key is empty, not PRI
+            col("code", "varchar", "varchar(50)", false, "PRI"),
+            col("updated_at", "timestamp", "timestamp", false, ""),
+        ];
+        let indexes = &[idx("PRIMARY", true, &["code"])];
+        let report = evaluate_cursor("orders", columns, indexes, None);
+        assert!(report.has_id, "column named `id` is present");
+        assert!(!report.id_is_pri, "`id` column's key is not PRI, must not be flagged as primary");
+    }
+
+    #[test]
+    fn id_column_is_primary_key() {
+        let columns = &[
+            col("id", "bigint", "bigint(20)", false, "PRI"),
+            col("updated_at", "timestamp", "timestamp", false, ""),
+        ];
+        let indexes = &[idx("PRIMARY", true, &["id"])];
+        let report = evaluate_cursor("orders", columns, indexes, None);
+        assert!(report.has_id);
+        assert!(report.id_is_pri, "`id` column's key is PRI, must be flagged as primary");
     }
 
     #[test]

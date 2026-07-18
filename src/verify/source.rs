@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use sqlx::Row;
 use std::collections::HashMap;
 
+use crate::query::backtick;
+
 use super::{
     AggKind, ColumnAgg, ColumnAggValues, ColumnMeta, KeyStats, SourceProbe, SourceScope,
     StringKeyStats,
@@ -11,11 +13,11 @@ fn scope_predicate_sql(scope: &SourceScope) -> String {
     // V8: DECIMAL(20,0) (not SIGNED) so a BIGINT UNSIGNED key above i64::MAX compares
     // correctly against the i64 `last_id` bound instead of wrapping negative and being
     // wrongly included.
-    format!(
-        "(`{cursor}` < ?) OR (`{cursor}` = ? AND CAST(`{key}` AS DECIMAL(20,0)) <= ?)",
-        cursor = scope.cursor_col,
-        key = scope.key_col,
-    )
+    // S2-r: identifiers routed through `backtick` (schema/config-derived names, not raw
+    // interpolation) — matches the extraction-path convention in `query.rs`.
+    let cursor = backtick(&scope.cursor_col);
+    let key = backtick(&scope.key_col);
+    format!("({cursor} < ?) OR ({cursor} = ? AND CAST({key} AS DECIMAL(20,0)) <= ?)")
 }
 
 /// Parse a MariaDB `CAST(... AS DECIMAL(20,0)) AS CHAR` key-stats MIN/MAX reading into an
@@ -35,7 +37,8 @@ impl SourceProbeAdapter {
 }
 impl SourceProbe for SourceProbeAdapter {
     async fn row_count(&self, table: &str) -> Result<i64> {
-        let row: (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM `{table}`"))
+        let quoted_table = backtick(table);
+        let row: (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {quoted_table}"))
             .fetch_one(&self.pool)
             .await
             .with_context(|| format!("source COUNT(*) for `{table}`"))?;
@@ -43,8 +46,9 @@ impl SourceProbe for SourceProbeAdapter {
     }
 
     async fn row_count_scoped(&self, table: &str, scope: &SourceScope) -> Result<i64> {
+        let quoted_table = backtick(table);
         let predicate = scope_predicate_sql(scope);
-        let sql = format!("SELECT COUNT(*) FROM `{table}` WHERE {predicate}");
+        let sql = format!("SELECT COUNT(*) FROM {quoted_table} WHERE {predicate}");
         let row: (i64,) = sqlx::query_as(&sql)
             .bind(&scope.updated_at)
             .bind(&scope.updated_at)
@@ -61,8 +65,10 @@ impl SourceProbe for SourceProbeAdapter {
     }
 
     async fn max_cursor(&self, table: &str, cursor_col: &str) -> Result<Option<String>> {
+        let quoted_table = backtick(table);
+        let cursor = backtick(cursor_col);
         let row: (Option<String>,) = sqlx::query_as(&format!(
-            "SELECT CAST(MAX(`{cursor_col}`) AS CHAR) FROM `{table}`"
+            "SELECT CAST(MAX({cursor}) AS CHAR) FROM {quoted_table}"
         ))
         .fetch_one(&self.pool)
         .await
@@ -157,10 +163,12 @@ impl SourceProbe for SourceProbeAdapter {
         // V8: MIN/MAX cast to DECIMAL(20,0)-as-CHAR (not SIGNED) so a BIGINT UNSIGNED key
         // above i64::MAX is captured exactly instead of wrapping negative; parsed to i128
         // below. BIT_XOR stays SIGNED/i64 (bit-preserving, not a magnitude).
+        let quoted_table = backtick(table);
+        let key = backtick(key_col);
         let row: (i64, i64, Option<String>, Option<String>, Option<i64>, Option<String>) = sqlx::query_as(&format!(
-            "SELECT COUNT(*), COUNT(DISTINCT `{key_col}`), \
-             CAST(CAST(MIN(`{key_col}`) AS DECIMAL(20,0)) AS CHAR), CAST(CAST(MAX(`{key_col}`) AS DECIMAL(20,0)) AS CHAR), \
-             CAST(BIT_XOR(`{key_col}`) AS SIGNED), CAST(SUM(`{key_col}`) AS CHAR) FROM `{table}`"
+            "SELECT COUNT(*), COUNT(DISTINCT {key}), \
+             CAST(CAST(MIN({key}) AS DECIMAL(20,0)) AS CHAR), CAST(CAST(MAX({key}) AS DECIMAL(20,0)) AS CHAR), \
+             CAST(BIT_XOR({key}) AS SIGNED), CAST(SUM({key}) AS CHAR) FROM {quoted_table}"
         ))
         .fetch_one(&self.pool)
         .await
@@ -184,9 +192,11 @@ impl SourceProbe for SourceProbeAdapter {
         key_col: &str,
         scope: &SourceScope,
     ) -> Result<KeyStats> {
+        let quoted_table = backtick(table);
+        let key = backtick(key_col);
         let predicate = scope_predicate_sql(scope);
         let sql = format!(
-            "SELECT COUNT(*), COUNT(DISTINCT `{key_col}`),              CAST(CAST(MIN(`{key_col}`) AS DECIMAL(20,0)) AS CHAR), CAST(CAST(MAX(`{key_col}`) AS DECIMAL(20,0)) AS CHAR),              CAST(BIT_XOR(`{key_col}`) AS SIGNED), CAST(SUM(`{key_col}`) AS CHAR) FROM `{table}`              WHERE {predicate}"
+            "SELECT COUNT(*), COUNT(DISTINCT {key}),              CAST(CAST(MIN({key}) AS DECIMAL(20,0)) AS CHAR), CAST(CAST(MAX({key}) AS DECIMAL(20,0)) AS CHAR),              CAST(BIT_XOR({key}) AS SIGNED), CAST(SUM({key}) AS CHAR) FROM {quoted_table}              WHERE {predicate}"
         );
         let row: (i64, i64, Option<String>, Option<String>, Option<i64>, Option<String>) = sqlx::query_as(&sql)
             .bind(&scope.updated_at)
@@ -217,9 +227,11 @@ impl SourceProbe for SourceProbeAdapter {
     /// the column's (often case-insensitive) collation — matches DataFusion's byte-ordered
     /// Utf8 comparison on the Delta side (the N8 collation lesson applied to the key).
     async fn string_key_stats(&self, table: &str, key_col: &str) -> Result<StringKeyStats> {
+        let quoted_table = backtick(table);
+        let key = backtick(key_col);
         let row: (i64, i64, Option<String>, Option<String>) = sqlx::query_as(&format!(
-            "SELECT COUNT(*), COUNT(DISTINCT BINARY `{key_col}`), \
-             CAST(MIN(BINARY `{key_col}`) AS CHAR), CAST(MAX(BINARY `{key_col}`) AS CHAR) FROM `{table}`"
+            "SELECT COUNT(*), COUNT(DISTINCT BINARY {key}), \
+             CAST(MIN(BINARY {key}) AS CHAR), CAST(MAX(BINARY {key}) AS CHAR) FROM {quoted_table}"
         ))
         .fetch_one(&self.pool)
         .await
@@ -238,10 +250,11 @@ impl SourceProbe for SourceProbeAdapter {
         }
         let select_list = columns
             .iter()
-            .map(|c| format!("COUNT(`{c}`)"))
+            .map(|c| format!("COUNT({})", backtick(c)))
             .collect::<Vec<_>>()
             .join(", ");
-        let sql = format!("SELECT {select_list} FROM `{table}`");
+        let quoted_table = backtick(table);
+        let sql = format!("SELECT {select_list} FROM {quoted_table}");
         let row = sqlx::query(&sql)
             .fetch_one(&self.pool)
             .await
@@ -263,11 +276,13 @@ impl SourceProbe for SourceProbeAdapter {
         // table has fewer than `limit` rows. Both probes then compare rows for these same ids.
         let high = limit / 2;
         let low = limit - high;
+        let quoted_table = backtick(table);
+        let id = backtick(id_col);
         let sql = format!(
             "SELECT k FROM ( \
-               (SELECT CAST(`{id_col}` AS SIGNED) AS k FROM `{table}` ORDER BY `{id_col}` ASC LIMIT {low}) \
+               (SELECT CAST({id} AS SIGNED) AS k FROM {quoted_table} ORDER BY {id} ASC LIMIT {low}) \
                UNION \
-               (SELECT CAST(`{id_col}` AS SIGNED) AS k FROM `{table}` ORDER BY `{id_col}` DESC LIMIT {high}) \
+               (SELECT CAST({id} AS SIGNED) AS k FROM {quoted_table} ORDER BY {id} DESC LIMIT {high}) \
              ) AS spread ORDER BY k"
         );
         let rows = sqlx::query(&sql)
@@ -291,9 +306,11 @@ impl SourceProbe for SourceProbeAdapter {
         if columns.is_empty() || ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let mut select_parts = vec![format!("CAST(`{id_col}` AS SIGNED)")];
+        let quoted_table = backtick(table);
+        let id = backtick(id_col);
+        let mut select_parts = vec![format!("CAST({id} AS SIGNED)")];
         for c in columns {
-            select_parts.push(format!("CAST(`{c}` AS CHAR)"));
+            select_parts.push(format!("CAST({} AS CHAR)", backtick(c)));
         }
         let select_list = select_parts.join(", ");
         let ids_list = ids
@@ -301,7 +318,7 @@ impl SourceProbe for SourceProbeAdapter {
             .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        let sql = format!("SELECT {select_list} FROM `{table}` WHERE `{id_col}` IN ({ids_list})");
+        let sql = format!("SELECT {select_list} FROM {quoted_table} WHERE {id} IN ({ids_list})");
         let rows = sqlx::query(&sql)
             .fetch_all(&self.pool)
             .await
@@ -339,33 +356,33 @@ impl SourceProbeAdapter {
     /// select-list slots each `AggKind` consumes so the result row can be read back
     /// positionally.
     fn column_exprs(col: &ColumnAgg) -> Vec<String> {
-        let c = &col.name;
+        let c = backtick(&col.name);
         match col.kind {
             AggKind::Integer => vec![
-                format!("CAST(SUM(`{c}`) AS CHAR)"),
-                format!("CAST(MIN(`{c}`) AS CHAR)"),
-                format!("CAST(MAX(`{c}`) AS CHAR)"),
-                format!("COUNT(`{c}`)"),
+                format!("CAST(SUM({c}) AS CHAR)"),
+                format!("CAST(MIN({c}) AS CHAR)"),
+                format!("CAST(MAX({c}) AS CHAR)"),
+                format!("COUNT({c})"),
             ],
             AggKind::Decimal { scale } => vec![
-                format!("CAST(CAST(SUM(`{c}`) AS DECIMAL(65,{scale})) AS CHAR)"),
-                format!("CAST(CAST(MIN(`{c}`) AS DECIMAL(65,{scale})) AS CHAR)"),
-                format!("CAST(CAST(MAX(`{c}`) AS DECIMAL(65,{scale})) AS CHAR)"),
-                format!("COUNT(`{c}`)"),
+                format!("CAST(CAST(SUM({c}) AS DECIMAL(65,{scale})) AS CHAR)"),
+                format!("CAST(CAST(MIN({c}) AS DECIMAL(65,{scale})) AS CHAR)"),
+                format!("CAST(CAST(MAX({c}) AS DECIMAL(65,{scale})) AS CHAR)"),
+                format!("COUNT({c})"),
             ],
             AggKind::DatetimeSec => vec![
-                format!("DATE_FORMAT(MIN(`{c}`), '%Y-%m-%d %H:%i:%s')"),
-                format!("DATE_FORMAT(MAX(`{c}`), '%Y-%m-%d %H:%i:%s')"),
-                format!("COUNT(`{c}`)"),
+                format!("DATE_FORMAT(MIN({c}), '%Y-%m-%d %H:%i:%s')"),
+                format!("DATE_FORMAT(MAX({c}), '%Y-%m-%d %H:%i:%s')"),
+                format!("COUNT({c})"),
             ],
             AggKind::DateOnly => vec![
-                format!("DATE_FORMAT(MIN(`{c}`), '%Y-%m-%d')"),
-                format!("DATE_FORMAT(MAX(`{c}`), '%Y-%m-%d')"),
-                format!("COUNT(`{c}`)"),
+                format!("DATE_FORMAT(MIN({c}), '%Y-%m-%d')"),
+                format!("DATE_FORMAT(MAX({c}), '%Y-%m-%d')"),
+                format!("COUNT({c})"),
             ],
             AggKind::TextMass => vec![
-                format!("CAST(SUM(CHAR_LENGTH(`{c}`)) AS CHAR)"),
-                format!("COUNT(`{c}`)"),
+                format!("CAST(SUM(CHAR_LENGTH({c})) AS CHAR)"),
+                format!("COUNT({c})"),
             ],
         }
     }
@@ -413,12 +430,13 @@ impl SourceProbeAdapter {
             .flat_map(Self::column_exprs)
             .collect::<Vec<_>>()
             .join(", ");
+        let quoted_table = backtick(table);
         let sql = match scope {
             Some(scope) => format!(
-                "SELECT {select_list} FROM `{table}` WHERE {}",
+                "SELECT {select_list} FROM {quoted_table} WHERE {}",
                 scope_predicate_sql(scope)
             ),
-            None => format!("SELECT {select_list} FROM `{table}`"),
+            None => format!("SELECT {select_list} FROM {quoted_table}"),
         };
         let mut query = sqlx::query(&sql);
         if let Some(scope) = scope {
@@ -437,5 +455,48 @@ impl SourceProbeAdapter {
             out.push(Self::read_column_values(&row, &mut offset, &col.kind)?);
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// S2-r: `scope_predicate_sql`'s cursor/key identifiers must go through `backtick`
+    /// (schema/config-derived names), not raw interpolation — an embedded backtick must be
+    /// doubled rather than breaking out of the quoting.
+    #[test]
+    fn scope_predicate_sql_backtick_escapes_identifiers() {
+        let scope = SourceScope {
+            cursor_col: "up`dated_at".to_string(),
+            updated_at: "2024-01-01".to_string(),
+            last_id: 1,
+            key_col: "i`d".to_string(),
+        };
+        let sql = scope_predicate_sql(&scope);
+        assert_eq!(
+            sql,
+            "(`up``dated_at` < ?) OR (`up``dated_at` = ? AND CAST(`i``d` AS DECIMAL(20,0)) <= ?)"
+        );
+    }
+
+    /// S2-r: `column_exprs` (used by `value_aggregates`/`value_aggregates_scoped`) must also
+    /// route the column identifier through `backtick`.
+    #[test]
+    fn column_exprs_backtick_escapes_identifier() {
+        let col = ColumnAgg {
+            name: "a`mount".to_string(),
+            kind: AggKind::Integer,
+        };
+        let exprs = SourceProbeAdapter::column_exprs(&col);
+        assert_eq!(
+            exprs,
+            vec![
+                "CAST(SUM(`a``mount`) AS CHAR)".to_string(),
+                "CAST(MIN(`a``mount`) AS CHAR)".to_string(),
+                "CAST(MAX(`a``mount`) AS CHAR)".to_string(),
+                "COUNT(`a``mount`)".to_string(),
+            ]
+        );
     }
 }

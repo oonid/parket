@@ -173,8 +173,18 @@ pub(crate) fn schema_evolution_check(
 
     for delta_name in &delta_names {
         if !mariadb_names.contains(delta_name) {
+            // D1-r2/N1-r2: `mariadb_columns` is the already-filtered extractable-column list
+            // (`discovery::filter_unsupported_columns`), so a Delta column missing from it does
+            // NOT mean the table was dropped (the table still exists) — the real, ambiguous-
+            // from-here causes are: the column was dropped, the column was renamed (a rename
+            // surfaces as this same old-name-disappeared symptom), or the column's type was
+            // ALTERed to something no longer in the extractable allowlist. Any of the three
+            // needs a full refresh to reconcile, so the message names all three rather than
+            // asserting the first one as fact.
             errors.push(format!(
-                "column {delta_name} exists in Delta but not in MariaDB — table was dropped"
+                "column {delta_name} is missing from MariaDB's current extractable columns \
+                 (dropped, renamed, or altered to a non-extractable type) — run a full refresh \
+                 for this table to reconcile"
             ));
         }
     }
@@ -316,7 +326,13 @@ mod tests {
         ]));
         let result = schema_evolution_check(&mariadb_cols, &delta_schema);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("column name exists in Delta but not in MariaDB"));
+        // N1-r2/D1-r2: reworded — no longer claims "table was dropped" (the table still
+        // exists; only the column is gone) and names all three real causes a missing column
+        // can have.
+        assert!(result.unwrap_err().to_string().contains(
+            "column name is missing from MariaDB's current extractable columns \
+             (dropped, renamed, or altered to a non-extractable type)"
+        ));
     }
 
     #[test]
@@ -623,9 +639,26 @@ mod tests {
         // in sync in both directions:
         //  1. every allowlisted type must be accepted here (else a column parket itself
         //     decided was safe would still bail the table);
-        //  2. known-unmapped types must stay OUT of the allowlist and still be rejected
-        //     here (else the allowlist would be stale and let an unmapped type through
-        //     to the connector's todo!()).
+        //  2. every DATA_TYPE string MariaDB is documented to actually produce must agree
+        //     EXACTLY between "accepted by mariadb_type_to_arrow" and "present in
+        //     EXTRACTABLE_DATA_TYPES" (see `all_known_mariadb_types` below).
+        //
+        // N1-r2: (2) is the hardened direction. The previous version of this test only
+        // spot-checked a handful of known-unmapped types, so a NEW match arm added to
+        // `mariadb_type_to_arrow` (e.g. for `geometry`) without a matching
+        // `EXTRACTABLE_DATA_TYPES` entry would silently pass as long as it wasn't one of the
+        // spot-checked names — the allowlist would be stale (permanently skipping a type
+        // parket could otherwise map) and nothing would catch it. Iterating the full known
+        // MariaDB type universe below closes that gap for every type MariaDB currently
+        // documents.
+        //
+        // What this still cannot catch (a fundamental Rust limitation, not a shortcut taken
+        // here): a mapping added for a type that is BOTH missing from
+        // `all_known_mariadb_types` AND missing from `EXTRACTABLE_DATA_TYPES` — Rust has no
+        // reflection over a `match`'s arms, so a hardcoded enumeration is the only way to
+        // exercise it from a unit test, and that enumeration is necessarily bounded by what
+        // we know to list. Extend `all_known_mariadb_types` whenever MariaDB adds a new
+        // DATA_TYPE to keep this residual gap as small as possible.
         use crate::discovery::EXTRACTABLE_DATA_TYPES;
 
         for dt in EXTRACTABLE_DATA_TYPES {
@@ -635,14 +668,32 @@ mod tests {
             );
         }
 
-        for dt in ["time", "year", "bit", "uuid", "inet4", "inet6", "geometry", "point", "vector"] {
-            assert!(
-                !EXTRACTABLE_DATA_TYPES.contains(&dt),
-                "'{dt}' must stay out of the extractable allowlist"
-            );
-            assert!(
-                mariadb_type_to_arrow(dt, dt).is_err(),
-                "'{dt}' unexpectedly accepted by mariadb_type_to_arrow — allowlist is stale"
+        // Every DATA_TYPE string MariaDB's information_schema.COLUMNS.DATA_TYPE is
+        // documented to report, lowercased (see https://mariadb.com/kb/en/data-types/).
+        // Union of every type mariadb_type_to_arrow's match arms handle (extractable) plus
+        // every other real MariaDB type outside them (not extractable).
+        let all_known_mariadb_types = [
+            "tinyint", "smallint", "mediumint", "int", "bigint",
+            "decimal", "numeric", "float", "double",
+            "bit", "bool", "boolean",
+            "date", "datetime", "timestamp", "time", "year",
+            "char", "varchar", "binary", "varbinary",
+            "tinyblob", "blob", "mediumblob", "longblob",
+            "tinytext", "text", "mediumtext", "longtext",
+            "enum", "set", "json",
+            "geometry", "point", "linestring", "polygon",
+            "multipoint", "multilinestring", "multipolygon", "geometrycollection",
+            "uuid", "inet4", "inet6", "vector",
+        ];
+
+        for dt in all_known_mariadb_types {
+            let accepted = mariadb_type_to_arrow(dt, dt).is_ok();
+            let allowlisted = EXTRACTABLE_DATA_TYPES.contains(&dt);
+            assert_eq!(
+                accepted, allowlisted,
+                "'{dt}': mariadb_type_to_arrow accepted={accepted} but \
+                 EXTRACTABLE_DATA_TYPES allowlisted={allowlisted} — the two must agree exactly \
+                 (add/remove '{dt}' on whichever side is missing it)"
             );
         }
     }
