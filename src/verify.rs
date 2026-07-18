@@ -555,6 +555,99 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
         }
     }
 
+    /// PS-M1: incremental-scoped verdict for `source_scoped` vs `delta_latest`. Mirrors
+    /// `key_stats_outcome`'s Pass and delta-lagging-Drift cases, but ALSO treats a
+    /// `delta_latest` **superset** (more distinct keys than `source_scoped`) whose key range
+    /// still sits *inside* `source_scoped`'s own [min, max] envelope as benign `Drift`, not
+    /// `Discrepancy`.
+    ///
+    /// Why this asymmetry is safe here specifically: `source_scoped` is re-scoped to
+    /// `updated_at <= HWM` on every verify run. A row that was already synced can have its
+    /// source `updated_at` advance past the stored HWM *after* the sync (an ordinary update on
+    /// an update-active table) — that row then drops out of `source_scoped` even though its
+    /// already-synced version legitimately remains in `delta_latest`. Because that row's key
+    /// pre-dates the sync, its value is necessarily within `source_scoped`'s own key range, so
+    /// `delta_latest`'s superset range never needs to extend beyond `source_scoped`'s bounds to
+    /// explain it. That is expected steady-state behavior, not a sync error, so it must not
+    /// trip the DISCREPANCY exit code. (This is a different asymmetry direction than
+    /// `two_stream_key_stats_outcome`'s, which allows `delta` to have a *wider* range than
+    /// `source` for its own, unrelated reason — two-stream's `source` is deliberately a
+    /// narrower recent window, not a superset-explaining envelope.)
+    ///
+    /// Discrepancy is still returned when the surplus is NOT explained by range containment
+    /// (`delta_latest` has a key strictly below `source_scoped`'s min or strictly above its
+    /// max — a genuine phantom or extra key that the HWM-advance explanation cannot account
+    /// for), or when the stats disagree in a way unrelated to distinct-count direction (e.g.
+    /// equal distinct/min/max but a mismatched `sum`/`xor`, indicating corrupted values).
+    ///
+    /// NOTE: `key_stats_outcome` (used by the full_refresh/basic, non-scoped path) is
+    /// deliberately left untouched — there a delta superset IS a real bug, since the source
+    /// there is not scoped and represents the full authoritative row/key-set.
+    fn incremental_scoped_key_stats_outcome(
+        source_label: &str,
+        delta_label: &str,
+        source_stats: &KeyStats,
+        delta_stats: &KeyStats,
+    ) -> TableOutcome {
+        if source_stats == delta_stats
+            || (source_stats.distinct == delta_stats.distinct
+                && source_stats.min == delta_stats.min
+                && source_stats.max == delta_stats.max
+                && source_stats.distinct_xor == delta_stats.distinct_xor
+                && source_stats.sum == delta_stats.sum)
+        {
+            return TableOutcome::Pass;
+        }
+
+        // delta_latest's key range sits within source_scoped's own [min, max] envelope (or
+        // either side has no keys at all) — true regardless of which side has more distinct
+        // keys, so it's shared by both the lagging and the superset branches below.
+        let delta_range_within_source = (delta_stats.max.is_none()
+            || (source_stats.max.is_some() && delta_stats.max <= source_stats.max))
+            && (delta_stats.min.is_none()
+                || (source_stats.min.is_some() && delta_stats.min >= source_stats.min));
+
+        if delta_stats.distinct < source_stats.distinct && delta_range_within_source {
+            // Delta lagging behind source_scoped: source_scoped advanced past the last sync
+            // (new/changed rows since sync), not a sync error. Unchanged from
+            // `key_stats_outcome`.
+            TableOutcome::Drift {
+                reason: format!(
+                    "{source_label} advanced past sync: {source_label} distinct={} {delta_label} distinct={} — likely new/changed rows since sync, not a sync error",
+                    source_stats.distinct, delta_stats.distinct
+                ),
+            }
+        } else if delta_stats.distinct > source_stats.distinct && delta_range_within_source {
+            // Delta superset, but its range is still contained by source_scoped's own bounds:
+            // benign HWM-scope drift (see doc comment above).
+            TableOutcome::Drift {
+                reason: format!(
+                    "{delta_label} retains rows whose {source_label} updated_at advanced past the HWM scope after sync: {source_label}(count={} distinct={} min={:?} max={:?}) {delta_label}(count={} distinct={} min={:?} max={:?}) — delta_latest's extra keys fall within source_scoped's own range, consistent with already-synced rows that were updated after the sync; benign steady-state drift on an update-active incremental table, not a sync error",
+                    source_stats.count,
+                    source_stats.distinct,
+                    source_stats.min,
+                    source_stats.max,
+                    delta_stats.count,
+                    delta_stats.distinct,
+                    delta_stats.min,
+                    delta_stats.max
+                ),
+            }
+        } else {
+            TableOutcome::Discrepancy {
+                reason: format!(
+                    "{delta_label} has ids/rows not in {source_label}: {source_label}(distinct={} min={:?} max={:?}) {delta_label}(distinct={} min={:?} max={:?})",
+                    source_stats.distinct,
+                    source_stats.min,
+                    source_stats.max,
+                    delta_stats.distinct,
+                    delta_stats.min,
+                    delta_stats.max
+                ),
+            }
+        }
+    }
+
     /// V3-r Tier 2: key-set verdict for a single-column string PRIMARY key, mirroring
     /// `key_stats_outcome`'s Drift-vs-Discrepancy split but over the string fingerprint
     /// (count/distinct/BINARY-normalized min/max).
@@ -903,7 +996,7 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                     .latest_key_stats(table, key, &scope.cursor_col)
                     .await?;
                 delta_keystats = Some(d.clone());
-                Self::key_stats_outcome("source_scoped", "delta_latest", &s, &d)
+                Self::incremental_scoped_key_stats_outcome("source_scoped", "delta_latest", &s, &d)
             } else {
                 let key = key_col.as_deref().unwrap();
                 let s = self.source.key_stats(table, key).await?;
@@ -2969,6 +3062,193 @@ mod tests {
         assert!(
             matches!(outcome, TableOutcome::Discrepancy { .. }),
             "expected Discrepancy, got {outcome:?}"
+        );
+    }
+
+    // --- PS-M1: incremental_scoped_key_stats_outcome -------------------------------------
+
+    #[test]
+    fn incremental_scoped_outcome_delta_superset_contained_range_is_drift() {
+        // The exact false-alarm reproduced live on `multi_course_tokens`: delta_latest has
+        // MORE distinct keys than source_scoped (17 "extra" rows), but its min/max range is
+        // identical to source_scoped's. These are rows that were updated in the source AFTER
+        // the sync — their `updated_at` advanced past the stored HWM, dropping them out of
+        // `source_scoped`, while their already-synced version legitimately remains in
+        // `delta_latest`. This is benign steady-state drift, NOT a sync error, so it must NOT
+        // trip Discrepancy (the previous, buggy behavior via `key_stats_outcome`).
+        let source_scoped = KeyStats {
+            count: 1_623_980,
+            distinct: 1_623_980,
+            min: Some(1),
+            max: Some(6_765_879),
+            xor: 0,
+            distinct_xor: 0,
+            sum: 0,
+        };
+        let delta_latest = KeyStats {
+            count: 1_623_997,
+            distinct: 1_623_997,
+            min: Some(1),
+            max: Some(6_765_879),
+            xor: 0,
+            distinct_xor: 0,
+            sum: 0,
+        };
+        let outcome = VerifyCommand::<MockSourceProbe, MockDeltaProbe>::incremental_scoped_key_stats_outcome(
+            "source_scoped",
+            "delta_latest",
+            &source_scoped,
+            &delta_latest,
+        );
+        assert!(
+            matches!(outcome, TableOutcome::Drift { .. }),
+            "expected Drift for a delta_latest superset with a contained key range, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn incremental_scoped_outcome_equal_stats_is_pass() {
+        let s = KeyStats {
+            count: 10,
+            distinct: 10,
+            min: Some(1),
+            max: Some(10),
+            xor: 11,
+            distinct_xor: 11,
+            sum: 55,
+        };
+        let d = s.clone();
+        let outcome = VerifyCommand::<MockSourceProbe, MockDeltaProbe>::incremental_scoped_key_stats_outcome(
+            "source_scoped",
+            "delta_latest",
+            &s,
+            &d,
+        );
+        assert_eq!(outcome, TableOutcome::Pass);
+    }
+
+    #[test]
+    fn incremental_scoped_outcome_delta_lagging_is_drift() {
+        // delta_latest has FEWER distinct keys than source_scoped, and its range is inside
+        // source_scoped's -> source_scoped advanced past the last sync. Still Drift, mirroring
+        // key_stats_outcome's existing lagging case.
+        let s = KeyStats {
+            count: 10,
+            distinct: 10,
+            min: Some(1),
+            max: Some(10),
+            xor: 11,
+            distinct_xor: 11,
+            sum: 55,
+        };
+        let d = KeyStats {
+            count: 8,
+            distinct: 8,
+            min: Some(1),
+            max: Some(8),
+            xor: 9,
+            distinct_xor: 9,
+            sum: 36,
+        };
+        let outcome = VerifyCommand::<MockSourceProbe, MockDeltaProbe>::incremental_scoped_key_stats_outcome(
+            "source_scoped",
+            "delta_latest",
+            &s,
+            &d,
+        );
+        assert!(
+            matches!(outcome, TableOutcome::Drift { .. }),
+            "expected Drift for a lagging delta_latest, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn incremental_scoped_outcome_superset_with_uncontained_range_is_discrepancy() {
+        // delta_latest is a superset (more distinct keys) but ALSO claims a min below
+        // source_scoped's min -- a genuine phantom/extra key that HWM-advance can't explain.
+        // Must stay Discrepancy.
+        let s = KeyStats {
+            count: 10,
+            distinct: 10,
+            min: Some(5),
+            max: Some(20),
+            xor: 1,
+            distinct_xor: 1,
+            sum: 100,
+        };
+        let d_min_below = KeyStats {
+            count: 12,
+            distinct: 12,
+            min: Some(1),
+            max: Some(20),
+            xor: 2,
+            distinct_xor: 2,
+            sum: 110,
+        };
+        let outcome = VerifyCommand::<MockSourceProbe, MockDeltaProbe>::incremental_scoped_key_stats_outcome(
+            "source_scoped",
+            "delta_latest",
+            &s,
+            &d_min_below,
+        );
+        assert!(
+            matches!(outcome, TableOutcome::Discrepancy { .. }),
+            "expected Discrepancy when delta's min is below source's, got {outcome:?}"
+        );
+
+        // ...and the same when delta's max exceeds source_scoped's max.
+        let d_max_above = KeyStats {
+            count: 12,
+            distinct: 12,
+            min: Some(5),
+            max: Some(25),
+            xor: 2,
+            distinct_xor: 2,
+            sum: 130,
+        };
+        let outcome = VerifyCommand::<MockSourceProbe, MockDeltaProbe>::incremental_scoped_key_stats_outcome(
+            "source_scoped",
+            "delta_latest",
+            &s,
+            &d_max_above,
+        );
+        assert!(
+            matches!(outcome, TableOutcome::Discrepancy { .. }),
+            "expected Discrepancy when delta's max exceeds source's, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn key_stats_outcome_full_refresh_superset_stays_discrepancy_regression_guard() {
+        // Regression guard: the untouched `key_stats_outcome` (used by the full_refresh/basic,
+        // non-scoped path) must STILL return Discrepancy for a delta superset with a contained
+        // range -- PS-M1's Drift carve-out is exclusive to `incremental_scoped_key_stats_outcome`
+        // and must never leak into the full_refresh/basic verdict, where an unscoped source is
+        // authoritative and a delta superset is always a real bug.
+        let source = KeyStats {
+            count: 1_623_980,
+            distinct: 1_623_980,
+            min: Some(1),
+            max: Some(6_765_879),
+            xor: 0,
+            distinct_xor: 0,
+            sum: 0,
+        };
+        let delta = KeyStats {
+            count: 1_623_997,
+            distinct: 1_623_997,
+            min: Some(1),
+            max: Some(6_765_879),
+            xor: 0,
+            distinct_xor: 0,
+            sum: 0,
+        };
+        let outcome = VerifyCommand::<MockSourceProbe, MockDeltaProbe>::key_stats_outcome(
+            "source", "delta", &source, &delta,
+        );
+        assert!(
+            matches!(outcome, TableOutcome::Discrepancy { .. }),
+            "expected Discrepancy for the unscoped full_refresh/basic path, got {outcome:?}"
         );
     }
 
