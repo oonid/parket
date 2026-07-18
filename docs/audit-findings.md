@@ -26,9 +26,10 @@ atomic commit trail; FA2/D3 fixes confirmed working in production; 2.58 GB peak 
 risks are **semantic, not mechanical** — chiefly the `completed_at` update-cursor blind spot on
 `developer_journey_trackings` (§8). New/operator findings recorded in §8: **PS-M1** (a genuine new
 verify false-DISCREPANCY bug), **PS-H-A** (the trackings freshness-contract decision), **PS-H-B**
-(= the un-implemented fix (b) of H-2026-07-11-1), and PS-M2/M3/L1–L3. **PS-H-B is now resolved**
-(`bd13be5` — the `TABLE_RECONCILE` one-shot reconcile flag; see §8.2); the rest are recorded for the
-remediation loop when bandwidth is available. A `fable` follow-up investigation established that the
+(= the un-implemented fix (b) of H-2026-07-11-1), and PS-M2/M3/L1–L3. **PS-H-B and PS-M1 are now
+resolved** (`bd13be5` — the `TABLE_RECONCILE` one-shot reconcile flag, §8.2; `00afcd5` — the verify
+false-DISCREPANCY fix, §8.3); the rest are recorded for the remediation loop when bandwidth is available.
+PS-M1-r (§8.4) is the low-priority end-to-end test follow-up. A `fable` follow-up investigation established that the
 trackings engagement drift is a **frozen historical backlog** (`last_viewed` stopped advancing
 ~2025-02-03), so a *dynamic/multi-field* update cursor would catch ≈0 rows/day and can't heal the
 backlog — the PS-H-A remedy is a one-time reconcile (now clean via PS-H-B), not a cursor change; a new
@@ -383,16 +384,22 @@ developer_id, status(char), last_viewed, first_opened_at, completed_at, develope
   PS-H-A option-2 reconcile a clean, mistake-proof one-shot (no manual seed).
 
 ### 8.3 Open — Medium
-- **PS-M1** (Medium, **code**, NEW — not previously in the register) — `--verify` false-alarms
-  **DISCREPANCY** on update-active incremental tables. Observed live: `multi_course_tokens` deep verify
-  gave `delta_latest = 1,623,997 > source_scoped = 1,623,980` with identical min/max. The 17 "extra"
-  rows were updated *after* the sync: their source `updated_at` moved past the HWM (out of source scope)
-  while their pre-update versions remain in delta scope (`verify/delta.rs:493`). A benign steady-state
-  condition that currently exits non-zero → cries wolf on alerts. **Fix (`verify.rs`):** give incremental
-  the same conservative asymmetry the two-stream path already has (`two_stream_key_stats_outcome`,
-  `verify.rs:594` — delta-superset + range-contained ⇒ Drift), or re-probe the surplus keys against the
-  *unscoped* source before declaring Discrepancy. Trade-off: slightly weaker duplicate detection
-  (mitigated by the distinct-count check).
+- **PS-M1** — **done** (`00afcd5`). Was: `--verify` false-alarms **DISCREPANCY** on update-active
+  incremental tables. Observed live: `multi_course_tokens` deep verify gave `delta_latest = 1,623,997 >
+  source_scoped = 1,623,980` with identical min/max — the 17 "extra" rows were updated *after* the sync
+  (source `updated_at` moved past the HWM, out of `source_scoped`, while the synced version remains in
+  `delta_latest`), a benign steady state that exited non-zero and cried wolf on alerts. **Resolved** — a
+  dedicated `incremental_scoped_key_stats_outcome` (used ONLY at the incremental-scoped call site) grades
+  a `delta_latest` superset whose key range is contained **within** `source_scoped`'s `[min,max]` as
+  **Drift** (source rows advanced past the HWM after sync), reserving Discrepancy for a surplus **outside**
+  the source range (`delta.min < source.min` or `delta.max > source.max`). The containment direction is
+  the OPPOSITE of `two_stream_key_stats_outcome`'s (caught mid-implementation via TDD): an already-synced
+  row that leaves the scope keeps a key inside source's envelope, whereas two-stream legitimately retains
+  extra ids that *enclose* source's range. `key_stats_outcome` (full_refresh/basic, `verify.rs:915`) and
+  `two_stream_key_stats_outcome` are **byte-unchanged**; a regression-guard test asserts the full_refresh
+  path still flags a superset as Discrepancy. 5 new unit tests; gate 646 lib tests, coverage 92.58% lines.
+  Accepted residual: a genuine phantom id *within* source's range is masked as Drift — narrow, since
+  `delta_latest` is deduped and value-aggregates run separately. Follow-up **PS-M1-r** (§8.4).
 - **PS-M2** (Medium, **ops/DBA**, no code) — add a source index on `developer_journey_trackings.completed_at`.
   Stream B's window query AND the per-run D2 NULL census each full-scan ~114M rows (~3 min each) every
   sync because `completed_at` is unindexed; an index makes both near-free and cuts tunnel/DB load as the
@@ -403,6 +410,14 @@ developer_id, status(char), last_viewed, first_opened_at, completed_at, develope
   retention, after confirming no time-travel consumers.
 
 ### 8.4 Open — Low
+- **PS-M1-r** (Low, test; follow-up to PS-M1 `00afcd5`) — the PS-M1 fix is unit-tested at the pure-function
+  level (5 tests over `incremental_scoped_key_stats_outcome`) but **not exercised end-to-end** in the Docker
+  suite. Existing integration tests that add post-sync rows only ever use *brand-new* ids (symmetrically
+  excluded from both `source_scoped` and `delta_latest`), so none reproduces the true PS-M1 shape: an
+  *already-synced* row whose `updated_at` is bumped past the HWM without re-syncing, leaving it in
+  `delta_latest` but not `source_scoped`. **Fix:** add an integration test (sync → update an existing row's
+  `updated_at` forward past the HWM → `--verify --verify-deep`) asserting **Drift**, not Discrepancy. No
+  existing test asserts the old behavior, so nothing is broken meanwhile.
 - **PS-L1** (Low, doc; ties **L7** + H-2026-07-11-1) — runbook the two-stream delete/append crash
   recovery: a run that dies between the DELETE commit (carries NO hwm metadata — confirmed in v25) and the
   APPEND commit leaves the latest commit HWM-less → next run's `read_insert_hwm` returns None → has_data
