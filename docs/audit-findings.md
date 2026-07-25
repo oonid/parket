@@ -358,15 +358,34 @@ developer_id, status(char), last_viewed, first_opened_at, completed_at, develope
 ### 8.2 Open — High
 - **PS-H-A** (High, **operator decision**) — close the trackings update blind spot per §8.1. Options,
   best first: **(1)** source team adds `updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE
-  CURRENT_TIMESTAMP` (+index), then a **config-only** cursor swap `TABLE_UPDATE_CURSOR_developer_journey_trackings=updated_at`
-  (captures every mutation; needs a one-time full-refresh/`TABLE_HWM` baseline); **(2)** available today,
-  config-only: periodic (monthly) `TABLE_MODE=full_refresh` reconcile — temporarily remove the two cursor
-  vars (O5 bails on the conflict), run (~20–25 min, ~3.7 GB S3 rewrite, proven under 8 GB), then restore
-  two-stream config **with a fresh `TABLE_HWM_developer_journey_trackings=<MAX(completed_at)>,<MAX(id)>`
-  seed** (format per `docs/config.md`); flushes never-propagated DELETEs/backdated ts too; **(3)**
-  compound/COALESCE cursor = code change (`query.rs` cursors are backticked names only) — not worth it vs
-  (1); **(4)** accept-and-document — valid ONLY if downstream consumes completion facts (§8.1). The *loss*
-  is tracked+accepted (D2/O3); the *remediation choice* is unrecorded — pick one and record it here.
+  CURRENT_TIMESTAMP` (+index), then a **config-only** cursor swap
+  `TABLE_UPDATE_CURSOR_developer_journey_trackings=updated_at` (captures every mutation; needs a one-time
+  reconcile baseline) — the permanent fix, but gated on a source schema change; **(2)** available today as
+  a **one-shot config flag** (mechanics corrected 2026-07-19: PS-H-B `bd13be5` superseded the original
+  manual `TABLE_MODE=full_refresh` + hand-seeded `TABLE_HWM` dance this entry used to describe) — set
+  `TABLE_RECONCILE_developer_journey_trackings=true` for a single run **keeping the two-stream cursor vars
+  in place** (no `TABLE_MODE` juggling, so no O5 conflict), then remove the flag: the table is extracted as
+  a full snapshot and atomically overwritten (O2-r protocol — an interrupted run leaves the prior snapshot
+  intact), and that commit is stamped with all three two-stream watermarks, so the NEXT run resumes cheap
+  incremental **with no manual `TABLE_HWM` re-seed** (see `docs/config.md` "Per-Table One-Shot Reconcile").
+  ~20–25 min, ~3.7 GB S3 rewrite, proven under 8 GB; also flushes never-propagated DELETEs and backdated
+  timestamps. Residual staleness is then bounded by the chosen cadence; **(3)** compound/COALESCE cursor
+  (e.g. `GREATEST(completed_at, last_viewed)`) — **rejected**, three independent reasons: `query.rs`
+  cursors are backticked column NAMES not expressions (so it is a code change, not config), an expression
+  cursor cannot use an index — and both candidate columns are unindexed — so every extraction window
+  degrades to a full 114M-row scan, and it still cannot see DELETEs; strictly worse than (1) for more work;
+  **(4)** accept-and-document — valid ONLY if downstream consumes completion facts (§8.1). The *loss* is
+  tracked+accepted (D2/O3).
+
+  **Decision record (2026-07-19):**
+  - **(3) rejected** — settled, reasons above.
+  - **(1) wanted but blocked** on the source team — request it in parallel as the permanent fix.
+  - **(2) is the working remediation** — available today as a one-line flag, staleness bounded by cadence.
+  - **(4) remains the legitimate close-out** *iff* nothing downstream reads engagement state.
+  - **Remaining input to finalize (operator/consumer question, not a code question):** does any downstream
+    consumer read `last_viewed`, `status`, or `developer_journey_status_hash`? — **No** ⇒ take (4), record
+    and close PS-H-A. **Yes** ⇒ adopt (2) on a fixed cadence (monthly unless the tolerable staleness window
+    is tighter) and keep (1) queued. **Recommendation: (2) now + pursue (1).**
 - **PS-H-B** — **done** (`bd13be5`). Was: stamp the snapshot max-cursor HWM on full-refresh's final commit
   (`orchestrator/full_refresh.rs` called `commit_overwrite(table_name, None)`) — fix (b) of H-2026-07-11-1,
   left optional and unimplemented; without it every full_refresh→two-stream round-trip (incl. the PS-H-A
