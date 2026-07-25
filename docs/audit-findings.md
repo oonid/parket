@@ -377,15 +377,27 @@ developer_id, status(char), last_viewed, first_opened_at, completed_at, develope
   **(4)** accept-and-document — valid ONLY if downstream consumes completion facts (§8.1). The *loss* is
   tracked+accepted (D2/O3).
 
-  **Decision record (2026-07-19):**
+  **DECIDED (2026-07-19, maintainer):** downstream **does** consume engagement state (at least one of
+  `last_viewed` / `status` / `developer_journey_status_hash` is read by a consuming app). Therefore:
+  - **(4) ruled out** — accept-and-document is not available; the decay is not benign here.
+  - **(2) ADOPTED** as the standing remediation: run the `TABLE_RECONCILE_developer_journey_trackings=true`
+    one-shot on a fixed cadence, **default monthly** (add to the §8.5 runbook). The cadence IS the
+    staleness bound: between reconciles, engagement state is stale for ~6.7% of the 22.9M NULL-`completed_at`
+    rows plus the 12.3% of completed rows carrying post-completion edits (§8.1). Tighten the interval if the
+    consumer's tolerance is shorter than that window — each reconcile is only ~20–25 min / ~3.7 GB.
+  - **(1) ESCALATED** — now the priority ask of the source team, not a nice-to-have: an `updated_at`
+    (+index) is the only option that keeps engagement state *continuously* correct rather than
+    correct-at-each-reconcile. Once it exists, the cursor swap is config-only and (2) can drop to a rare
+    safety net.
   - **(3) rejected** — settled, reasons above.
-  - **(1) wanted but blocked** on the source team — request it in parallel as the permanent fix.
-  - **(2) is the working remediation** — available today as a one-line flag, staleness bounded by cadence.
-  - **(4) remains the legitimate close-out** *iff* nothing downstream reads engagement state.
-  - **Remaining input to finalize (operator/consumer question, not a code question):** does any downstream
-    consumer read `last_viewed`, `status`, or `developer_journey_status_hash`? — **No** ⇒ take (4), record
-    and close PS-H-A. **Yes** ⇒ adopt (2) on a fixed cadence (monthly unless the tolerable staleness window
-    is tighter) and keep (1) queued. **Recommendation: (2) now + pursue (1).**
+  - **Worth investigating, NOT adopted (unverified):** swapping the update cursor to `last_viewed`
+    (`TABLE_UPDATE_CURSOR_...=last_viewed`) would be config-only and available today, and `last_viewed`
+    demonstrably advances on the engagement edits the current cursor misses (§8.1 derives both drift
+    figures from it). Two unknowns must be settled FIRST, because getting them wrong trades a working
+    guarantee for a broken one: (a) is `last_viewed` NOT NULL? — a nullable cursor is silently lossy
+    (D2/O3) and would be auto-demoted anyway (O3); (b) does every completion also touch `last_viewed`? If
+    not, switching would sacrifice the one property that is currently exact (completion facts) to gain
+    engagement freshness. Check with `--inspect` + a `completed_at > last_viewed` count before considering.
 - **PS-H-B** — **done** (`bd13be5`). Was: stamp the snapshot max-cursor HWM on full-refresh's final commit
   (`orchestrator/full_refresh.rs` called `commit_overwrite(table_name, None)`) — fix (b) of H-2026-07-11-1,
   left optional and unimplemented; without it every full_refresh→two-stream round-trip (incl. the PS-H-A
@@ -475,6 +487,13 @@ developer_id, status(char), last_viewed, first_opened_at, completed_at, develope
   three hwm keys (`hwm_insert_id`/`hwm_updated_at`/`hwm_last_id`) — a missing set ⇒ next run bails,
   re-seed per PS-L1; (4) `state.json` all `last_run_status == "success"`.
 - **Weekly:** `--verify --verify-deep` on everything except trackings (≤4.6M each, ~3 min total).
+- **Monthly — trackings reconcile (PS-H-A option 2, ADOPTED 2026-07-19):** engagement state
+  (`last_viewed`/`status`/`status_hash`) is consumed downstream and the `completed_at` cursor cannot heal it,
+  so run the one-shot: set `TABLE_RECONCILE_developer_journey_trackings=true`, run once (~20–25 min, ~3.7 GB
+  S3 rewrite; the two-stream cursor vars STAY in place), then remove the flag — the next run resumes
+  incremental automatically (watermarks are stamped on the reconcile commit; no manual `TABLE_HWM`). Follow
+  it with `--verify --verify-deep` on trackings, off-peak. This cadence IS the staleness bound — tighten it
+  if the consumer needs fresher engagement state than one month.
 - **Monthly / pre-critical-use:** trackings frontier parity (far cheaper than deep verify on 114M):
   read `hwm_insert_id` from the latest commit → source `COUNT(*) WHERE id <= <hwm_insert_id>` (~2 min, PK
   range) vs Σ live-file `numRecords` from `_delta_log` (seconds). Any inequality = real drift (in-scope
