@@ -361,7 +361,7 @@ developer_id, status(char), last_viewed, first_opened_at, completed_at, develope
   CURRENT_TIMESTAMP` (+index), then a **config-only** cursor swap
   `TABLE_UPDATE_CURSOR_developer_journey_trackings=updated_at` (captures every mutation; needs a one-time
   reconcile baseline) — the permanent fix, but gated on a source schema change; **(2)** available today as
-  a **one-shot config flag** (mechanics corrected 2026-07-19: PS-H-B `bd13be5` superseded the original
+  a **one-shot config flag** (mechanics corrected 2026-07-25: PS-H-B `bd13be5` superseded the original
   manual `TABLE_MODE=full_refresh` + hand-seeded `TABLE_HWM` dance this entry used to describe) — set
   `TABLE_RECONCILE_developer_journey_trackings=true` for a single run **keeping the two-stream cursor vars
   in place** (no `TABLE_MODE` juggling, so no O5 conflict), then remove the flag: the table is extracted as
@@ -377,7 +377,7 @@ developer_id, status(char), last_viewed, first_opened_at, completed_at, develope
   **(4)** accept-and-document — valid ONLY if downstream consumes completion facts (§8.1). The *loss* is
   tracked+accepted (D2/O3).
 
-  **DECIDED (2026-07-19, maintainer):** downstream **does** consume engagement state (at least one of
+  **DECIDED (2026-07-25, maintainer):** downstream **does** consume engagement state (at least one of
   `last_viewed` / `status` / `developer_journey_status_hash` is read by a consuming app). Therefore:
   - **(4) ruled out** — accept-and-document is not available; the decay is not benign here.
   - **(2) ADOPTED** as the standing remediation: run the `TABLE_RECONCILE_developer_journey_trackings=true`
@@ -487,7 +487,7 @@ developer_id, status(char), last_viewed, first_opened_at, completed_at, develope
   three hwm keys (`hwm_insert_id`/`hwm_updated_at`/`hwm_last_id`) — a missing set ⇒ next run bails,
   re-seed per PS-L1; (4) `state.json` all `last_run_status == "success"`.
 - **Weekly:** `--verify --verify-deep` on everything except trackings (≤4.6M each, ~3 min total).
-- **Monthly — trackings reconcile (PS-H-A option 2, ADOPTED 2026-07-19):** engagement state
+- **Monthly — trackings reconcile (PS-H-A option 2, ADOPTED 2026-07-25):** engagement state
   (`last_viewed`/`status`/`status_hash`) is consumed downstream and the `completed_at` cursor cannot heal it,
   so run the one-shot: set `TABLE_RECONCILE_developer_journey_trackings=true`, run once (~20–25 min, ~3.7 GB
   S3 rewrite; the two-stream cursor vars STAY in place), then remove the flag — the next run resumes
