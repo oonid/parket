@@ -169,7 +169,7 @@ design (see `docs/verify-checks.md`).
 - **O11** — **done** (`a09642e`): `resolve_ts_col_and_mode` now validates an explicit `TABLE_TIMESTAMP` only when it's actually used as the incremental cursor — validation is skipped when the table is EXPLICITLY configured for a mode that never reads it (`TABLE_MODE=full_refresh` or two-stream). An invalid cursor that would otherwise leave the table incremental-eligible STILL fails fast (the `explicit_timestamp_cursor_on_filtered_time_column_bails_actionably` orchestrator test is preserved — that fail-fast is desirable, not the bug). 3 resolver unit tests. **Preflight adopted the shared resolver** (removed the last inline mode-resolution copy), so `--check`/run/verify are now unified — this also closes O7's mode-parity sub-item. Full 22-test Docker suite green (Opus-reviewed).
 - **T2–T5** — ~~corruption/scope/NULL/multibyte test coverage~~ **done** (`108d9e3`).
 - **T6** — **done** (`87db089`): Docker coverage added for the four previously-unproven verify outcome paths — the **two-stream verdict** (Clean, then Discrepancy via source-grew hitting the asymmetric else-branch), the **Drift tier** (`source advanced past sync`, asserted through the now-`pub run_one_table` since `run()` rolls Drift up to Clean), the **size-guard Skipped tier** (`with_row_cap(5)` + !deep on a 10-row table → Skipped; deep bypasses it → Pass), and a **VARCHAR-only value drift** (per-column value-aggregate catches a text-column change with unchanged ids). Two additive test-enablers in verify.rs (`pub run_one_table`, `with_row_cap`) — `run()`/outcome logic untouched. Full 28-test Docker suite green (Opus-reviewed, Docker-proven).
-- **T6-r (Low)** — secondary coverage still absent: keyset full-refresh page-boundary (C1) and the R2 HWM-no-progress bail. Both are extraction-path (not verify-verdict) gaps; R2-bail is pathological to construct deterministically (a full batch of non-advancing cursor values).
+- **T6-r** — **done / resolved-as-unreachable** (`6c915d2`). (a) **keyset full-refresh page boundary (C1): now Docker-covered** — `full_refresh_keyset_pagination_crosses_page_boundary_exactly_once` forces 5 keyset pages over a 300-row integer-PK table (N8's page-forcing trick: an 8000-char filler column + `ANALYZE TABLE` + `target_memory_mb=1` shrinks `calculate_batch_size` to 60/page) and asserts exactly 300 rows / 300 distinct ids — no skip or duplicate across the 4 boundaries crossed. (b) **R2 HWM-no-progress bail: UNREACHABLE BY CONSTRUCTION, not missing coverage** — verified in source, three independent invariants each block it: the incremental predicate (`query.rs:72`) is `(ts = hwm AND key > last_id) OR (ts > hwm)`, so every row MariaDB returns strictly exceeds the current HWM in `(ts, key)` order and therefore so does their max; `validate_timestamp_col` (`discovery.rs`) admits only `timestamp`/`datetime` cursors, whose Arrow round-trip via `extract_timestamp_as_strings` covers every unit connector_arrow emits without precision loss; and N7's `ts_components` comparison preserves chronological ordering, so no formatting tie/reversal can occur. The guard is additionally gated on `batch_hwm.is_some()`, so the unextractable-cursor route produces the *None* bail instead (reachable, and covered by N2-r's Boolean-cursor unit test). **Keep the guard as defense-in-depth** — it is unreachable *given those invariants*, so it becomes live again if any of them changes (a future non-timestamp cursor type, or a comparison regression); it is not dead code to delete.
 
 ## 5. Open — Low
 - **N1-u** — upstream follow-up: connector_arrow `create_field` `todo!()` → proper `ConnectorError` (offered in PR #79's description; unreachable from parket since `ee09a7f`).
@@ -458,14 +458,15 @@ developer_id, status(char), last_viewed, first_opened_at, completed_at, develope
   RETAIN 168 HOURS` (default retention; L7 makes it safe) once tombstones age past 7 days.
 
 ### 8.4 Open — Low
-- **PS-M1-r** (Low, test; follow-up to PS-M1 `00afcd5`) — the PS-M1 fix is unit-tested at the pure-function
-  level (5 tests over `incremental_scoped_key_stats_outcome`) but **not exercised end-to-end** in the Docker
-  suite. Existing integration tests that add post-sync rows only ever use *brand-new* ids (symmetrically
-  excluded from both `source_scoped` and `delta_latest`), so none reproduces the true PS-M1 shape: an
-  *already-synced* row whose `updated_at` is bumped past the HWM without re-syncing, leaving it in
-  `delta_latest` but not `source_scoped`. **Fix:** add an integration test (sync → update an existing row's
-  `updated_at` forward past the HWM → `--verify --verify-deep`) asserting **Drift**, not Discrepancy. No
-  existing test asserts the old behavior, so nothing is broken meanwhile.
+- **PS-M1-r** — **done** (`6c915d2`): `verify_incremental_scoped_drift_on_already_synced_row_advancing_past_hwm`
+  reproduces the true PS-M1 shape end-to-end under Docker — seed 5 rows, sync, then (no re-run) advance the
+  **non-extremal** id=3 row's `updated_at` past the HWM, so it leaves `source_scoped` while remaining in
+  `delta_latest` with its key still inside `source_scoped`'s own `[1,5]` envelope. Asserts
+  `TableOutcome::Drift` (reason: "advanced past the HWM scope after sync") via the public `run_one_table`,
+  since `run()` folds Drift up into `Clean` and a run-level assertion cannot distinguish Drift from Pass.
+  **Same test also proves the fix is containment-based, not a blanket downgrade:** advancing the *extremal*
+  id=5 row shrinks `source_scoped`'s max to 4 while `delta_latest` keeps 5 — now OUTSIDE the envelope — and
+  the outcome is correctly `Discrepancy`.
 - **PS-L1** — **done** (docs, `docs/config.md` "Two-Stream Recovery & Caveats"). The crash-between-DELETE-
   and-APPEND case (DELETE commit carries no HWM) **now largely self-heals** thanks to **L7** (`391210d`):
   `read_insert_hwm`/`read_hwm` scan back past the watermark-less DELETE commit to the last HWM-carrying
