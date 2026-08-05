@@ -70,9 +70,14 @@ cursor swap investigated and REJECTED on live-DB evidence — 99.2% of completed
 corrections that would each have misled an operator — the post-L7 runbook HWM check (it would
 false-alarm on today's production log, whose two newest commits are `VACUUM START`/`END` and carry no
 watermark) and PS-H-A's option-2 mechanics (still describing the pre-`bd13be5` manual `TABLE_HWM`
-dance). All work is on `master`, ahead of `origin/master` and prepared for the operator to push (remote
-gitops run manually with an SSH key). `vendor/connector_arrow`: upstream PR #79 **merged** and released
-as v0.12.1 — submodule on aljazerzen upstream at `3e98df6`; the temporary fork pin is retired.
+dance). **Released:** `master` is pushed and tagged `v0.2.3` — both the Release and CI workflows green
+(CI proves it on a clean checkout with submodules initialised, independently of any local run), all four
+target artifacts published, and the `x86_64-unknown-linux-gnu` binary deployed in porter (`--version`
+and `--check` verified against the live config). porter pins the submodule at the released commit
+`3ce0ea5`; post-release work may sit ahead of that tag, which is expected — do not chase the pin
+forward without a new release. Remote gitops are run manually by the operator with an SSH key.
+`vendor/connector_arrow`: upstream PR #79 **merged** and released as v0.12.1 — submodule on aljazerzen
+upstream at `3e98df6`; the temporary fork pin is retired.
 Coverage gate (re-measured 2026-08-05 at v0.2.3 release time): `cargo llvm-cov --lib -p parket
 --fail-under-lines 90` reports **92.60% lines** (regions 91.79%, functions 90.21%), exit 0 — passes
 (`verify/source.rs` reads ~0% under `--lib`: it is Docker-integration-only, covered by the 40-test
