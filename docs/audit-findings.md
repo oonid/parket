@@ -232,9 +232,15 @@ plan→implement→review remediation loop; none fixed yet.
   deliberate choice** — not parity caution (there is none here; both numbers come from the same Delta-side
   aggregate) but *legacy-data* caution: a table synced before `c6ea932` may still carry residual duplicates and
   hard-failing would regress existing deployments instead of reporting. The line names the surplus and points at
-  the `TABLE_RECONCILE` one-shot as remediation. **FA2-r2 (Low, follow-up):** promote to `Discrepancy` once live
-  two-stream tables are confirmed duplicate-free — this diagnostic is itself the check that confirms it (watch
-  for the line on the next `--verify` of `developer_journey_trackings`, which ran pre-fix).
+  the `TABLE_RECONCILE` one-shot as remediation. **FA2-r2 (Low, follow-up) — EVIDENCE GATHERED 2026-08-05, promotion now justified:** frontier parity on
+  `developer_journey_trackings` (the ONLY two-stream table in the live config, and the one that ran pre-fix) is
+  **EXACT** — Delta Σ live-file `numRecords` = **114,412,210** (25 live parquet, log v36) vs source
+  `COUNT(*) WHERE id <= hwm_insert_id(500147847)` = **114,412,210**. Zero net surplus ⇒ no duplicate rows and no
+  in-scope deletes, so promoting the diagnostic to `Discrepancy` would not fail any existing table. Caveat: this
+  is a NET row count, not `count` vs `count(distinct id)`, so it rules out duplication only up to the improbable
+  case of duplicates exactly offset by deletes; a true distinct-count needs a full Delta parquet scan
+  (`--verify --verify-deep`, runbook-reserved for off-peak post-reconcile). **Decision pending operator sign-off**
+  (it changes `--verify`'s exit code behavior).
 
 ### 7.3 Open — Medium
 - **FA3** — **done** (`878d051`). Full refresh never evolved the Delta schema (confirmed). `coerce_batch_to_schema` iterates only
@@ -508,9 +514,13 @@ developer_id, status(char), last_viewed, first_opened_at, completed_at, develope
 - **After every sync (~10 min):** (1) `--verify` on the 7 light tables (expect PASS/SKIPPED; a
   DISCREPANCY with `delta_latest > source_scoped` + equal min/max = the benign PS-M1 signature); (2)
   `TABLES=developer_journey_trackings --verify` (schema + counts; verdict SKIPPED expected; healthy =
-  source−delta gap ≈ new inserts, schema 9=9); (3) latest trackings `_delta_log` commit MUST carry all
-  three hwm keys (`hwm_insert_id`/`hwm_updated_at`/`hwm_last_id`) — a missing set ⇒ next run bails,
-  re-seed per PS-L1; (4) `state.json` all `last_run_status == "success"`.
+  source−delta gap ≈ new inserts, schema 9=9); (3) the most recent HWM-carrying commit **within the last 64**
+  must have all three hwm keys (`hwm_insert_id`/`hwm_updated_at`/`hwm_last_id`). **CORRECTED 2026-08-05
+  (post-L7 `391210d`):** `read_hwm`/`read_insert_hwm` now scan back up to 64 commits, so watermark-less
+  commits AT THE HEAD of the log (VACUUM START/END, OPTIMIZE, checkpoints) are NORMAL and do **not** cause a
+  bail — the old wording ("latest commit must carry the keys ⇒ else next run bails") would raise a FALSE ALARM
+  today: production is currently v36=`VACUUM END`, v35=`VACUUM START`, newest HWM at v34, and is healthy. Only
+  >64 consecutive watermark-less commits, or no HWM anywhere in the lookback, needs the PS-L1 re-seed; (4) `state.json` all `last_run_status == "success"`.
 - **Weekly:** `--verify --verify-deep` on everything except trackings (≤4.6M each, ~3 min total).
 - **Monthly — trackings reconcile (PS-H-A option 2, ADOPTED 2026-07-25):** engagement state
   (`last_viewed`/`status`/`status_hash`) is consumed downstream and the `completed_at` cursor cannot heal it,
