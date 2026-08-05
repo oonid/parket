@@ -245,9 +245,15 @@ plan→implement→review remediation loop; none fixed yet.
   `max(id) = 500147847` exactly equal to the log's `hwm_insert_id`. `count == distinct` rules out
   duplication outright, so the "duplicates offset by an equal number of deletes" loophole is eliminated
   rather than merely improbable. Four independent measurements agree (parquet scan, `_delta_log`
-  `numRecords` sum, source frontier count, and the HWM). **The FA2-r2 precondition is met: promotion to
-  `Discrepancy` will not fail any existing table.** Remaining step is operator sign-off, since it changes
-  `--verify`'s exit-code behavior.
+  `numRecords` sum, source frontier count, and the HWM). **FA2-r2 — DONE** (`53cd1bc`, operator-approved
+  2026-08-05): the check is promoted from diagnostic to **verdict** — `count > distinct` on a two-stream
+  table now yields `Discrepancy`, so duplication reaches the exit code. It moved INSIDE
+  `two_stream_key_stats_outcome` (pure + directly unit-testable) and runs FIRST so it dominates the Drift
+  arm — the arm that, combined with `run()` folding Drift into Clean, is exactly how the original FA2
+  duplication stayed invisible. A regression-guard test asserts the promotion did NOT break the legitimate
+  two-stream Drift path (extra *distinct* ids enclosing source's range: `count == distinct`, no surplus →
+  still Drift). 664 lib tests, clippy `--all-targets` clean, all 7 two-stream Docker tests green.
+  **The FA2 blind spot is now closed at its root.**
 
 ### 7.3 Open — Medium
 - **FA3** — **done** (`878d051`). Full refresh never evolved the Delta schema (confirmed). `coerce_batch_to_schema` iterates only
