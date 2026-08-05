@@ -239,8 +239,15 @@ plan→implement→review remediation loop; none fixed yet.
   in-scope deletes, so promoting the diagnostic to `Discrepancy` would not fail any existing table. Caveat: this
   is a NET row count, not `count` vs `count(distinct id)`, so it rules out duplication only up to the improbable
   case of duplicates exactly offset by deletes; a true distinct-count needs a full Delta parquet scan
-  (`--verify --verify-deep`, runbook-reserved for off-peak post-reconcile). **Decision pending operator sign-off**
-  (it changes `--verify`'s exit code behavior).
+  (`--verify --verify-deep`, runbook-reserved for off-peak post-reconcile). **DEFINITIVE 2026-08-05** — the net-count caveat above is now
+  CLOSED by direct measurement: the new `examples/delta_key_census` (Delta-side only, no source-DB load)
+  reports **count = 114,412,210 == distinct = 114,412,210**, with `xor == distinct_xor` and
+  `max(id) = 500147847` exactly equal to the log's `hwm_insert_id`. `count == distinct` rules out
+  duplication outright, so the "duplicates offset by an equal number of deletes" loophole is eliminated
+  rather than merely improbable. Four independent measurements agree (parquet scan, `_delta_log`
+  `numRecords` sum, source frontier count, and the HWM). **The FA2-r2 precondition is met: promotion to
+  `Discrepancy` will not fail any existing table.** Remaining step is operator sign-off, since it changes
+  `--verify`'s exit-code behavior.
 
 ### 7.3 Open — Medium
 - **FA3** — **done** (`878d051`). Full refresh never evolved the Delta schema (confirmed). `coerce_batch_to_schema` iterates only
