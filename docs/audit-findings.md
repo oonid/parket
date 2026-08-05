@@ -1,6 +1,6 @@
 # Audit findings register (living document)
 
-**Status date:** 2026-07-18. This is the single source of truth for audit findings and remediation
+**Status date:** 2026-08-05. This is the single source of truth for audit findings and remediation
 process — it consolidates `docs/audit-2026-07-04.md` and `docs/handoff-2026-07-06.md` (both retired;
 content carried forward here) and the second-pass results in `docs/audit-2026-07-06.md` (kept for its
 detailed analysis; finding IDs below reference it). Target runtime: an **8 GB RAM** VM.
@@ -54,18 +54,30 @@ a plan → confirm → implement+test → review → commit loop, stopping for c
 snapshot branch (`snapshot/pre-<step>-<date>`) before starting each fix; small reviewable diffs; never
 weaken an existing test assertion to make it pass.
 
-**Branch state (2026-07-18):** `master` and the active `test/verify-docker-integration` branch share
-the same head, now tagged **`v0.2.2`** (bumped from `0.2.1` — PS-H-B `TABLE_RECONCILE` one-shot
-reconcile, PS-M1 verify false-DISCREPANCY fix, the §9 Low-batch cleanup [L7/FA11/M2-r2/S2-r/N1-r2/
-D1-r2/L1/O13 + PS-L1/L2 docs], and the versioned-tar.gz release workflow). All work is on `master`,
-ahead of `origin/master` and prepared for the operator to push (remote gitops run manually with an SSH
-key). `vendor/connector_arrow`: upstream PR #79 **merged** and released as v0.12.1 — submodule on
-aljazerzen upstream at `3e98df6`; the temporary fork pin is retired.
-Coverage gate (re-measured 2026-07-18 at v0.2.2 release time): `cargo llvm-cov --lib -p parket
---fail-under-lines 90` reports **92.59% lines** (regions 91.80%, functions 90.19%), exit 0 — passes
-(`verify/source.rs` reads 0% under `--lib`: it is Docker-integration-only, covered by the 38-test
+**Branch state (2026-08-05):** `master` is the ONLY local branch — the topic branches and the ~34
+`snapshot/*` safety branches were pruned once their work had landed (each verified merged into
+`origin/master` first) — and its head is now tagged **`v0.2.3`** (bumped from `0.2.2`). Since v0.2.2:
+**FA2-r2 changes `--verify` exit-code semantics** — duplicate keys on a two-stream table now yield
+`Discrepancy` instead of a printed diagnostic, enabled by measuring production FIRST (the only live
+two-stream table reports `count == distinct == 114,412,210` via the new census, so no existing
+deployment starts failing); **PS-M1-r + T6-r** Docker coverage (the true PS-M1 Drift shape, and keyset
+full-refresh page boundaries — while the R2 no-progress bail is recorded as unreachable-by-construction
+rather than untested, and kept as defence-in-depth); the new **`examples/delta_key_census`**, a
+Delta-side key census that costs the source database nothing; **PS-H-A decided** (the `TABLE_RECONCILE`
+one-shot adopted with a verify-driven cadence, source-side `updated_at` escalated, and the `last_viewed`
+cursor swap investigated and REJECTED on live-DB evidence — 99.2% of completed rows have
+`last_viewed < completed_at`, so it would stop completions re-syncing); plus two documentation
+corrections that would each have misled an operator — the post-L7 runbook HWM check (it would
+false-alarm on today's production log, whose two newest commits are `VACUUM START`/`END` and carry no
+watermark) and PS-H-A's option-2 mechanics (still describing the pre-`bd13be5` manual `TABLE_HWM`
+dance). All work is on `master`, ahead of `origin/master` and prepared for the operator to push (remote
+gitops run manually with an SSH key). `vendor/connector_arrow`: upstream PR #79 **merged** and released
+as v0.12.1 — submodule on aljazerzen upstream at `3e98df6`; the temporary fork pin is retired.
+Coverage gate (re-measured 2026-08-05 at v0.2.3 release time): `cargo llvm-cov --lib -p parket
+--fail-under-lines 90` reports **92.60% lines** (regions 91.79%, functions 90.21%), exit 0 — passes
+(`verify/source.rs` reads ~0% under `--lib`: it is Docker-integration-only, covered by the 40-test
 Docker suite instead). Local gate at release: `cargo build` clean, `cargo clippy --all-targets -D
-warnings` clean, `cargo test --lib` **622 passed**, full Docker integration suite **38 passed**.
+warnings` clean, `cargo test --lib` **664 passed**, full Docker integration suite **40 passed**.
 
 **Cross-engine status (updated after `108d9e3`):** the verify value-aggregate SQL is now
 **execution-proven** against real MariaDB + MinIO for: full-refresh/basic deep verify across

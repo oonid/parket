@@ -4800,7 +4800,7 @@ checksum = "4fedd80c472f62662c2039c01b2434ca886948fb2f1aa2bc30b84ec53e474bdf"
 
 [[package]]
 name = "parket"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "aws-sdk-s3",
