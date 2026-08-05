@@ -710,6 +710,29 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
         source_stats: &KeyStats,
         delta_stats: &KeyStats,
     ) -> TableOutcome {
+        // FA2-r2: duplicate keys DOMINATE every other grading below. In two-stream mode the
+        // Delta table is a current-state mirror (both `delete_then_append` and `merge_batch`
+        // keep exactly one row per key), so `count > distinct` is duplicated rows — the FA2
+        // class. This must be checked FIRST precisely because the Drift arm further down
+        // grades a Delta surplus as legitimately-retained extra ids, and `run()` folds Drift
+        // into `Clean` — which is exactly how the original FA2 duplication stayed invisible to
+        // the exit code. Promoted from a diagnostic to a verdict on 2026-08-05 after the only
+        // live two-stream table measured `count == distinct` (114,412,210) via
+        // `examples/delta_key_census`, so no existing deployment fails on legacy data. Safe to
+        // gate the verdict on: unlike the V5/V6-r diagnostics both numbers come from the same
+        // Delta-side aggregate, so there is no cross-engine parity risk.
+        if let Some(surplus) = duplicate_key_surplus(delta_stats) {
+            return TableOutcome::Discrepancy {
+                reason: format!(
+                    "{delta_label} holds DUPLICATE KEYS: count={} > distinct={} ({surplus} surplus row(s)). \
+                     two_stream keeps exactly one row per key, so these are duplicated rows (FA2-class); \
+                     remediate with a TABLE_RECONCILE_<table>=true one-shot. \
+                     ({source_label}: count={} distinct={})",
+                    delta_stats.count, delta_stats.distinct, source_stats.count, source_stats.distinct
+                ),
+            };
+        }
+
         if source_stats == delta_stats {
             return TableOutcome::Pass;
         }
@@ -1023,24 +1046,8 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                 let d = self.delta.key_stats(table, key).await?;
                 delta_keystats = Some(d.clone());
                 if matches!(&plan.mode, VerifyMode::TwoStream { .. }) {
-                    // FA2 follow-up: two-stream keeps exactly one row per key, so a surplus
-                    // over distinct keys means duplicated rows — the FA2 class. The verdict
-                    // below grades a Delta surplus as Drift (folded to Clean by `run()`),
-                    // which is what hid the original bug, so say it out loud here.
-                    // Diagnostic-only deliberately: a table synced BEFORE the FA2 fix
-                    // (`c6ea932`) can still carry residual duplicates, and hard-failing those
-                    // runs would regress existing deployments. Promotion to Discrepancy is
-                    // safe once live tables are confirmed clean (register FA2-r2) — there is
-                    // no cross-engine parity risk in this check.
-                    if let Some(surplus) = duplicate_key_surplus(&d) {
-                        println!(
-                            "verify {table} DUPLICATE KEYS in {delta_label}: count={} > distinct={} \
-                             ({surplus} surplus row(s); two_stream holds one row per key — FA2-class \
-                             duplication, remediate with a TABLE_RECONCILE one-shot) \
-                             (diagnostic — does not affect verdict)",
-                            d.count, d.distinct
-                        );
-                    }
+                    // FA2-r2: the duplicate-key check lives INSIDE the outcome fn (pure +
+                    // directly unit-testable) and dominates it — see there for why.
                     Self::two_stream_key_stats_outcome("source", delta_label, &s, &d)
                 } else {
                     Self::key_stats_outcome("source", delta_label, &s, &d)
@@ -3565,6 +3572,59 @@ mod tests {
         let result = cmd.run().await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), VerifyVerdict::Discrepancy);
+    }
+
+    #[test]
+    fn two_stream_outcome_duplicate_keys_is_discrepancy_not_drift() {
+        // FA2-r2: a Delta surplus over distinct keys must FAIL, not be graded Drift (which
+        // run() folds into Clean — the exact path that hid the original FA2 duplication).
+        let ks = |count: i64, distinct: i64, min: i128, max: i128| KeyStats {
+            count,
+            distinct,
+            min: Some(min),
+            max: Some(max),
+            xor: 0,
+            distinct_xor: 0,
+            sum: 0,
+        };
+
+        // Duplicated rows in Delta: 100 distinct keys but 103 rows.
+        let outcome = VerifyCommand::<MockSourceProbe, MockDeltaProbe>::two_stream_key_stats_outcome(
+            "source",
+            "delta",
+            &ks(100, 100, 1, 100),
+            &ks(103, 100, 1, 100),
+        );
+        match &outcome {
+            TableOutcome::Discrepancy { reason } => {
+                assert!(reason.contains("DUPLICATE KEYS"), "got: {reason}");
+                assert!(reason.contains("3 surplus"), "should name the surplus: {reason}");
+            }
+            other => panic!("expected Discrepancy for duplicate keys, got {other:?}"),
+        }
+
+        // REGRESSION GUARD: the legitimate two-stream Drift path must survive the promotion —
+        // Delta retaining extra *distinct* ids that enclose source's range is still Drift, not
+        // a duplication failure (count == distinct, so no surplus).
+        let drift = VerifyCommand::<MockSourceProbe, MockDeltaProbe>::two_stream_key_stats_outcome(
+            "source",
+            "delta",
+            &ks(100, 100, 5, 95),
+            &ks(120, 120, 1, 100),
+        );
+        assert!(
+            matches!(drift, TableOutcome::Drift { .. }),
+            "extra distinct ids in two_stream must stay Drift, got {drift:?}"
+        );
+
+        // Identical stats still Pass.
+        let pass = VerifyCommand::<MockSourceProbe, MockDeltaProbe>::two_stream_key_stats_outcome(
+            "source",
+            "delta",
+            &ks(100, 100, 1, 100),
+            &ks(100, 100, 1, 100),
+        );
+        assert!(matches!(pass, TableOutcome::Pass), "got {pass:?}");
     }
 
     #[test]
