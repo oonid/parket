@@ -224,7 +224,17 @@ plan→implement→review remediation loop; none fixed yet.
   (→ Clean), so it's invisible to the exit code and `--verify`. **Fix:** cap Stream B at the insert
   watermark (`AND {insert_col} <= {hwm_id}`) — rows beyond it belong to the next run's insert stream. (Do
   NOT advance the insert watermark past Stream B's max — that would lose not-yet-completed rows in `(X, maxB]`.)
-  Optionally make `two_stream_key_stats_outcome` treat `delta count > delta distinct` as a loud diagnostic. **Resolved:** `build_incremental_query` gained an optional `key_upper_bound`; Stream B now passes the insert watermark `hwm_id`, so a row inserted past it (belonging to the next run's Stream A) isn't updated+appended now and re-appended next run. Plain incremental passes `None` (byte-identical, verified). In a quiescent DB the cap excludes nothing (Stream A ends at source max) so no behavior change — the race isn't deterministically Docker-reproducible; proof is the query-cap unit tests + a mock test asserting Stream A is uncapped while Stream B carries `AND \`id\` <= <hwm>`. Full 36-test Docker suite green, no regression. (The `two_stream_key_stats_outcome` diagnostic tweak was left as an optional follow-up.)
+  Optionally make `two_stream_key_stats_outcome` treat `delta count > delta distinct` as a loud diagnostic. **Resolved:** `build_incremental_query` gained an optional `key_upper_bound`; Stream B now passes the insert watermark `hwm_id`, so a row inserted past it (belonging to the next run's Stream A) isn't updated+appended now and re-appended next run. Plain incremental passes `None` (byte-identical, verified). In a quiescent DB the cap excludes nothing (Stream A ends at source max) so no behavior change — the race isn't deterministically Docker-reproducible; proof is the query-cap unit tests + a mock test asserting Stream A is uncapped while Stream B carries `AND \`id\` <= <hwm>`. Full 36-test Docker suite green, no regression. **FA2 diagnostic follow-up — DONE** (`37e7dd0`): the optional tweak is implemented. `duplicate_key_surplus`
+  (a pure, single-engine invariant check) flags `count > distinct` on the **two-stream path only** — two-stream
+  keeps exactly one row per key, so a surplus IS duplicated rows, whereas an incremental append-log legitimately
+  holds many versions per id. This closes the blind spot that hid FA2: the verdict grades a Delta surplus as
+  Drift, which `run()` folds into Clean, so duplication could not reach the exit code. **Diagnostic-only by
+  deliberate choice** — not parity caution (there is none here; both numbers come from the same Delta-side
+  aggregate) but *legacy-data* caution: a table synced before `c6ea932` may still carry residual duplicates and
+  hard-failing would regress existing deployments instead of reporting. The line names the surplus and points at
+  the `TABLE_RECONCILE` one-shot as remediation. **FA2-r2 (Low, follow-up):** promote to `Discrepancy` once live
+  two-stream tables are confirmed duplicate-free — this diagnostic is itself the check that confirms it (watch
+  for the line on the next `--verify` of `developer_journey_trackings`, which ran pre-fix).
 
 ### 7.3 Open — Medium
 - **FA3** — **done** (`878d051`). Full refresh never evolved the Delta schema (confirmed). `coerce_batch_to_schema` iterates only
