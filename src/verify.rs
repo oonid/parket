@@ -314,6 +314,26 @@ fn sum_would_overflow(kind: &AggKind, min: Option<&str>, max: Option<&str>, non_
     int_digits + count_digits > capacity
 }
 
+/// FA2 follow-up: surplus rows over distinct keys on the Delta side, i.e. DUPLICATE KEYS.
+///
+/// In two-stream mode the Delta table is a *current-state mirror* — both write strategies
+/// (`delete_then_append` and `merge_batch`) maintain exactly one row per key — so
+/// `count > distinct` is not a normal state, it is the FA2 cross-window-duplication
+/// signature. It is deliberately NOT derived from any source comparison: both numbers come
+/// from the same Delta-side aggregate, so this is a single-engine invariant check with no
+/// cross-engine parity risk (unlike the V5/V6-r diagnostics).
+///
+/// Why this exists at all: `two_stream_key_stats_outcome` grades a Delta surplus as `Drift`,
+/// which `run()` folds into `Clean` — precisely what made the original FA2 duplication
+/// invisible to the exit code. FA2's cause is fixed (`c6ea932`), so this guards against
+/// future variants of the same class.
+///
+/// NOTE for incremental mode this is expected and normal (an append-log legitimately holds
+/// many versions per id), which is why callers must only apply it on the two-stream path.
+pub(crate) fn duplicate_key_surplus(delta_stats: &KeyStats) -> Option<i64> {
+    (delta_stats.count > delta_stats.distinct).then(|| delta_stats.count - delta_stats.distinct)
+}
+
 /// Canonical fingerprint assembly — the ONLY place that turns raw `ColumnAggValues` from
 /// both sides into the (source, delta) fingerprint-string pairs compared in `run()`. Kept
 /// centralized so both probes' differing raw reads always compare byte-for-byte, and so the
@@ -1003,6 +1023,24 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                 let d = self.delta.key_stats(table, key).await?;
                 delta_keystats = Some(d.clone());
                 if matches!(&plan.mode, VerifyMode::TwoStream { .. }) {
+                    // FA2 follow-up: two-stream keeps exactly one row per key, so a surplus
+                    // over distinct keys means duplicated rows — the FA2 class. The verdict
+                    // below grades a Delta surplus as Drift (folded to Clean by `run()`),
+                    // which is what hid the original bug, so say it out loud here.
+                    // Diagnostic-only deliberately: a table synced BEFORE the FA2 fix
+                    // (`c6ea932`) can still carry residual duplicates, and hard-failing those
+                    // runs would regress existing deployments. Promotion to Discrepancy is
+                    // safe once live tables are confirmed clean (register FA2-r2) — there is
+                    // no cross-engine parity risk in this check.
+                    if let Some(surplus) = duplicate_key_surplus(&d) {
+                        println!(
+                            "verify {table} DUPLICATE KEYS in {delta_label}: count={} > distinct={} \
+                             ({surplus} surplus row(s); two_stream holds one row per key — FA2-class \
+                             duplication, remediate with a TABLE_RECONCILE one-shot) \
+                             (diagnostic — does not affect verdict)",
+                            d.count, d.distinct
+                        );
+                    }
                     Self::two_stream_key_stats_outcome("source", delta_label, &s, &d)
                 } else {
                     Self::key_stats_outcome("source", delta_label, &s, &d)
@@ -3527,6 +3565,32 @@ mod tests {
         let result = cmd.run().await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), VerifyVerdict::Discrepancy);
+    }
+
+    #[test]
+    fn duplicate_key_surplus_detects_two_stream_duplication() {
+        // FA2 follow-up. Helper for building a KeyStats with a given count/distinct; the
+        // other fields are irrelevant to this invariant.
+        let ks = |count: i64, distinct: i64| KeyStats {
+            count,
+            distinct,
+            min: Some(1),
+            max: Some(i128::from(distinct.max(1))),
+            xor: 0,
+            distinct_xor: 0,
+            sum: 0,
+        };
+
+        // Healthy two-stream current-state mirror: exactly one row per key.
+        assert_eq!(duplicate_key_surplus(&ks(100, 100)), None);
+        // Empty table.
+        assert_eq!(duplicate_key_surplus(&ks(0, 0)), None);
+        // FA2-class duplication: 3 rows beyond the distinct key count.
+        assert_eq!(duplicate_key_surplus(&ks(103, 100)), Some(3));
+        // A single duplicated row must still be reported (no threshold/rounding).
+        assert_eq!(duplicate_key_surplus(&ks(101, 100)), Some(1));
+        // distinct > count is not representable in practice; must not underflow/panic.
+        assert_eq!(duplicate_key_surplus(&ks(100, 101)), None);
     }
 
     #[test]
