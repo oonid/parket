@@ -3760,3 +3760,251 @@ async fn verify_source_key_stats_handles_bigint_unsigned_above_i63() {
     assert_eq!(stats.count, 2);
     assert_eq!(stats.distinct, 2);
 }
+
+/// PS-M1-r: end-to-end proof of the PS-M1 fix (`00afcd5`) — `incremental_scoped_key_stats_outcome`
+/// grades a `delta_latest` surplus as **Drift** (not Discrepancy) when its key range stays
+/// CONTAINED within `source_scoped`'s own `[min, max]` envelope. The fix was unit-tested at the
+/// pure-function level only; no Docker test reproduced the real shape, because every existing
+/// test that grows the source post-sync uses brand-new ids (symmetrically excluded from both
+/// `source_scoped` and `delta_latest` — never exercising the asymmetric superset path at all).
+///
+/// Real shape reproduced here: sync a table, then `UPDATE` an ALREADY-SYNCED, NON-extremal row's
+/// `updated_at` to a value strictly after the stored HWM, WITHOUT re-running the pipeline. That
+/// row drops out of `source_scoped` (its `updated_at` no longer satisfies the HWM scope predicate)
+/// while its already-synced version legitimately remains in `delta_latest` — a benign superset
+/// whose key sits inside `source_scoped`'s surviving range (id 1 and id 5 are untouched, so
+/// source_scoped's own min/max stay at 1/5). `run()` rolls Drift up to Clean, so this drives the
+/// now-public `run_one_table` directly (T6's test-enabler) to observe the per-table
+/// `TableOutcome::Drift` the aggregate verdict would hide.
+///
+/// Bonus (same container, no extra spin-up): advancing an EXTREMAL row (the max id) instead
+/// shrinks `source_scoped`'s own max below `delta_latest`'s surviving max — the surplus key now
+/// sits OUTSIDE the shrunk envelope, so the fix must still report Discrepancy, proving PS-M1
+/// didn't just blanket-downgrade every delta-superset case.
+#[tokio::test]
+#[serial_test::serial]
+async fn verify_incremental_scoped_drift_on_already_synced_row_advancing_past_hwm() {
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let env = TestEnv::new(vec!["sync_drift"]).await;
+
+    sqlx::query(
+        "CREATE TABLE sync_drift (\
+            id BIGINT AUTO_INCREMENT PRIMARY KEY, \
+            val INT NOT NULL, \
+            updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)\
+        )",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create sync_drift table");
+
+    sqlx::query("CREATE INDEX idx_sync_drift_updated_at ON sync_drift (updated_at)")
+        .execute(&env.pool)
+        .await
+        .expect("failed to create sync_drift updated_at index");
+
+    // ids 1..5, strictly increasing updated_at so the HWM after run 1 is deterministic
+    // (last_id=5, updated_at=row 5's timestamp).
+    sqlx::query(
+        "INSERT INTO sync_drift (val, updated_at) VALUES \
+            (10, '2026-01-01 10:00:00.000000'), \
+            (20, '2026-01-01 11:00:00.000000'), \
+            (30, '2026-01-01 12:00:00.000000'), \
+            (40, '2026-01-01 13:00:00.000000'), \
+            (50, '2026-01-01 14:00:00.000000')",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to insert sync_drift seed rows");
+
+    let mut orchestrator = env.make_orchestrator();
+    let exit_code = orchestrator.run().await;
+    assert!(
+        matches!(exit_code, ExitCode::Success),
+        "expected Success exit code, got {exit_code:?}"
+    );
+
+    let writer = DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    );
+    let hwm = writer
+        .read_hwm("sync_drift")
+        .await
+        .expect("read_hwm failed for sync_drift")
+        .expect("incremental sync_drift should have HWM after run 1");
+    assert_eq!(hwm.last_id, 5, "HWM last_id should be the max synced id");
+
+    // WITHOUT re-running the pipeline: bump an ALREADY-SYNCED, NON-extremal row (id=3, strictly
+    // between min=1 and max=5) to an updated_at strictly AFTER the HWM. It now drops out of
+    // source_scoped (updated_at no longer <= HWM) but stays in delta_latest (already synced) —
+    // the exact PS-M1 shape. Ids 1 and 5 are untouched, so source_scoped's own [min,max] stays
+    // [1,5], containing delta_latest's [1,5] surplus range.
+    sqlx::query(
+        "UPDATE sync_drift SET updated_at = '2026-02-01 00:00:00.000000' WHERE id = 3",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to advance id=3 past the HWM");
+
+    let plan = TablePlan {
+        table: "sync_drift".to_string(),
+        mode: VerifyMode::Incremental {
+            cursor_col: "updated_at".to_string(),
+            hwm: Some(hwm.clone()),
+        },
+    };
+
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let cmd = VerifyCommand::new(source, delta, vec!["sync_drift".to_string()]).with_deep(true);
+    let outcome = cmd
+        .run_one_table("sync_drift", &plan)
+        .await
+        .expect("run_one_table should succeed for sync_drift");
+
+    match &outcome {
+        TableOutcome::Drift { reason } => {
+            assert!(
+                reason.contains("advanced past the HWM scope after sync"),
+                "Drift reason should describe the advanced-past-sync shape, got: {reason}"
+            );
+        }
+        other => panic!(
+            "an already-synced row whose updated_at moved past the HWM (key range contained \
+             within source_scoped's own [min,max]) must grade as Drift, not {other:?} — this is \
+             the exact PS-M1 false-DISCREPANCY shape the fix (00afcd5) targets"
+        ),
+    }
+
+    // Bonus (same container): advance the EXTREMAL row (id=5, the current max) past the HWM
+    // too. source_scoped's own max now shrinks to 4 (ids 3 and 5 both excluded), while
+    // delta_latest's surviving max stays 5 — OUTSIDE the shrunk source_scoped envelope. The fix
+    // must still report Discrepancy here, proving it didn't blanket-downgrade every superset.
+    sqlx::query(
+        "UPDATE sync_drift SET updated_at = '2026-02-01 00:00:00.000000' WHERE id = 5",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to advance id=5 past the HWM");
+
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let cmd_outside = VerifyCommand::new(source, delta, vec!["sync_drift".to_string()]).with_deep(true);
+    let outcome_outside = cmd_outside
+        .run_one_table("sync_drift", &plan)
+        .await
+        .expect("run_one_table should succeed for sync_drift (outside-range case)");
+
+    assert!(
+        matches!(outcome_outside, TableOutcome::Discrepancy { .. }),
+        "a delta_latest surplus key OUTSIDE source_scoped's own (now-shrunk) range must still be \
+         Discrepancy, not {outcome_outside:?} — proves PS-M1 grades by containment, not a blanket \
+         downgrade of every superset"
+    );
+}
+
+/// T6-r (C1): force MULTIPLE keyset pages over an integer-PK full-refresh table and assert
+/// EXACTLY N rows / N distinct ids in Delta — no skip, no duplicate at a page boundary. The
+/// existing `full_refresh_extraction_creates_delta_table_with_all_rows` uses 2 rows with a large
+/// default batch size, so only page 1 ever runs; the keyset pagination boundary itself (the
+/// `WHERE id > last_key ... LIMIT batch_size` advance in `build_full_refresh_query_keyset`) was
+/// never Docker-proven across a real page split.
+///
+/// Reuses N8's page-forcing mechanism (`eadb045`): a large, identical filler column inflates
+/// `information_schema.AVG_ROW_LENGTH` (refreshed via `ANALYZE TABLE`), then a small
+/// `target_memory_mb` makes `calculate_batch_size` compute a `batch_size` well under the seeded
+/// row count — forcing several keyset pages instead of the one a normal `target_memory_mb` would
+/// give (a real table's populated AVG_ROW_LENGTH otherwise yields a page far larger than any
+/// reasonably-sized test table). Unlike N8 (which is PK-less and exercises the OFFSET fallback),
+/// this table has an integer PRIMARY KEY, so it exercises the OTHER pagination path entirely:
+/// keyset (`WHERE id > last_key`), not OFFSET/LIMIT.
+#[tokio::test]
+#[serial_test::serial]
+async fn full_refresh_keyset_pagination_crosses_page_boundary_exactly_once() {
+    let _guard = tracing_subscriber::fmt()
+        .with_env_filter("parket=debug")
+        .with_test_writer()
+        .try_init();
+
+    let mut env = TestEnv::new(vec!["paged_widgets"]).await;
+
+    // Integer AUTO_INCREMENT PRIMARY KEY -> select_integer_pk finds it -> keyset pagination.
+    sqlx::query(
+        "CREATE TABLE paged_widgets (\
+            id BIGINT AUTO_INCREMENT PRIMARY KEY, \
+            filler VARCHAR(8000) NOT NULL\
+        ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("failed to create paged_widgets table");
+
+    let filler = "x".repeat(8000);
+    let total_rows = 300usize;
+    let mut values = Vec::with_capacity(total_rows);
+    for _ in 1..=total_rows {
+        values.push(format!("('{filler}')"));
+    }
+    let insert_sql = format!(
+        "INSERT INTO paged_widgets (filler) VALUES {}",
+        values.join(", ")
+    );
+    sqlx::query(&insert_sql)
+        .execute(&env.pool)
+        .await
+        .expect("failed to seed paged_widgets rows");
+
+    // Without this, AVG_ROW_LENGTH reflects a stale pre-insert estimate.
+    sqlx::query("ANALYZE TABLE paged_widgets")
+        .execute(&env.pool)
+        .await
+        .expect("failed to analyze paged_widgets");
+
+    // Shrink target_memory_mb so calculate_batch_size (driven by the now-large AVG_ROW_LENGTH)
+    // yields a batch_size well under total_rows, forcing several keyset pages instead of one.
+    env.config.target_memory_mb = 1;
+
+    let mut orchestrator = env.make_orchestrator();
+    let exit_code = orchestrator.run().await;
+
+    assert!(
+        matches!(exit_code, ExitCode::Success),
+        "expected Success exit code, got {exit_code:?}"
+    );
+
+    let row_count = count_delta_rows(&env, "paged_widgets").await;
+    assert_eq!(
+        row_count, total_rows,
+        "expected exactly {total_rows} rows (no skip/dup across keyset page boundaries), got {row_count}"
+    );
+
+    let distinct_ids = count_distinct(&env, "paged_widgets", "id").await;
+    assert_eq!(
+        distinct_ids, total_rows as i64,
+        "every seeded row has a distinct auto-increment id; a skip or duplicate across keyset \
+         page boundaries would surface as fewer than {total_rows} distinct ids, got {distinct_ids}"
+    );
+}
