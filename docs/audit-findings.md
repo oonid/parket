@@ -395,19 +395,33 @@ developer_id, status(char), last_viewed, first_opened_at, completed_at, develope
     staleness bound: between reconciles, engagement state is stale for ~6.7% of the 22.9M NULL-`completed_at`
     rows plus the 12.3% of completed rows carrying post-completion edits (§8.1). Tighten the interval if the
     consumer's tolerance is shorter than that window — each reconcile is only ~20–25 min / ~3.7 GB.
+    **Cadence refinement (2026-08-05):** the `last_viewed` drift is a FROZEN historical backlog (stopped
+    advancing ~2025-02-03; re-measured above — 0 post-completion views among recent rows), so it does **not
+    accumulate** and the one-time reconcile already executed 2026-07-18 healed it. A fixed *monthly* calendar
+    reconcile is therefore likely over-provisioned; prefer **verify-driven**: use §8.5's cheap monthly
+    frontier-parity check as the TRIGGER and reconcile only when it shows drift. Residual open question
+    (unmeasured — `status` changes carry no timestamp, so source-only cannot give a rate): do `status` /
+    `developer_journey_status_hash` still mutate post-completion? If they do, drift still accumulates through
+    that channel and a periodic reconcile stays justified; a post-reconcile `--verify --verify-deep` on
+    trackings is the instrument that would show it.
   - **(1) ESCALATED** — now the priority ask of the source team, not a nice-to-have: an `updated_at`
     (+index) is the only option that keeps engagement state *continuously* correct rather than
     correct-at-each-reconcile. Once it exists, the cursor swap is config-only and (2) can drop to a rare
     safety net.
   - **(3) rejected** — settled, reasons above.
-  - **Worth investigating, NOT adopted (unverified):** swapping the update cursor to `last_viewed`
-    (`TABLE_UPDATE_CURSOR_...=last_viewed`) would be config-only and available today, and `last_viewed`
-    demonstrably advances on the engagement edits the current cursor misses (§8.1 derives both drift
-    figures from it). Two unknowns must be settled FIRST, because getting them wrong trades a working
-    guarantee for a broken one: (a) is `last_viewed` NOT NULL? — a nullable cursor is silently lossy
-    (D2/O3) and would be auto-demoted anyway (O3); (b) does every completion also touch `last_viewed`? If
-    not, switching would sacrifice the one property that is currently exact (completion facts) to gain
-    engagement freshness. Check with `--inspect` + a `completed_at > last_viewed` count before considering.
+  - **Cursor swap to `last_viewed`: INVESTIGATED AND REJECTED (2026-08-05, live-DB measured).** Two
+    independent disqualifiers, either alone fatal: **(i) completion does not touch it** — over the newest
+    ~2M id range (667,026 rows, 642,231 completed): `last_viewed < completed_at` for **636,857 (99.2%)`,
+    `= ` for 5,374 (0.8%), `> ` for **0**, and `last_viewed IS NULL` for **0**. Since Stream B selects
+    `WHERE cursor > hwm`, a completion would not move `last_viewed` at all, so completions would **stop
+    re-syncing** — sacrificing the one property that is currently exact. **(ii) it is a dead cursor** —
+    independently corroborates the earlier `fable` finding that `last_viewed` **stopped advancing
+    ~2025-02-03**: it is still WRITTEN at row creation (0 NULLs) but never UPDATED afterwards, so as an
+    update cursor it would catch ≈0 rows/day AND cannot heal the historical backlog. Nullability is NOT
+    the differentiator here (`--inspect` confirms `last_viewed`, `first_opened_at` and `completed_at` are
+    all nullable+unindexed → all three branded UNSAFE), which is why (i)/(ii) are the decisive reasons.
+    **No cursor change can fix PS-H-A; the remedy is the reconcile.** Closed — do not revisit without new
+    source-side behavior.
 - **PS-H-B** — **done** (`bd13be5`). Was: stamp the snapshot max-cursor HWM on full-refresh's final commit
   (`orchestrator/full_refresh.rs` called `commit_overwrite(table_name, None)`) — fix (b) of H-2026-07-11-1,
   left optional and unimplemented; without it every full_refresh→two-stream round-trip (incl. the PS-H-A
