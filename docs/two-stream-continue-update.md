@@ -9,6 +9,13 @@
 > **Status: RESOLVED (2026-06-12).** The continue-update upsert defaults to **DELETE+APPEND**
 > (bounded memory, fits a 4 GB VM). The delta-rs **MERGE** is retained only as an opt-out
 > (`UPDATE_STRATEGY=merge`) and **cannot** be memory-bounded — see §2.
+>
+> **AMENDED 2026-08-06 — the memory conclusion stands; the COST conclusion does not.** DELETE+APPEND
+> performs **one full-table rewrite per 1024 update keys**, not one target scan per run as §3
+> originally claimed. On a 115 M-row table over remote object storage an 858 k-key window projects to
+> **≈ 56 h / ≈ 2 TB egress** (839 chunks); on local disk the same window is ≈ 74 min. See the
+> correction in §3 and audit-findings §10.1. Nothing here about MERGE's memory behaviour changes —
+> that analysis was verified and is why DELETE+APPEND is still the default on small hosts.
 
 Generic `orders` table throughout: integer PK `id`, nullable `completed_at` (update cursor),
 ordinary columns. Numbers are from the real 112M-row table the design was validated on.
@@ -102,7 +109,9 @@ ids>)`** (delta-rs `DeleteBuilder`) followed by an **append** of the new version
 (`delete.rs`: no `JoinType`, no `SortExec`), so **memory is bounded and ~constant regardless of
 target size**. The result is the same current-state mirror (one row per id) the MERGE produced.
 
-**Validation, same 112M-row table, `sudo systemd-run -p MemoryMax=3500M` (4 GB cap):**
+**Validation, same 112M-row table, `sudo systemd-run -p MemoryMax=3500M` (4 GB cap).**
+**Storage backend not recorded** — the 74 s figure implies ~453 MB/s of parquet rewrite, so almost
+certainly local disk, NOT remote object storage. This matters: see the correction below the table.
 
 | | MERGE (best config) | **DELETE+APPEND** |
 |---|---|---|
@@ -113,10 +122,29 @@ target size**. The result is the same current-state mirror (one row per id) the 
 Bounded, table-size-independent, fits a 4 GB VM, full current-state semantics, no
 windowing/pruning. **This is the default.**
 
+> ### ⚠ CORRECTION (2026-08-06): the cost below is understated by ~3 orders of magnitude
+>
+> The validation above was run at **13,660 rows = 14 delete chunks**, and its ~74 s implies
+> ~453 MB/s of parquet rewrite — i.e. **local disk**. The backend was never recorded here, so the
+> figure reads as general when it is not.
+>
+> The trade-off list originally said "**per-run** target scan", singular. That is wrong: the delete
+> runs **once per `DELETE_KEYS_PER_CHUNK` (1024) keys**, and each one rewrites *every file holding a
+> matching row* — which, for the scattered ids of a real update window, is the whole table. The true
+> cost is **`ceil(distinct_update_keys / 1024)` full-table rewrites**, not one.
+>
+> Measured on a 115 M-row table (audit register §10.1): an 858,473-key window = **839 chunks**, each
+> copying ~114.39 M rows at 4.05 min ± 3 s against remote S3 → **≈ 56 h and ≈ 2 TB of egress**.
+> The same window on local disk would be ≈ 74 min (839 × 5.3 s) — the amplification is identical;
+> only the per-rewrite cost differs. §4's deferred design names its own trigger as "only if the
+> per-run target scan becomes the bottleneck": **that trigger has fired.**
+
 Trade-offs (accepted):
 - **2 commits** (DELETE then APPEND) → a brief window where the changed ids are absent; fine for a
   batch ETL with no concurrent mid-run readers.
-- **Per-run target scan** (time, not memory) — the delete scans the target streaming each run.
+- ~~**Per-run target scan**~~ → **one target rewrite per 1024 update keys** (time, not memory). See
+  the correction above: this is `ceil(keys/1024)` full-table rewrites per run, and it is the
+  dominant cost on remote storage.
 - HWM advances **only after the APPEND commits** (failure-safe: a failed append self-heals next run
   via the unchanged watermark).
 - Hard-deletes / un-completions still not captured (a general two-stream limitation).

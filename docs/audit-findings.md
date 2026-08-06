@@ -659,10 +659,36 @@ num_removed_files : 23
 execution_time_ms : 248,144          <- 4.1 min
 ```
 
-Extrapolated over that run's window of 840,349 update keys → **821 chunks**, each rewriting
-~2.4 GB: **≈ 56 hours and ≈ 2 TB of S3 egress** (~USD 170 at $0.09/GB) to apply 840 k row
-updates. The 4.1 min/chunk matches re-reading 2.4 GB at the measured 12.5 MB/s link speed, so the
-operation is network-bound on re-reading the full table once per chunk.
+Three chunks sampled independently (commits 70/75/80) cost **247.2 s / 241.8 s / 248.1 s** — i.e.
+**4.05 min ± 3 s**, each copying ~114.39 M rows to delete 1024. Cross-checked against the run
+itself: 110 min of wall clock produced ~29 commits ≈ 3.8 min each.
+
+### Separate the amplification from the link speed
+
+The headline number decomposes into two independent factors, and only the first is a parket defect:
+
+| factor | value | environment-dependent? |
+|---|---|---|
+| **Amplification** | `ceil(keys/1024)` full-table rewrites = **839 chunks** for this window | **no** — intrinsic |
+| Cost per rewrite | ~2.4 GB moved; 4.05 min at the measured 12.5 MB/s WAN link | **yes** |
+
+So for the 858,473-key window on this setup: **839 × 4.05 min ≈ 56.6 h and ≈ 2 TB of S3 egress**
+(~USD 170 at $0.09/GB).
+
+**But do not read "56 hours" as parket's intrinsic cost.** §3's own validation did 13,660 rows in
+~74 s on the same 112 M-row table — that is 14 chunks at **5.3 s each**, implying ~453 MB/s, i.e.
+local disk rather than remote object storage (§3 does not state its storage backend — see the
+correction filed against that section). Identical amplification, 47× cheaper per rewrite. **The
+same 858 k window in-region or on local disk would be ≈ 74 minutes** — bad, but survivable, and it
+would likely never have been noticed.
+
+Honest framing for comparison, same table and same window:
+
+| | rewrites | measured / projected |
+|---|---|---|
+| `delete_then_append`, remote S3 over 12.5 MB/s | 839 | ≈ 56.6 h *(projected from 3 samples)* |
+| `delete_then_append`, local/in-region (extrapolating §3's 5.3 s/chunk) | 839 | ≈ 74 min |
+| `UPDATE_STRATEGY=merge` | **1** | **17.8 min measured**, one MERGE commit |
 
 **Why the existing tests do not catch it.** The chunking itself is correct and deliberate — the
 comment states its purpose (a single IN-list over every key OR-normalizes into a predicate tree
@@ -672,29 +698,51 @@ Neither the chunking nor its test is wrong. What is missing is any notion of **c
 scale one full-table rewrite is microseconds, so the amplification is invisible until the table
 is large and remote.
 
-**Aggravating factor: the pathological path is the DEFAULT.** `UPDATE_STRATEGY` unset selects
-`delete_then_append`. The alternative, `UPDATE_STRATEGY=merge`, routes to `merge_batch`, which is
-a **single** `.merge(source, predicate)` — one pass, one commit, no per-chunk rewrite
-(`src/writer/two_stream.rs:47`+). An operator hitting this has no signal pointing at the knob
-that fixes it; the run simply appears slow, then fails on whatever network hiccup arrives first.
+**The operator gets no signal.** `UPDATE_STRATEGY` unset selects `delete_then_append`, and nothing
+logs the projected rewrite count. The run simply appears slow and then dies on whatever
+network hiccup arrives first — which is exactly how the three attempts above were misdiagnosed as
+network failures rather than as a cost problem.
 
-**FIX**, in preference order:
+**FIX — corrected 2026-08-06.** An earlier revision of this finding proposed *"make `merge` the
+default"* as fix #1. **That was wrong**, and is retracted: §2 of
+`docs/two-stream-continue-update.md` establishes with empirical sizing runs that the delta-rs MERGE
+is `source FULL OUTER JOIN target`, **cannot** be memory-bounded (the dominant memory — Parquet
+scan buffering plus delta-rs's own merge output buffering — is untracked by the `FairSpillPool`, so
+it never spills), and has a **~6.9 GB working-set floor for 112 M rows that grows with the table**.
+A 4 GB VM is infeasible for it. `delete_then_append` is the default *precisely because* it is
+bounded and table-size-independent (2060 MB peak under a 4 GB cap). That trade was made
+deliberately and on better evidence than the original filing had. The 17.8 min MERGE measured above
+ran on a **46.5 GB workstation** with a 23.8 GB pool and its peak RSS was never sampled, so it says
+nothing about the 8 GB target.
 
-1. **Make `merge` the default** for the two-stream update stream, keeping `delete_then_append`
-   selectable (it is still the correct fallback for additive schema evolution — see D1-r, where
-   `merge_batch` deliberately defers to it because the MERGE clauses would drop a new column).
-2. **Auto-escalate**: when `ids.len() / DELETE_KEYS_PER_CHUNK` exceeds a small threshold (even 2),
-   switch that window to `merge_batch`, or `warn!` with the projected rewrite count. A one-line
-   warning would have saved the three runs above.
-3. **Single-DELETE rewrite**: replace the OR-normalized IN-list with a predicate that DataFusion
-   can evaluate as a set/semi-join against the deduped source (a subquery or anti-join), so one
-   `delete()` covers the whole window and the stack-depth motivation for chunking disappears.
-4. Failing all of the above, document the amplification next to `UPDATE_STRATEGY` in the README
-   and in the runbook, with the `ceil(keys/1024) × table_size` formula.
+The real constraint is therefore **both** bounded memory **and** one pass. Only one option
+satisfies both:
 
-**Operator workaround today:** set `UPDATE_STRATEGY=merge` for two-stream tables of any size.
-`TABLE_RECONCILE_<table>=true` also avoids it (the full-refresh atomic-overwrite path is a single
-pass) but pays a full re-extract of the source table, so it is the heavier remedy.
+1. **Single-DELETE via set/anti-join predicate** *(the right fix)*. Replace the OR-normalized
+   IN-list with a predicate DataFusion can evaluate as a semi/anti-join against the deduped source
+   (subquery or join), so one `delete()` covers the entire window. `delete.rs` is a streaming
+   scan→filter→rewrite with no `JoinType` and no `SortExec`, so this keeps the bounded-memory
+   property that motivated the default, while collapsing 839 rewrites to 1. It also removes the
+   stack-depth motivation for chunking entirely.
+2. **Warn loudly** with the projected rewrite count and estimated bytes before starting the loop
+   (`ids.len()`, `ceil(ids.len()/1024)`, × current table size). Cheap, non-breaking, and would have
+   saved all three runs above. Worth doing regardless of #1.
+3. **Auto-escalate on a threshold** — above N chunks, route the window to the full-refresh
+   atomic-overwrite path (`TABLE_RECONCILE` machinery), which is single-pass *and* bounded. Not to
+   `merge_batch`, for the memory reason above.
+4. **Revive §4's deferred APPEND + read-time-dedup design.** Its stated trigger is "only if the
+   per-run target scan becomes the bottleneck" — that trigger has now fired, harder than the
+   wording anticipated (see the correction filed against §3's cost claim).
+
+**Operator workaround today**, in order of preference by host:
+
+* **Memory-constrained host (≤ 8 GB):** `TABLE_RECONCILE_<table>=true` for one run. Single pass,
+  bounded memory; costs a full re-extract of the source table.
+* **Roomy host (≫ table working set):** `UPDATE_STRATEGY=merge`. Measured 17.8 min vs a projected
+  56.6 h here — but verify peak RSS against §2.3's sizing table before relying on it, and note the
+  floor grows with the table.
+* `delete_then_append` remains correct and bounded — just do not point it at remote object storage
+  with a large update window.
 
 ### 10.2 Open — Low: `SIGINT` is not honoured mid-table
 
