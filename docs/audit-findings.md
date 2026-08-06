@@ -759,14 +759,39 @@ closed:
 `delete_then_append` remains correct and bounded — just do not point it at remote object storage
 with a large update window.
 
-### 10.2 Open — Low: `SIGINT` is not honoured mid-table
+### 10.2 Open — Low: `SIGINT` cannot land inside the writer's chunk loop
 
 Interrupting the run above with `SIGINT` had no effect: two further DELETE chunks committed after
-the signal, and `SIGTERM` was required. The `interrupted` flag in the `run complete` summary
-suggests interruption is checked **between tables**, not between batches/chunks. For a table whose
-single update stream runs for hours this makes the process effectively unkillable by the polite
-signal. Checking the flag at each chunk/batch boundary would make `SIGINT` land within one chunk,
-and each chunk is already an independent commit so stopping there is safe.
+the signal, and `SIGTERM` was required.
+
+**Corrected 2026-08-06.** An earlier revision of this item guessed that interruption is "checked
+between tables, not between batches/chunks". That is wrong and would send a reader to the wrong
+file — the shutdown plumbing is finer-grained than that, and the gap is one level lower:
+
+```
+orchestrator/two_stream.rs:133   if self.check_shutdown() { break; }   <- top of insert-stream loop
+orchestrator/two_stream.rs:212   if self.check_shutdown() { break; }   <- top of update-stream loop
+writer/two_stream.rs             (no shutdown check anywhere in the file)
+```
+
+The orchestrator checks between **extract windows**, which is a real and reasonable boundary. But
+`delete_then_append`'s `for chunk in ids.chunks(DELETE_KEYS_PER_CHUNK)` loop (§10.1) sits *below*
+that boundary, inside the writer, which has no shutdown awareness at all. One extract window
+therefore becomes one `delete_then_append` call containing `ceil(keys/1024)` independent Delta
+commits — **839** in the observed run — with no opportunity to honour the signal until they all
+finish. The next check would have arrived roughly 56 hours later.
+
+So the polite signal fails precisely when it matters most: during a run long enough that an operator
+wants to stop it. The escalation is `SIGTERM`/`SIGKILL`, which only happens to be safe because of
+Delta's commit atomicity (§10.3) rather than by design.
+
+**FIX:** check the shutdown flag once per chunk inside the writer loop — each chunk is already a
+complete, independent commit, so it is a safe stopping point and no partial state can leak.
+
+**Note the composition with §10.1:** fixing §10.1 properly (the single-DELETE anti-join predicate,
+fix #1 there) **dissolves this finding**, because there would no longer be a long-running loop
+inside the writer for the signal to be trapped behind. If §10.1 is fixed, re-check whether §10.2
+still reproduces before spending effort on it.
 
 ### 10.3 Note — killing mid-write is safe, and confirmed so
 
