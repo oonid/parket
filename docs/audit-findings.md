@@ -824,3 +824,61 @@ This is the concrete cost case for the **PS-M3 vacuum work** (already open, prev
 Note the interaction with §10.1: the amplification does not only cost time and egress, it also
 multiplies stored bytes by the chunk count until a VACUUM runs. A retention-window VACUUM is the fix;
 until then storage grows monotonically with every two-stream update run.
+
+### 10.6 Post-incident verification — NO DATA LOSS (evidence, 2026-08-06)
+
+The incident above involved three aborted writes to a 115 M-row two-stream table (host suspend,
+S3 connect timeout, deliberate `SIGTERM`) followed by a successful `UPDATE_STRATEGY=merge` run.
+This subsection records the evidence that none of it lost or duplicated data, because §10.3's
+"aborting is safe" claim otherwise rests on assertion.
+
+**1. `parket --verify` — clean, but weaker than it looks.**
+
+```
+verify summary: pass=3  drift=0  discrepancy=0  skipped=5
+```
+
+Schema matched on all 8 tables (`missing_in_delta=[] extra_in_delta=[]`). The three tables under the
+row cap passed strictly (`partner_programs` 579=579 + 5 value-aggregates; `developer_journey_tutorials`
+11,548=11,548 + 12 aggregates + 100/100 sample; `developer_journeys`). **But 5 of 8 tables SKIPPED
+strict checks** — every large one — on `> cap 1000000`. `drift=0` here means *no drift was detected*,
+not *none exists*: the checks that would detect it did not run. Worth internalising for this dataset,
+where most tables exceed the cap by design.
+
+**2. §8.5 frontier parity on `developer_journey_trackings` — EXACT.** The cheap check that answers
+what the skipped verdict could not:
+
+| | |
+|---|---|
+| insert HWM (`hwm_insert_id`) | 502,658,778 |
+| source `COUNT(*) WHERE id <= hwm` | **115,249,572** |
+| Delta total rows | **115,249,572** ← exact match |
+| source `COUNT(*)` total | 115,252,316 |
+| source rows above the frontier | 2,744 |
+
+Delta holds precisely the number of rows the source holds at or below the insert watermark ⇒ **zero
+rows lost** across all three aborted writes plus the MERGE. Paired with the Delta-side census
+(`count == distinct == 115,249,572`) the table is both **complete up to its watermark** and **free of
+duplicate keys**.
+
+The shortfall `--verify` reported (`source=115,252,019 delta=115,249,572`, −2,447) is therefore
+entirely rows that arrived after the sync cursor — `completed_at` source max was `15:29:59` against a
+Delta cursor of `14:31:31`, i.e. ~58 min of new completions. The "rows above the frontier" figure grew
+from 2,447 to 2,744 across the ~30 min between the two measurements, which is itself corroboration
+that the gap is freshness and not loss.
+
+**Reproduce** (read-only, one indexed range count; minutes, not hours — vastly cheaper than
+`--verify-deep`'s 4–5 full source scans):
+
+```sql
+SELECT COUNT(*) FROM developer_journey_trackings WHERE id <= <hwm_insert_id>;
+-- compare against the Delta count from:
+--   cargo run -q -p parket --example delta_key_census -- developer_journey_trackings
+```
+
+**3. Still unproven.** `users` (source 1,454,706 vs delta 1,454,672, −34) and
+`developer_journey_completions` (1,029,191 vs 1,029,173, −18) are `full_refresh` and skipped the cap.
+Frontier parity does **not** apply to them — full_refresh keeps no watermark, so there is no frontier
+to compare against, and the cheap substitute simply does not exist. Both gaps are consistent with
+source activity after their snapshot and their schemas match, but neither is *proven*; that needs
+`--verify-deep` scoped to those two tables (off-peak, per §8.5).
