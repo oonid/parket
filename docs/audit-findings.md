@@ -1,6 +1,6 @@
 # Audit findings register (living document)
 
-**Status date:** 2026-08-05. This is the single source of truth for audit findings and remediation
+**Status date:** 2026-08-06. This is the single source of truth for audit findings and remediation
 process — it consolidates `docs/audit-2026-07-04.md` and `docs/handoff-2026-07-06.md` (both retired;
 content carried forward here) and the second-pass results in `docs/audit-2026-07-06.md` (kept for its
 detailed analysis; finding IDs below reference it). Target runtime: an **8 GB RAM** VM.
@@ -12,7 +12,15 @@ full-refresh (O2-r), and the entire verify V-series (V8, VA1-r, V3-r Tier 1+2, V
 **fresh `fable` audit (§7)**: every **Critical, High, and Medium** resolved — FA1/FA3 (full-refresh
 safe-cast + source-schema adoption via a Metadata action), FA2 (two-stream update-window cap), FA4
 (bounded default `delete_then_append` session), FA5 (quoted two-stream identifiers) — plus the
-worthwhile Lows FA6/FA7/FA8/FA9/FA10/FA12 and §5's L5/L6 (L2 found already-fixed). What remains open is
+worthwhile Lows FA6/FA7/FA8/FA9/FA10/FA12 and §5's L5/L6 (L2 found already-fixed).
+
+> **NO LONGER TRUE as of §10 (2026-08-06):** the claim below that only Low-tier residuals remain was
+> accurate through `v0.2.3`, but a production two-stream sync has since surfaced a **High** —
+> **§10.1, `delete_then_append` write amplification**: one full-table rewrite per 1024 update keys,
+> measured at ~56 h and ~2 TB of egress to apply an 840 k-row update window to a 115 M-row table.
+> It is a cost defect, not a correctness one, and `UPDATE_STRATEGY=merge` avoids it today.
+
+Apart from §10, what remains open is
 exclusively **Low-tier / deferred residuals**, each documented below with rationale: FA11, FA4-r, V8-r,
 T6-r, M2-r2, D1-r2/-r3, P1-r-a2/-b, S2-r, N1-u, N1-r2, L1, L4, L7, O13, V6-r. Verify's verdict-gating vs
 diagnostic layers are documented in `docs/verify-checks.md`; `crates/mysql-metadata-probe` carries a
@@ -609,3 +617,100 @@ resolved-markers (this commit).
   left to avoid false-positive verdict risk.
 - **PS-M1-r, T6-r** — Docker integration-test follow-ups (out of the `--lib` loop; do in a Docker pass).
 - Info/perf/upstream residuals unchanged: FA4-r, D1-r3, P1-r-a2/-b, N1-u, L4.
+
+---
+
+## 10. Production incident — 2026-08-06: `delete_then_append` write amplification
+
+Found by running a real two-stream sync of `developer_journey_trackings` (115 M rows, ~2.4 GB on
+S3 `ap-southeast-1`) from a workstation. Three attempts were made; each was initially
+misdiagnosed as a network failure (one host suspend, one transient connect stall). They were not:
+at ~40 minutes each run had applied roughly **3%** of its update window. The network errors
+merely interrupted a run that could not have finished.
+
+### 10.1 Open — High: one full-table rewrite per 1024 update keys
+
+`DeltaWriter::delete_then_append` (`src/writer/two_stream.rs:429-446`) deletes the incoming keys
+in chunks and issues **a separate `table.delete()` per chunk**:
+
+```rust
+const DELETE_KEYS_PER_CHUNK: usize = 1024;
+for chunk in ids.chunks(DELETE_KEYS_PER_CHUNK) {
+    let predicate = cast(col, Int64).in_list(chunk_literals, false);
+    let (t, _metrics) = table.delete().with_predicate(predicate).await?;   // <- one COMMIT each
+    table = t;
+}
+```
+
+A Delta `DELETE` rewrites every file containing a matching row. The keys in an update window are
+arbitrary ids scattered across the whole table, so **essentially every file matches every chunk**
+— each chunk rewrites the entire table. Cost is therefore
+`ceil(distinct_update_keys / 1024) × full_table_size`, i.e. quadratic in table size × window size
+rather than linear in the window.
+
+**Measured** (commit `00000000000000000080.json`, one chunk):
+
+```
+operation         : DELETE
+num_deleted_rows  : 1024
+num_copied_rows   : 114,383,538      <- the whole table, per 1024 keys
+num_added_files   : 23
+num_removed_files : 23
+execution_time_ms : 248,144          <- 4.1 min
+```
+
+Extrapolated over that run's window of 840,349 update keys → **821 chunks**, each rewriting
+~2.4 GB: **≈ 56 hours and ≈ 2 TB of S3 egress** (~USD 170 at $0.09/GB) to apply 840 k row
+updates. The 4.1 min/chunk matches re-reading 2.4 GB at the measured 12.5 MB/s link speed, so the
+operation is network-bound on re-reading the full table once per chunk.
+
+**Why the existing tests do not catch it.** The chunking itself is correct and deliberate — the
+comment states its purpose (a single IN-list over every key OR-normalizes into a predicate tree
+deep enough to overflow the stack, hence the 512 MB stack in `main.rs`), and
+`delete_then_append_spans_multiple_delete_chunks` verifies *correctness* across chunk boundaries.
+Neither the chunking nor its test is wrong. What is missing is any notion of **cost**: at test
+scale one full-table rewrite is microseconds, so the amplification is invisible until the table
+is large and remote.
+
+**Aggravating factor: the pathological path is the DEFAULT.** `UPDATE_STRATEGY` unset selects
+`delete_then_append`. The alternative, `UPDATE_STRATEGY=merge`, routes to `merge_batch`, which is
+a **single** `.merge(source, predicate)` — one pass, one commit, no per-chunk rewrite
+(`src/writer/two_stream.rs:47`+). An operator hitting this has no signal pointing at the knob
+that fixes it; the run simply appears slow, then fails on whatever network hiccup arrives first.
+
+**FIX**, in preference order:
+
+1. **Make `merge` the default** for the two-stream update stream, keeping `delete_then_append`
+   selectable (it is still the correct fallback for additive schema evolution — see D1-r, where
+   `merge_batch` deliberately defers to it because the MERGE clauses would drop a new column).
+2. **Auto-escalate**: when `ids.len() / DELETE_KEYS_PER_CHUNK` exceeds a small threshold (even 2),
+   switch that window to `merge_batch`, or `warn!` with the projected rewrite count. A one-line
+   warning would have saved the three runs above.
+3. **Single-DELETE rewrite**: replace the OR-normalized IN-list with a predicate that DataFusion
+   can evaluate as a set/semi-join against the deduped source (a subquery or anti-join), so one
+   `delete()` covers the whole window and the stack-depth motivation for chunking disappears.
+4. Failing all of the above, document the amplification next to `UPDATE_STRATEGY` in the README
+   and in the runbook, with the `ceil(keys/1024) × table_size` formula.
+
+**Operator workaround today:** set `UPDATE_STRATEGY=merge` for two-stream tables of any size.
+`TABLE_RECONCILE_<table>=true` also avoids it (the full-refresh atomic-overwrite path is a single
+pass) but pays a full re-extract of the source table, so it is the heavier remedy.
+
+### 10.2 Open — Low: `SIGINT` is not honoured mid-table
+
+Interrupting the run above with `SIGINT` had no effect: two further DELETE chunks committed after
+the signal, and `SIGTERM` was required. The `interrupted` flag in the `run complete` summary
+suggests interruption is checked **between tables**, not between batches/chunks. For a table whose
+single update stream runs for hours this makes the process effectively unkillable by the polite
+signal. Checking the flag at each chunk/batch boundary would make `SIGINT` land within one chunk,
+and each chunk is already an independent commit so stopping there is safe.
+
+### 10.3 Note — killing mid-write is safe, and confirmed so
+
+Recorded because it was verified three times, twice by accident: aborting a two-stream update
+mid-write (host suspend, connect timeout, and `SIGTERM`) left the table **consistent** each time.
+The last successful commit remained the table version, the interrupted write's parquet files were
+never referenced by the log (orphans, not corruption), and a Delta-side key census returned
+`count == distinct` after each abort (115,226,755 / 115,213,106 respectively). Re-running is safe:
+the update stream's HWM only advances on a successful commit, and `delete_then_append` is
+idempotent. Orphaned parquet accumulates and is not reclaimed by anything short of VACUUM.
