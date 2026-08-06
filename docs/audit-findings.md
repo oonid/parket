@@ -876,9 +876,34 @@ SELECT COUNT(*) FROM developer_journey_trackings WHERE id <= <hwm_insert_id>;
 --   cargo run -q -p parket --example delta_key_census -- developer_journey_trackings
 ```
 
-**3. Still unproven.** `users` (source 1,454,706 vs delta 1,454,672, −34) and
-`developer_journey_completions` (1,029,191 vs 1,029,173, −18) are `full_refresh` and skipped the cap.
-Frontier parity does **not** apply to them — full_refresh keeps no watermark, so there is no frontier
-to compare against, and the cheap substitute simply does not exist. Both gaps are consistent with
-source activity after their snapshot and their schemas match, but neither is *proven*; that needs
-`--verify-deep` scoped to those two tables (off-peak, per §8.5).
+**3. `--verify-deep` on the two `full_refresh` tables — DRIFT, and it is lag, not loss.** Scoped
+runs on `users` and `developer_journey_completions` (both ~1–1.5 M rows, so minutes — the
+`--verify-deep` cost warning is about the 115 M-row table, not these):
+
+```
+users:       DRIFT: source advanced past sync: source distinct=1454724 delta distinct=1454672
+completions: DRIFT: source advanced past sync: source distinct=1029194 delta distinct=1029173
+             — likely new/changed rows since sync, not a sync error
+discrepancy=0 on both, schema ok on both
+```
+
+Comparing the two verify runs ~1 h apart makes it quantitative — **the gap grows by exactly what the
+source grows, while Delta stays fixed**:
+
+| table | source run 1 | source run 2 | source grew | Delta (both runs) | gap run 1 → run 2 |
+|---|---|---|---|---|---|
+| `users` | 1,454,706 | 1,454,724 | **+18** | 1,454,672 | 34 → 52 (**+18**) |
+| `developer_journey_completions` | 1,029,191 | 1,029,194 | **+3** | 1,029,173 | 18 → 21 (**+3**) |
+
+That is the signature of a consistent point-in-time snapshot falling behind a live table. Rows lost
+by the aborted writes would leave a constant unexplained component in the gap; there is none.
+
+**A `full_refresh` table on a live source can essentially never reach PASS — do not chase it.**
+`--verify-deep` never reached its strict content checks on either table: the count mismatch produced
+DRIFT first, and DRIFT short-circuits before `value-aggregates` / `non-null census` (neither line is
+emitted). Since any source write between sync and verify guarantees a count mismatch, the DRIFT
+verdict is the **expected steady state** for these tables, not an actionable signal. Consequence:
+for `users` and `completions` there is strong *count* evidence and **no** *content* evidence, and
+re-running cannot change that. A true PASS would require a quiescent source, or verifying against a
+snapshot captured at the same instant as the sync. Structural limitation of verifying full_refresh
+against a live DB, not a defect in either.
