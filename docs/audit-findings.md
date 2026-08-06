@@ -720,19 +720,54 @@ nothing about the 8 GB target.
 The real constraint is therefore **both** bounded memory **and** one pass. Only one option
 satisfies both:
 
-1. **Single-DELETE via set/anti-join predicate** *(the right fix)*. Replace the OR-normalized
-   IN-list with a predicate DataFusion can evaluate as a semi/anti-join against the deduped source
-   (subquery or join), so one `delete()` covers the entire window. `delete.rs` is a streaming
-   scan→filter→rewrite with no `JoinType` and no `SortExec`, so this keeps the bounded-memory
-   property that motivated the default, while collapsing 839 rewrites to 1. It also removes the
-   stack-depth motivation for chunking entirely.
-2. **Warn loudly** with the projected rewrite count and estimated bytes before starting the loop
+1. ~~**Single-DELETE via set/anti-join predicate**~~ — **ATTEMPTED 2026-08-06 and BLOCKED by
+   delta-rs. Do not retry as specified.** The idea was sound and the plumbing exists:
+   `DeleteBuilder::with_session_state` accepts our bounded session, and delta-rs applies the delete
+   predicate at the LOGICAL level (`operations/delete.rs`: `.filter(predicate)` and
+   `.filter(predicate.is_not_true())`), so datafusion's `decorrelate_predicate_subquery` would turn
+   an `Expr::InSubquery` into LeftSemi/LeftAnti joins with the **small key set on the build side**
+   and the huge target streaming — bounded, and one commit instead of 839.
+
+   It compiles and clippy passes. It fails at runtime, in 7 existing `delete_then_append` tests:
+
+   ```
+   Generic DeltaTable error: Unable to convert expression to string
+   ```
+
+   `operations/delete.rs:331` serialises the predicate into the commit's `operationParameters`
+   via `fmt_expr_to_sql`, and that writer (`delta_datafusion/expr.rs:613`) has no `InSubquery`
+   arm — reasonably so, since a subquery is not meaningfully representable as a Delta commit
+   predicate string. **Any** predicate that is not SQL-stringifiable is therefore rejected by
+   `DeleteBuilder`, which rules out this whole class of fix at the library boundary. Closing it
+   would need an upstream delta-rs change (or a fork), and the upstream design question — what
+   string to record for a subquery predicate — has no obvious answer.
+
+2. **Anti-join + atomic overwrite, implemented in parket** *(now the real fix)*. Bypass
+   `DeleteBuilder` entirely: scan the target through the bounded session, LEFT ANTI JOIN it against
+   the deduped key set (small side = build side ⇒ streaming and bounded), union the new versions,
+   and commit the result as a single atomic overwrite. This needs **no new primitives** — parket
+   already has `begin_overwrite` / `commit_overwrite` / `abort_overwrite` (`writer.rs:414/502/595`),
+   built for full_refresh's atomic overwrite (O2-r) and already exercised by the reconcile path
+   (PS-H-B). Properties: **one** table rewrite instead of 839, bounded memory, one commit (which
+   also removes the two-commit window §3 lists as a trade-off), and no dependence on delta-rs
+   predicate serialisation. Cost: rewrites the whole table even for a small window, so it should be
+   chosen by size — small windows keep the existing chunked DELETE, large ones take this path.
+
+3. **Raise `DELETE_KEYS_PER_CHUNK`** as a cheap interim mitigation. The constant exists only to cap
+   predicate-tree depth, and at 1024 it produces the amplification measured above; e.g. 50,000
+   would cut 839 rewrites to 18. **Do not pick a value without evidence** — the stack-overflow the
+   comment describes is real, and it is what the current 1024 is defending against. Note the limit
+   cannot be established from the unit tests: `main.rs` deliberately runs on a **512 MB stack**
+   while test threads get far less, so a test-derived ceiling would be misleadingly low. Determining
+   it needs a run on the real stack size.
+
+4. **Warn loudly** with the projected rewrite count and estimated bytes before starting the loop
    (`ids.len()`, `ceil(ids.len()/1024)`, × current table size). Cheap, non-breaking, and would have
    saved all three runs above. Worth doing regardless of #1.
-3. **Auto-escalate on a threshold** — above N chunks, route the window to the full-refresh
+5. **Auto-escalate on a threshold** — above N chunks, route the window to the full-refresh
    atomic-overwrite path (`TABLE_RECONCILE` machinery), which is single-pass *and* bounded. Not to
    `merge_batch`, for the memory reason above.
-4. **Revive §4's deferred APPEND + read-time-dedup design.** Its stated trigger is "only if the
+6. **Revive §4's deferred APPEND + read-time-dedup design.** Its stated trigger is "only if the
    per-run target scan becomes the bottleneck" — that trigger has now fired, harder than the
    wording anticipated (see the correction filed against §3's cost claim).
 
