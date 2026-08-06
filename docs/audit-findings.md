@@ -18,7 +18,9 @@ worthwhile Lows FA6/FA7/FA8/FA9/FA10/FA12 and §5's L5/L6 (L2 found already-fixe
 > accurate through `v0.2.3`, but a production two-stream sync has since surfaced a **High** —
 > **§10.1, `delete_then_append` write amplification**: one full-table rewrite per 1024 update keys,
 > measured at ~56 h and ~2 TB of egress to apply an 840 k-row update window to a 115 M-row table.
-> It is a cost defect, not a correctness one, and `UPDATE_STRATEGY=merge` avoids it today.
+> It is a cost defect, not a correctness one. The workaround for a memory-constrained host is a
+> one-shot `TABLE_RECONCILE_<table>=true`; `UPDATE_STRATEGY=merge` also avoids it but is **NOT
+> recommended** until its peak RSS is measured on the 8–16 GB target (see §10.1).
 
 Apart from §10, what remains open is
 exclusively **Low-tier / deferred residuals**, each documented below with rationale: FA11, FA4-r, V8-r,
@@ -734,15 +736,28 @@ satisfies both:
    per-run target scan becomes the bottleneck" — that trigger has now fired, harder than the
    wording anticipated (see the correction filed against §3's cost claim).
 
-**Operator workaround today**, in order of preference by host:
+**Operator workaround today.** The supported answer is a one-shot
+**`TABLE_RECONCILE_<table>=true`**: single pass, bounded memory, correct on an 8 GB host. It costs a
+full re-extract of the source table, which is the price of staying inside the memory budget.
 
-* **Memory-constrained host (≤ 8 GB):** `TABLE_RECONCILE_<table>=true` for one run. Single pass,
-  bounded memory; costs a full re-extract of the source table.
-* **Roomy host (≫ table working set):** `UPDATE_STRATEGY=merge`. Measured 17.8 min vs a projected
-  56.6 h here — but verify peak RSS against §2.3's sizing table before relying on it, and note the
-  floor grows with the table.
-* `delete_then_append` remains correct and bounded — just do not point it at remote object storage
-  with a large update window.
+`UPDATE_STRATEGY=merge` is **deliberately NOT recommended**, and must not be until the gap below is
+closed:
+
+> **UNVALIDATED at the target size.** The 17.8 min run above was on a **46.5 GB** workstation with a
+> 23.8 GB pool, and **peak RSS was never sampled** — that measurement was not taken and cannot be
+> reconstructed after the fact. §2.3's sizing puts the floor at ~6.9 GB peak RSS for **112 M** rows
+> under the best config (8 GB VM, `MERGE_MEMORY_MB=2048`, `MERGE_TARGET_PARTITIONS=1`), and
+> explicitly notes the floor **grows with the table**. The table is now **115.2 M** rows, i.e. past
+> the size that measurement covers, so the honest status is: *the 8 GB case is unproven and the
+> margin was already thin at a smaller size.*
+>
+> **To close it:** run the MERGE path under a real memory cap
+> (`sudo systemd-run -p MemoryMax=8G` / `-p MemoryMax=16G`) against a genuine update window, sampling
+> `VmHWM`, and extend §2.3's table with a 115 M-row row. Until then treat `merge` as a
+> large-host-only escape hatch, not guidance.
+
+`delete_then_append` remains correct and bounded — just do not point it at remote object storage
+with a large update window.
 
 ### 10.2 Open — Low: `SIGINT` is not honoured mid-table
 
@@ -762,3 +777,50 @@ never referenced by the log (orphans, not corruption), and a Delta-side key cens
 `count == distinct` after each abort (115,226,755 / 115,213,106 respectively). Re-running is safe:
 the update stream's HWM only advances on a successful commit, and `delete_then_append` is
 idempotent. Orphaned parquet accumulates and is not reclaimed by anything short of VACUUM.
+
+### 10.4 Open — Low: `--check` preflight hides the two-stream INSERT watermark
+
+The preflight table prints `hwm_updated_at / hwm_last_id`. For a **two-stream** table those are both
+*update-stream* values, and `hwm_last_id` is the update window's keyset-pagination cursor — **not**
+the insert frontier. `hwm_insert_id`, the value an operator actually reasons about for a two-stream
+table, is not shown at all.
+
+Observed consequence (2026-08-06, during a post-incident recheck): preflight read
+`… 2026-07-18T17:17:23 / 500147844` before a sync and `… 2026-08-06T14:31:31 / 173218080` after it,
+which looks exactly like an insert watermark **regressing by 327 M** — the H-2026-07-11-1 failure
+shape. It had not. The commit carried all three keys correctly:
+
+```
+hwm_insert_id  = 502658778     <- advanced from 500147844, correct
+hwm_updated_at = 2026-08-06T14:31:31.000000
+hwm_last_id    = 173218080     <- update-window pagination cursor
+```
+
+`read_insert_hwm` reads `hwm_insert_id` and `read_hwm` reads `hwm_updated_at`/`hwm_last_id`, so the
+two streams resume from the right places and there is **no correctness bug**. The defect is purely
+that the diagnostic most likely to be run *during an incident* displays a number that resembles the
+insert watermark and can appear to move backwards. FIX: for two-stream tables print `hwm_insert_id`
+alongside the update cursor, or label the column so `hwm_last_id` cannot be mistaken for it.
+
+### 10.5 Open — Medium: superseded parquet is never reclaimed (PS-M3, now quantified)
+
+`developer_journey_trackings` on S3, measured 2026-08-06 immediately after a successful sync:
+
+| | |
+|---|---|
+| parquet files in the table prefix | **793** |
+| prefix size | **73.1 GB** |
+| files referenced by the current snapshot | **36** (`num_target_files_added` of the final MERGE) |
+| live data size | **~2.4 GB** |
+
+≈ **30× storage amplification**. Two sources, both expected-but-unreclaimed:
+
+1. **Superseded files** — every one of §10.1's 839 DELETE chunks removed and rewrote ~23–27 files.
+   The `remove` actions are logged, but Delta never deletes the bytes; only VACUUM does.
+2. **True orphans** — parquet written by the three aborted runs that never reached a commit, so no
+   `remove` action references them either.
+
+This is the concrete cost case for the **PS-M3 vacuum work** (already open, previously unquantified).
+Note the interaction with §10.1: the amplification does not only cost time and egress, it also
+multiplies stored bytes by the chunk count until a VACUUM runs. A retention-window VACUUM is the fix;
+until then storage grows monotonically with every two-stream update run.
