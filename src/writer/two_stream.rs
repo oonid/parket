@@ -29,6 +29,43 @@ fn dedup_rownum_alias(col_names: &[String]) -> String {
     alias
 }
 
+/// Rewrite datafusion's "view" string/binary types back to their canonical Arrow forms.
+///
+/// DataFusion 53 hands back `Utf8View`/`BinaryView` for parquet string and binary columns
+/// (`schema_force_view_types` defaults on), but Delta has no view types — `arrow_schema_to_delta`
+/// rejects them outright ("unsupported Arrow type for Delta: Utf8View"). The overwrite path reads
+/// its target schema from the datafusion provider, so it must canonicalise before handing that
+/// schema to `begin_overwrite`. The staged batches need no separate handling:
+/// `stage_overwrite_chunk` already casts every column to the writer's target schema, and
+/// Utf8View→Utf8 / BinaryView→Binary are supported Arrow casts.
+fn strip_view_types(schema: &deltalake::arrow::datatypes::Schema) -> deltalake::arrow::datatypes::Schema {
+    use deltalake::arrow::datatypes::Field;
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let dt = match f.data_type() {
+                DataType::Utf8View => DataType::Utf8,
+                DataType::BinaryView => DataType::Binary,
+                other => other.clone(),
+            };
+            Field::new(f.name(), dt, f.is_nullable())
+        })
+        .collect();
+    deltalake::arrow::datatypes::Schema::new(fields)
+}
+
+/// Arguments for `delete_then_append_via_overwrite` (§10.1). Grouped into a struct purely to keep
+/// the call under clippy's argument-count limit; every field is what the chunked path already had.
+struct OverwriteUpsert<'a> {
+    table_name: &'a str,
+    deduped_batches: Vec<RecordBatch>,
+    key_col: &'a str,
+    ids: Vec<i64>,
+    insert_id: Option<i64>,
+    update_hwm: Option<&'a super::Hwm>,
+}
+
 impl DeltaWriter {
     /// Upsert `batches` into the table, matching on `key_col`: existing keys updated
     /// (non-key columns only), new keys inserted. Both stream watermarks ride the commit.
@@ -158,6 +195,153 @@ impl DeltaWriter {
     /// sorter owns the whole pool). MERGE_SORT_RESERVATION_MB / MERGE_TARGET_PARTITIONS override.
     /// Used by BOTH `merge_batch` and `delete_then_append` (the default strategy) so neither runs
     /// an unbounded session.
+    /// §10.1: apply an update window as ONE atomic overwrite instead of `ceil(keys/1024)`
+    /// full-table DELETEs.
+    ///
+    /// `delete_then_append`'s chunked DELETE loop rewrites the entire table once per 1024 keys
+    /// (measured: 839 rewrites, ~56 h and ~2 TB of egress for an 858 k-key window on a 115 M-row
+    /// table). The obvious fix — one DELETE with a semi-join predicate — is **impossible** through
+    /// delta-rs's `DeleteBuilder`, which serialises the predicate to SQL for the commit's
+    /// `operationParameters` and rejects anything `fmt_expr_to_sql` cannot render, including
+    /// `InSubquery` (audit register §10.1 records the attempt).
+    ///
+    /// So bypass `DeleteBuilder`: compute the surviving rows with an ANTI JOIN, append the new
+    /// versions, and swap the whole table in one atomic commit using the same
+    /// `begin_overwrite`/`stage_overwrite_chunk`/`commit_overwrite` primitives full-refresh uses
+    /// (O2-r). Properties versus the chunked loop:
+    ///   * **one** table rewrite regardless of window size, instead of `ceil(keys/1024)`;
+    ///   * **one** commit instead of two, which also closes the brief window where the changed
+    ///     keys are absent from the table (a trade-off `docs/two-stream-continue-update.md` §3
+    ///     lists as accepted);
+    ///   * memory stays bounded — the anti-join's BUILD side is the small key set while the huge
+    ///     target STREAMS, and the surviving rows are staged to parquet in bounded chunks rather
+    ///     than collected. This is what makes it a valid replacement rather than a second
+    ///     `merge_batch`, whose `source FULL OUTER JOIN target` must drive the whole target
+    ///     through a non-spillable operator and therefore cannot be bounded at all (§2 there).
+    ///
+    /// Cost: it rewrites the whole table even for a tiny window, so `delete_then_append` only
+    /// routes here once the projected chunk count makes the DELETE loop the more expensive option.
+    async fn delete_then_append_via_overwrite(
+        &self,
+        args: OverwriteUpsert<'_>,
+        ctx: &SessionContext,
+    ) -> Result<()> {
+        let OverwriteUpsert { table_name, deduped_batches, key_col, ids, insert_id, update_hwm } = args;
+        use deltalake::arrow::datatypes::{Field, Schema};
+        use std::sync::Arc;
+
+        const TARGET_TABLE: &str = "__parket_overwrite_target";
+        const KEYS_TABLE: &str = "__parket_overwrite_keys";
+        /// Rows buffered before staging a parquet chunk. Bounds peak memory independently of how
+        /// large the surviving set is; the staged chunks are what the final commit references.
+        const STAGE_ROWS: usize = 200_000;
+
+        let key_count = ids.len();
+        let table = self.open_table(table_name).await?;
+        let provider = table.table_provider().await?;
+        // The provider's schema may carry datafusion view types; Delta cannot represent those.
+        let provider_schema = provider.schema();
+        let target_schema = Arc::new(strip_view_types(&provider_schema));
+        ctx.register_table(TARGET_TABLE, provider)?;
+
+        let key_schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let key_batch = RecordBatch::try_new(key_schema.clone(), vec![Arc::new(Int64Array::from(ids))])
+            .context("building the overwrite key batch")?;
+        ctx.register_table(
+            KEYS_TABLE,
+            Arc::new(
+                MemTable::try_new(key_schema, vec![vec![key_batch]])
+                    .context("registering the overwrite key table")?,
+            ),
+        )?;
+
+        // Project the target's own columns explicitly so the staged batches match the schema
+        // `begin_overwrite` was given. `NOT IN` decorrelates to a LeftAnti join; the key column is
+        // cast to Int64 to match the key table, mirroring the chunked path's predicate cast.
+        let col_list = target_schema
+            .fields()
+            .iter()
+            .map(|f| backtick(f.name()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {col_list} FROM {TARGET_TABLE} \
+             WHERE CAST({key} AS BIGINT) NOT IN (SELECT k FROM {KEYS_TABLE})",
+            key = backtick(key_col)
+        );
+
+        let new_rows: usize = deduped_batches.iter().map(|b| b.num_rows()).sum();
+        self.begin_overwrite(table_name, target_schema).await?;
+
+        // Any failure after begin_overwrite must drain the session, or the next call for this
+        // table fails with "no overwrite session in progress"/"already in progress" (FA11).
+        let staged = self
+            .stage_anti_join_and_new_versions(table_name, ctx, &sql, deduped_batches, STAGE_ROWS)
+            .await;
+        let survivors = match staged {
+            Ok(n) => n,
+            Err(e) => {
+                self.abort_overwrite(table_name).await;
+                return Err(e);
+            }
+        };
+
+        if let Err(e) = self.commit_overwrite(table_name, update_hwm, insert_id).await {
+            self.abort_overwrite(table_name).await;
+            return Err(e);
+        }
+
+        info!(
+            table = table_name,
+            keys = key_count,
+            survivors,
+            new_rows,
+            "delete_then_append: applied via ONE atomic overwrite (anti-join), not per-chunk DELETEs"
+        );
+        Ok(())
+    }
+
+    /// Stream the anti-join survivors into staged parquet chunks, then stage the new versions.
+    /// Split out so the caller can `abort_overwrite` on any error without duplicating cleanup.
+    async fn stage_anti_join_and_new_versions(
+        &self,
+        table_name: &str,
+        ctx: &SessionContext,
+        sql: &str,
+        deduped_batches: Vec<RecordBatch>,
+        stage_rows: usize,
+    ) -> Result<usize> {
+        use futures::StreamExt;
+
+        let mut stream = ctx
+            .sql(sql)
+            .await
+            .context("planning the overwrite anti-join")?
+            .execute_stream()
+            .await
+            .context("executing the overwrite anti-join")?;
+
+        let mut survivors = 0usize;
+        let mut buffered = 0usize;
+        let mut buf: Vec<RecordBatch> = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.context("reading an anti-join batch")?;
+            survivors += batch.num_rows();
+            buffered += batch.num_rows();
+            buf.push(batch);
+            if buffered >= stage_rows {
+                self.stage_overwrite_chunk(table_name, std::mem::take(&mut buf)).await?;
+                buffered = 0;
+            }
+        }
+        if !buf.is_empty() {
+            self.stage_overwrite_chunk(table_name, buf).await?;
+        }
+        // The new versions land in the SAME overwrite, so the table never lacks these keys.
+        self.stage_overwrite_chunk(table_name, deduped_batches).await?;
+        Ok(survivors)
+    }
+
     fn build_bounded_session(&self, table_name: &str) -> Result<SessionContext> {
         let pool_bytes = (self.merge_memory_mb as usize) * 1024 * 1024;
         // Route the external sort's spill to the configured dir (MERGE_SPILL_DIR); else system temp.
@@ -432,6 +616,60 @@ impl DeltaWriter {
         //    deep predicate tree whose plan traversal overflows the stack on large batches
         //    (the reason main.rs runs on a 512 MB stack); chunking caps the depth.
         const DELETE_KEYS_PER_CHUNK: usize = 1024;
+        // §10.1: each chunk below rewrites the WHOLE table, so the DELETE loop costs
+        // ceil(keys/1024) full-table rewrites. Past a few chunks that is strictly worse than
+        // rewriting the table exactly once, which is what `delete_then_append_via_overwrite`
+        // does. Route by projected chunk count.
+        //
+        // The overwrite path is skipped when the incoming batch carries a column the Delta table
+        // does not have yet: the append below writes with `SchemaMode::Merge` and so evolves the
+        // schema additively (D1), whereas an overwrite would have to reconcile the new column
+        // against rescued rows that predate it. That is exactly the reason `merge_batch` defers
+        // here (D1-r), and the same reasoning applies in reverse.
+        const OVERWRITE_ABOVE_CHUNKS: usize = 8;
+        let projected_chunks = ids.len().div_ceil(DELETE_KEYS_PER_CHUNK);
+        let schema_is_additive = {
+            let delta_fields: std::collections::HashSet<String> = table
+                .snapshot()?
+                .schema()
+                .fields()
+                .map(|f| f.name().to_string())
+                .collect();
+            deduped_batches
+                .first()
+                .map(|b| b.schema().fields().iter().any(|f| !delta_fields.contains(f.name())))
+                .unwrap_or(false)
+        };
+        if projected_chunks > OVERWRITE_ABOVE_CHUNKS && !schema_is_additive {
+            info!(
+                table = table_name,
+                keys = ids.len(),
+                projected_chunks,
+                "delete_then_append: window too large for per-chunk DELETEs — using one atomic overwrite (§10.1)"
+            );
+            self.cache_store(table_name, table).await;
+            return self
+                .delete_then_append_via_overwrite(
+                    OverwriteUpsert {
+                        table_name,
+                        deduped_batches,
+                        key_col,
+                        ids,
+                        insert_id,
+                        update_hwm,
+                    },
+                    &ctx,
+                )
+                .await;
+        }
+        if projected_chunks > OVERWRITE_ABOVE_CHUNKS {
+            info!(
+                table = table_name,
+                projected_chunks,
+                "delete_then_append: window is large but the batch adds a column — staying on the \
+                 chunked DELETE path so SchemaMode::Merge can evolve the Delta schema (D1)"
+            );
+        }
         if !ids.is_empty() {
             for chunk in ids.chunks(DELETE_KEYS_PER_CHUNK) {
                 let list: Vec<_> = chunk.iter().map(|id| lit(*id)).collect();
@@ -1786,7 +2024,91 @@ mod tests {
         assert_eq!(cnt_col.value(0), 0i64);
     }
 
+        /// §10.1: a window above `OVERWRITE_ABOVE_CHUNKS` must take the single-atomic-overwrite path
+    /// and still produce exactly the same result as the chunked DELETE path — one row per key, the
+    /// new values, and (critically) every NON-updated row preserved. The chunked path is covered by
+    /// `delete_then_append_spans_multiple_delete_chunks`; without this test the overwrite branch
+    /// would ship unexercised, since every other test's key count falls under the threshold.
     #[tokio::test]
+    async fn delete_then_append_large_window_uses_atomic_overwrite_and_keeps_survivors() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        writer.ensure_table("t", schema.clone()).await.unwrap();
+
+        // Seed 12000 rows. Updating 10000 of them projects to ceil(10000/1024) = 10 chunks, above
+        // the threshold of 8, so this routes to the overwrite path. The remaining 2000 are the
+        // survivors an anti-join must carry across untouched — the property a DELETE cannot get
+        // wrong but a full rewrite can.
+        let total: i64 = 12_000;
+        let updated: i64 = 10_000;
+        let seed = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from((1..=total).collect::<Vec<i64>>())),
+                Arc::new(StringArray::from(vec!["old"; total as usize])),
+            ],
+        )
+        .unwrap();
+        let t = writer.open_table("t").await.unwrap();
+        t.write(vec![seed]).with_save_mode(SaveMode::Append).await.unwrap();
+        let version_before = writer.open_table("t").await.unwrap().version();
+
+        let update = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from((1..=updated).collect::<Vec<i64>>())),
+                Arc::new(StringArray::from(vec!["new"; updated as usize])),
+            ],
+        )
+        .unwrap();
+        writer
+            .delete_then_append("t", vec![update], "id", Some(total), None)
+            .await
+            .unwrap();
+
+        let t = writer.open_table("t").await.unwrap();
+        // ONE commit, not two (the chunked path commits N deletes + 1 append).
+        assert_eq!(
+            t.version(),
+            version_before.map(|v| v + 1),
+            "the overwrite path must advance the table by exactly ONE commit"
+        );
+
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        ctx.register_table("t", t.table_provider().await.unwrap()).unwrap();
+        let batches = ctx
+            .sql(
+                "SELECT COUNT(*) AS c, COUNT(DISTINCT id) AS d, \
+                        SUM(CASE WHEN value = 'new' THEN 1 ELSE 0 END) AS new_cnt, \
+                        SUM(CASE WHEN value = 'old' THEN 1 ELSE 0 END) AS old_cnt, \
+                        MIN(id) AS lo, MAX(id) AS hi FROM t",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let b = &batches[0];
+        let g = |i: usize| b.column(i).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+
+        assert_eq!(g(0), total, "row count must be unchanged (no dupes, nothing dropped)");
+        assert_eq!(g(1), total, "every id must appear exactly once");
+        assert_eq!(g(2), updated, "all updated keys must carry the new value");
+        assert_eq!(
+            g(3),
+            total - updated,
+            "the {} untouched rows must survive the overwrite",
+            total - updated
+        );
+        assert_eq!(g(4), 1, "lowest id preserved");
+        assert_eq!(g(5), total, "highest id preserved");
+    }
+
+#[tokio::test]
     async fn delete_then_append_spans_multiple_delete_chunks() {
         let temp = tempfile::tempdir().unwrap();
         let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
