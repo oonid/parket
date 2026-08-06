@@ -630,7 +630,21 @@ misdiagnosed as a network failure (one host suspend, one transient connect stall
 at ~40 minutes each run had applied roughly **3%** of its update window. The network errors
 merely interrupted a run that could not have finished.
 
-### 10.1 Open — High: one full-table rewrite per 1024 update keys
+### 10.1 ~~Open~~ **FIXED (`fb5c4eb`)** — High: one full-table rewrite per 1024 update keys
+
+> **Resolved 2026-08-06** by fix #2 below (anti-join + atomic overwrite), after fix #1 turned out to
+> be impossible through delta-rs. `delete_then_append` now routes windows above 8 projected chunks
+> (>8192 keys) to `delete_then_append_via_overwrite`: ONE table rewrite and ONE commit instead of
+> `ceil(keys/1024)` rewrites plus two commits, with memory still bounded (anti-join build side = the
+> small key set; survivors staged in 200k-row chunks). Smaller windows keep the chunked DELETE,
+> which is cheaper for them and unchanged. Gate: 665 lib tests, clippy clean, llvm-cov 92.59%.
+>
+> **Still to validate at scale:** the fix is exercised only against local-filesystem tables in
+> tests. The projection is that one ~2.4 GB rewrite replaces 839; confirm against the real 115 M-row
+> table before trusting the numbers. §10.2 (SIGINT) should also be re-checked — the long writer-side
+> loop it was trapped behind no longer runs on this path.
+
+The original finding follows.
 
 `DeltaWriter::delete_then_append` (`src/writer/two_stream.rs:429-446`) deletes the incoming keys
 in chunks and issues **a separate `table.delete()` per chunk**:
