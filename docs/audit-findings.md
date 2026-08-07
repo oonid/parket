@@ -1,6 +1,10 @@
 # Audit findings register (living document)
 
-**Status date:** 2026-08-06. This is the single source of truth for audit findings and remediation
+**Release v0.2.4 (2026-08-07):** §10.1 fixed — large two-stream update windows now apply as ONE
+atomic overwrite instead of `ceil(keys/1024)` full-table DELETEs (`fb5c4eb`), plus the §10.x findings
+and the corrected MERGE memory guidance. **Not yet validated at production scale** — see §10.1.
+
+**Status date:** 2026-08-07. This is the single source of truth for audit findings and remediation
 process — it consolidates `docs/audit-2026-07-04.md` and `docs/handoff-2026-07-06.md` (both retired;
 content carried forward here) and the second-pass results in `docs/audit-2026-07-06.md` (kept for its
 detailed analysis; finding IDs below reference it). Target runtime: an **8 GB RAM** VM.
