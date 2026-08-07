@@ -177,6 +177,22 @@ async fn build_verify_table_plans(
     Ok(plans)
 }
 
+/// Render a byte count in the largest unit that keeps it legible. §10.7: a hardcoded "GB" made a
+/// few MB of reclaimed log files print as `0.00 GB`, indistinguishable from nothing at all.
+fn human_bytes(b: u64) -> String {
+    const K: f64 = 1024.0;
+    let f = b as f64;
+    if f >= K * K * K {
+        format!("{:.2} GB", f / (K * K * K))
+    } else if f >= K * K {
+        format!("{:.1} MB", f / (K * K))
+    } else if f >= K {
+        format!("{:.0} KB", f / K)
+    } else {
+        format!("{b} B")
+    }
+}
+
 /// §10.7: reclaim superseded/orphaned parquet. DRY RUN unless `--vacuum-apply`, because deletion is
 /// irreversible and an ETL binary must not delete data as the default reading of a new flag.
 ///
@@ -225,6 +241,7 @@ async fn run_vacuum(
 
     let mut total_files = 0usize;
     let mut total_bytes = 0u64;
+    let mut total_present = 0usize;
     let mut failed = 0u32;
     for t in &tables {
         match writer
@@ -239,20 +256,20 @@ async fn run_vacuum(
         {
             Ok(r) => {
                 total_files += r.files;
+                total_present += r.files_present;
                 total_bytes += r.bytes;
                 // §10.7: a zero byte total with a non-zero file count means the deletion could
                 // NOT be priced, not that there is nothing to reclaim. Say so — rendering it as
                 // "0.00 GB" is the same trap as a swallowed error surfacing as a plausible number.
-                let size = if r.files > 0 && r.bytes == 0 {
-                    "  (unpriced)".to_string()
-                } else {
-                    format!("{:>10.2} GB", r.bytes as f64 / 1_073_741_824.0)
-                };
+                // §10.7: adaptive units. A fixed "GB" with two decimals renders a few MB of
+                // reclaimed _delta_log entries as "0.00 GB", which reads as "nothing to reclaim"
+                // and is what made the first dry run look like the byte pricing had failed.
                 println!(
-                    "{:<32} {:>7} files {}  retention={}h mode={} {}",
+                    "{:<32} named={:<6} present={:<6} {:>12}  retention={}h mode={} {}",
                     t,
                     r.files,
-                    size,
+                    r.files_present,
+                    human_bytes(r.bytes),
                     r.retention_hours,
                     if r.full { "full" } else { "lite" },
                     if r.dry_run { "(dry run)" } else { "DELETED" },
@@ -265,10 +282,11 @@ async fn run_vacuum(
         }
     }
     println!(
-        "vacuum {}: {} file(s), {:.2} GB priced across {} table(s){}",
+        "vacuum {}: {} named, {} present in storage, {} reclaimable across {} table(s){}",
         if cli.vacuum_apply { "applied" } else { "dry run" },
         total_files,
-        total_bytes as f64 / 1_073_741_824.0,
+        total_present,
+        human_bytes(total_bytes),
         tables.len(),
         if failed > 0 { format!(", {failed} FAILED") } else { String::new() },
     );

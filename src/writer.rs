@@ -113,7 +113,11 @@ struct OverwriteSession {
 #[derive(Debug, Clone)]
 pub struct VacuumReport {
     pub dry_run: bool,
+    /// Files delta-rs NAMED as deletable. Derived from the transaction log, so it includes files
+    /// already physically gone — see `files_present`.
     pub files: usize,
+    /// Of those, how many actually exist in storage. This is the real reclaim count.
+    pub files_present: usize,
     pub bytes: u64,
     pub retention_hours: u64,
     pub full: bool,
@@ -297,7 +301,21 @@ impl DeltaWriter {
             .await
             .context("vacuum dry run")?;
 
-        let bytes: u64 = metrics
+        // §10.7: byte pricing failed silently on S3 (0 bytes for 71 real files) while working on a
+        // local FS. Log both sides of the match so the mismatch is diagnosable instead of guessed at.
+        tracing::debug!(
+            listed = sizes.len(),
+            sample_listed = ?sizes.keys().take(2).collect::<Vec<_>>(),
+            sample_deleted = ?metrics.files_deleted.iter().take(2).collect::<Vec<_>>(),
+            "vacuum: pricing inputs"
+        );
+
+        // §10.7: a dry run's `files_deleted` is derived from the log's `remove` actions, so it names
+        // files that may ALREADY be physically gone — e.g. everything PS-M3's 2026-07-18 force-vacuum
+        // deleted is still referenced by remove actions. Reporting that count alone is misleading:
+        // the first S3 dry run said "71 files" when every one of them was absent from storage and the
+        // real reclaim was ZERO bytes. So intersect with the listing and report both.
+        let present: Vec<u64> = metrics
             .files_deleted
             .iter()
             .filter_map(|f| {
@@ -305,8 +323,11 @@ impl DeltaWriter {
                     .file_name()
                     .and_then(|n| n.to_str())
                     .and_then(|n| sizes.get(n))
+                    .copied()
             })
-            .sum();
+            .collect();
+        let bytes: u64 = present.iter().sum();
+        let files_present = present.len();
         let files = metrics.files_deleted.len();
 
         if apply {
@@ -322,12 +343,13 @@ impl DeltaWriter {
             return Ok(VacuumReport {
                 dry_run: false,
                 files: applied.files_deleted.len(),
+                files_present,
                 bytes,
                 retention_hours,
                 full,
             });
         }
-        Ok(VacuumReport { dry_run: true, files, bytes, retention_hours, full })
+        Ok(VacuumReport { dry_run: true, files, files_present, bytes, retention_hours, full })
     }
 
     /// §10.1-r3: how many BYTES of surviving rows to buffer before staging a parquet chunk.
@@ -886,11 +908,19 @@ mod tests {
         let report = writer.vacuum("t", 0, true, false, true).await.unwrap();
 
         assert!(report.dry_run, "must not delete without apply");
-        assert!(report.files > 0, "tombstoned files should be reclaimable, got {}", report.files);
+        assert!(report.files > 0, "tombstoned files should be named, got {}", report.files);
+        // §10.7: `files` counts what delta-rs NAMED, which includes files already physically gone.
+        // `files_present` is the real reclaim, and it is what must be priced. On S3 a dry run
+        // reported 71 named / 0 present / 0 B — every name was a stale remove action from an earlier
+        // force-vacuum — so reporting `files` alone read as 71 reclaimable files that did not exist.
+        assert_eq!(
+            report.files_present, report.files,
+            "these tombstones were just created, so every named file must still be in storage"
+        );
         assert!(
             report.bytes > 0,
-            "{} files reported but 0 bytes — the deletion was not priced",
-            report.files
+            "{} present files but 0 bytes — the deletion was not priced",
+            report.files_present
         );
     }
     use super::*;

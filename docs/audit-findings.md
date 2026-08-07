@@ -1139,13 +1139,26 @@ against a live DB, not a defect in either.
 > v0.2.5 overwrite and the rest of §10.5's backlog become eligible — run it with `--vacuum-full`
 > then, since Lite alone would skip the never-committed orphans.
 >
-> **Known gap — byte totals are not priced on S3.** `VacuumMetrics` returns file NAMES only, so the
-> command prices the deletion by matching them against one object-store LIST. That works on a local
-> filesystem (`vacuum_dry_run_prices_the_deletion_in_bytes` pins it) but returned 0 bytes for 71 real
-> files on S3, cause not yet diagnosed. Rather than print "0.00 GB" — a swallowed failure rendered as
-> a plausible number, the exact trap that nearly had a destroyed transaction log reported earlier in
-> this session — the output says **`(unpriced)`** whenever the file count is non-zero and the byte
-> total is not. Fix the matching before relying on the GB figure; the FILE COUNT is trustworthy.
+> **Dry run today: `named=71  present=0  0 B reclaimable`** — and that distinction is the point.
+>
+> A dry run's `files_deleted` comes from the log's `remove` actions, so it names files that may
+> ALREADY be physically gone. Everything PS-M3's 2026-07-18 force-vacuum deleted is still referenced
+> by remove actions, so delta-rs names those 71 files even though **every one of them is absent from
+> storage** (verified individually) and the real reclaim is **zero bytes**.
+>
+> I first read "71 files / 0.00 GB" as a broken byte-pricing implementation, and said so. Wrong twice:
+> the pricing was correct all along, and the misleading number was the FILE COUNT. So the report now
+> intersects the named list against a storage listing and prints both — `named=` is what delta-rs
+> would tidy from the log, `present=` is what actually exists and gets reclaimed. Only the second is
+> a measure of disk. Pinned by `vacuum_dry_run_prices_the_deletion_in_bytes`, which asserts
+> `files_present == files` for freshly-created tombstones and that the bytes are non-zero.
+>
+> Byte figures use adaptive units, because a fixed `GB` with two decimals renders a few MB as
+> `0.00 GB` — indistinguishable from nothing at all, which is how this investigation started.
+>
+> **For the 2026-08-13 reclaim, watch `present=`, not `named=`.** The 564 small files from the v0.2.5
+> overwrite and the rest of §10.5's backlog cross the retention boundary then; `--vacuum-full` is
+> required, since Lite skips the never-committed orphans.
 
 <details><summary>Original proposal (kept for the design rationale)</summary>
 
