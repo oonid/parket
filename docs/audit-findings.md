@@ -14,7 +14,9 @@ commit, which described a `STAGE_ROWS` change that a later commit replaced:
   become `SIGTERM`.
 * **§10.4 FIXED** — `--check` shows the two-stream INSERT watermark and labels the pagination cursor.
 
-v0.2.4 is a **pre-release**: its overwrite path failed in production. v0.2.5 was never tagged.
+v0.2.4 is a **pre-release**: its overwrite path failed in production and must not be deployed.
+**v0.2.5 is tagged, released and is the binary currently in production** — it carries the
+validated §10.1 fix. v0.2.6 supersedes it with §10.1-r3, §10.2 and §10.4.
 
 **Status date:** 2026-08-07. This is the single source of truth for audit findings and remediation
 process — it consolidates `docs/audit-2026-07-04.md` and `docs/handoff-2026-07-06.md` (both retired;
