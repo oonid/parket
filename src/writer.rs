@@ -109,6 +109,16 @@ struct OverwriteSession {
 /// exists to prevent. A data-losing narrowing now fails the table loudly and actionably instead.
 /// §10.1-r3: default staged-chunk byte budget. 256 MB keeps peak buffering small against the 8 GB
 /// target while producing ~40 output files for a 115 M-row table (the MERGE path produces ~36).
+/// §10.7: outcome of a `--vacuum` run.
+#[derive(Debug, Clone)]
+pub struct VacuumReport {
+    pub dry_run: bool,
+    pub files: usize,
+    pub bytes: u64,
+    pub retention_hours: u64,
+    pub full: bool,
+}
+
 const DEFAULT_STAGE_BYTES: usize = 256 * 1024 * 1024;
 
 fn coerce_batch_to_schema(
@@ -220,6 +230,104 @@ impl DeltaWriter {
         self.merge_memory_mb = merge_memory_mb;
         self.merge_spill_dir = merge_spill_dir;
         self
+    }
+
+    /// §10.7: reclaim superseded/orphaned parquet for one table.
+    ///
+    /// parket had no vacuum command, so PS-M3's reclaim was done with `deltalake` Python — a second
+    /// toolchain, credentials duplicated outside parket's config, and a hand-written script whose
+    /// retention and mode flags are the dangerous ones. For a MONTHLY chore that is the wrong shape.
+    ///
+    /// Three deliberate safety choices, all learned from §10.5:
+    /// * **Dry run unless `apply`.** Deletion is irreversible; an ETL binary must not delete data as
+    ///   the default reading of a new flag.
+    /// * **`full` selects `VacuumMode::Full`.** delta-rs defaults to `Lite`, which only removes files
+    ///   carrying a `remove` action — so it silently SKIPS true orphans (parquet from aborted runs
+    ///   and aborted staged overwrites, which nothing ever referenced). Those were a large part of
+    ///   the measured bloat, so the mode must be a conscious choice.
+    /// * **`force` is required below 168 h.** Retention exists to protect concurrent readers and
+    ///   time travel; `retention_hours=0` must not be one typo away.
+    ///
+    /// Byte totals come from a single object-store LIST priced against the dry-run file list —
+    /// `VacuumMetrics` reports names only, and PS-M3 had to state its "3.7 GB→2.06 GB" by hand.
+    pub async fn vacuum(
+        &self,
+        table_name: &str,
+        retention_hours: u64,
+        full: bool,
+        apply: bool,
+        force: bool,
+    ) -> Result<VacuumReport> {
+        use deltalake::operations::vacuum::VacuumMode;
+        use futures::StreamExt;
+
+        const DEFAULT_RETENTION_HOURS: u64 = 168;
+        if retention_hours < DEFAULT_RETENTION_HOURS && !force {
+            anyhow::bail!(
+                "vacuum retention {retention_hours}h is below the {DEFAULT_RETENTION_HOURS}h \
+                 default, which protects in-flight readers and time travel. Pass --vacuum-force to \
+                 accept that (PS-M3 did so deliberately once, for a snapshot it had verified \
+                 superseded)."
+            );
+        }
+        // delta-rs wants a chrono TimeDelta here, not std::time::Duration.
+        let retention = chrono::TimeDelta::hours(retention_hours as i64);
+        let mode = if full { VacuumMode::Full } else { VacuumMode::Lite };
+
+        // Price the deletion from ONE list of the table prefix; VacuumMetrics returns names only.
+        let table = self.open_table(table_name).await?;
+        let store = table.log_store().object_store(None);
+        let mut sizes: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let mut listing = store.list(None);
+        while let Some(meta) = listing.next().await {
+            let meta = meta.context("listing the table prefix to price the vacuum")?;
+            let name = meta.location.filename().unwrap_or_default().to_string();
+            sizes.insert(name, meta.size);
+        }
+
+        // Always dry-run first: it yields the file list we price, and on a non-apply run it IS the
+        // answer.
+        let table = self.open_table(table_name).await?;
+        let (_t, metrics) = table
+            .vacuum()
+            .with_retention_period(retention)
+            .with_mode(mode.clone())
+            .with_enforce_retention_duration(!force)
+            .with_dry_run(true)
+            .await
+            .context("vacuum dry run")?;
+
+        let bytes: u64 = metrics
+            .files_deleted
+            .iter()
+            .filter_map(|f| {
+                std::path::Path::new(f)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| sizes.get(n))
+            })
+            .sum();
+        let files = metrics.files_deleted.len();
+
+        if apply {
+            let table = self.open_table(table_name).await?;
+            let (_t, applied) = table
+                .vacuum()
+                .with_retention_period(retention)
+                .with_mode(mode)
+                .with_enforce_retention_duration(!force)
+                .with_dry_run(false)
+                .await
+                .context("vacuum apply")?;
+            return Ok(VacuumReport {
+                dry_run: false,
+                files: applied.files_deleted.len(),
+                bytes,
+                retention_hours,
+                full,
+            });
+        }
+        Ok(VacuumReport { dry_run: true, files, bytes, retention_hours, full })
     }
 
     /// §10.1-r3: how many BYTES of surviving rows to buffer before staging a parquet chunk.
@@ -742,6 +850,49 @@ impl DeltaWriter {
 
 #[cfg(test)]
 mod tests {
+
+    /// §10.7: a dry-run vacuum must report BYTES, not just a file count.
+    ///
+    /// `VacuumMetrics` returns file NAMES only — PS-M3 had to state its "3.7 GB→2.06 GB" by hand,
+    /// which is exactly what a command should compute. The first implementation priced the deletion
+    /// by matching those names against an object-store listing and reported 0.00 GB for 71 real
+    /// files, so the matching is pinned here.
+    #[tokio::test]
+    async fn vacuum_dry_run_prices_the_deletion_in_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = std::sync::Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+            deltalake::arrow::datatypes::Field::new("id", deltalake::arrow::datatypes::DataType::Int64, false),
+        ]));
+        writer.ensure_table("t", schema.clone()).await.unwrap();
+
+        // Two appends then an overwrite: the first two files become tombstoned (removable).
+        for chunk in [vec![1i64, 2, 3], vec![4i64, 5, 6]] {
+            let b = deltalake::arrow::record_batch::RecordBatch::try_new(
+                schema.clone(),
+                vec![std::sync::Arc::new(deltalake::arrow::array::Int64Array::from(chunk))],
+            )
+            .unwrap();
+            writer.append_batch("t", vec![b], None).await.unwrap();
+        }
+        let b = deltalake::arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![std::sync::Arc::new(deltalake::arrow::array::Int64Array::from(vec![9i64]))],
+        )
+        .unwrap();
+        writer.overwrite_table("t", vec![b], None).await.unwrap();
+
+        // retention 0 needs force; that also makes the just-tombstoned files eligible immediately.
+        let report = writer.vacuum("t", 0, true, false, true).await.unwrap();
+
+        assert!(report.dry_run, "must not delete without apply");
+        assert!(report.files > 0, "tombstoned files should be reclaimable, got {}", report.files);
+        assert!(
+            report.bytes > 0,
+            "{} files reported but 0 bytes — the deletion was not priced",
+            report.files
+        );
+    }
     use super::*;
     
     

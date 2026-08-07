@@ -1106,6 +1106,47 @@ re-running cannot change that. A true PASS would require a quiescent source, or 
 snapshot captured at the same instant as the sync. Structural limitation of verifying full_refresh
 against a live DB, not a defect in either.
 
+### 10.7 **IMPLEMENTED** — `parket --vacuum`
+
+> **Shipped 2026-08-07.** Replaces the `deltalake` Python script PS-M3 had to use, which meant a
+> second toolchain, credentials duplicated outside parket's config, and hand-written retention/mode
+> flags — the two most dangerous knobs — for a *monthly* chore, on a host where that package is not
+> even installed.
+>
+> ```
+> parket --vacuum [<TABLE>]              # all configured tables, or one. DRY RUN by default.
+>        --vacuum-apply                  # actually delete
+>        --vacuum-retention-hours <N>    # default 168 (the PS-M3 cadence)
+>        --vacuum-full                   # VacuumMode::Full — also reclaims never-committed orphans
+>        --vacuum-force                  # required below 168h
+> ```
+>
+> Guards verified against production:
+> ```
+> $ parket --vacuum developer_journey_trackings --vacuum-retention-hours 0
+> vacuum retention 0h is below the 168h default, which protects in-flight readers and time travel.
+> Pass --vacuum-force to accept that (PS-M3 did so deliberately once, for a snapshot it had
+> verified superseded).
+> $ parket --vacuum not_a_table
+> vacuum: `not_a_table` is not in TABLES
+> ```
+>
+> Dry run today, both modes: **71 files** eligible at 168 h retention. Lite and Full agree, which is
+> **correct rather than suspicious**: every orphan from the recent failed runs is younger than the
+> retention window, so nothing extra is in scope yet. After 2026-08-13 the 564 small files from the
+> v0.2.5 overwrite and the rest of §10.5's backlog become eligible — run it with `--vacuum-full`
+> then, since Lite alone would skip the never-committed orphans.
+>
+> **Known gap — byte totals are not priced on S3.** `VacuumMetrics` returns file NAMES only, so the
+> command prices the deletion by matching them against one object-store LIST. That works on a local
+> filesystem (`vacuum_dry_run_prices_the_deletion_in_bytes` pins it) but returned 0 bytes for 71 real
+> files on S3, cause not yet diagnosed. Rather than print "0.00 GB" — a swallowed failure rendered as
+> a plausible number, the exact trap that nearly had a destroyed transaction log reported earlier in
+> this session — the output says **`(unpriced)`** whenever the file count is non-zero and the byte
+> total is not. Fix the matching before relying on the GB figure; the FILE COUNT is trustworthy.
+
+<details><summary>Original proposal (kept for the design rationale)</summary>
+
 ### 10.7 Proposed — parket has no `--vacuum`, and this is now a recurring chore
 
 PS-M3's reclaim was done with **`deltalake` Python** because parket has no vacuum command
@@ -1144,3 +1185,5 @@ Notes for the implementer:
   (single-writer assumption).
 * `with_keep_versions` is worth exposing later if time-travel windows are ever needed; not needed
   for the monthly cadence.
+
+</details>

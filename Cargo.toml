@@ -16,6 +16,9 @@ tokio = { version = "1", features = ["full"] }
 # §10.1: streaming the overwrite anti-join batch-by-batch (StreamExt) so the surviving rows
 # are staged to parquet in bounded chunks instead of collected. Already in the lockfile.
 futures = "0.3"
+# §10.7: `--vacuum` — delta-rs's VacuumBuilder::with_retention_period takes a chrono TimeDelta,
+# not std::time::Duration. Already in the lockfile transitively via deltalake.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dotenvy = "0.15"

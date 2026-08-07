@@ -177,6 +177,104 @@ async fn build_verify_table_plans(
     Ok(plans)
 }
 
+/// §10.7: reclaim superseded/orphaned parquet. DRY RUN unless `--vacuum-apply`, because deletion is
+/// irreversible and an ETL binary must not delete data as the default reading of a new flag.
+///
+/// Replaces the `deltalake` Python script PS-M3 had to use (parket had no vacuum command), which
+/// meant a second toolchain, credentials duplicated outside parket's config, and hand-written
+/// retention/mode flags — the two most dangerous knobs — for what is a MONTHLY chore.
+async fn run_vacuum(
+    config: &config::Config,
+    local_dir: Option<&std::path::Path>,
+    table: Option<String>,
+    cli: &Cli,
+) -> i32 {
+    let writer = match local_dir {
+        Some(dir) => DeltaWriter::new_local(&dir.to_string_lossy()),
+        None => DeltaWriter::new(
+            &config.s3_bucket,
+            &config.s3_prefix,
+            config.s3_endpoint.as_deref(),
+            &config.s3_region,
+            &config.s3_access_key_id,
+            &config.s3_secret_access_key,
+        ),
+    };
+
+    let tables: Vec<String> = match table {
+        Some(t) => {
+            if !config.tables.contains(&t) {
+                eprintln!("vacuum: `{t}` is not in TABLES");
+                return 2;
+            }
+            vec![t]
+        }
+        None => config.tables.clone(),
+    };
+
+    if cli.vacuum_apply {
+        tracing::warn!(
+            retention_hours = cli.vacuum_retention_hours,
+            full = cli.vacuum_full,
+            "vacuum: APPLY mode — deletions are irreversible and time travel before the retention \
+             window will be lost"
+        );
+    } else {
+        tracing::info!("vacuum: DRY RUN — reporting only; pass --vacuum-apply to delete");
+    }
+
+    let mut total_files = 0usize;
+    let mut total_bytes = 0u64;
+    let mut failed = 0u32;
+    for t in &tables {
+        match writer
+            .vacuum(
+                t,
+                cli.vacuum_retention_hours,
+                cli.vacuum_full,
+                cli.vacuum_apply,
+                cli.vacuum_force,
+            )
+            .await
+        {
+            Ok(r) => {
+                total_files += r.files;
+                total_bytes += r.bytes;
+                // §10.7: a zero byte total with a non-zero file count means the deletion could
+                // NOT be priced, not that there is nothing to reclaim. Say so — rendering it as
+                // "0.00 GB" is the same trap as a swallowed error surfacing as a plausible number.
+                let size = if r.files > 0 && r.bytes == 0 {
+                    "  (unpriced)".to_string()
+                } else {
+                    format!("{:>10.2} GB", r.bytes as f64 / 1_073_741_824.0)
+                };
+                println!(
+                    "{:<32} {:>7} files {}  retention={}h mode={} {}",
+                    t,
+                    r.files,
+                    size,
+                    r.retention_hours,
+                    if r.full { "full" } else { "lite" },
+                    if r.dry_run { "(dry run)" } else { "DELETED" },
+                );
+            }
+            Err(e) => {
+                eprintln!("vacuum {t}: {e:#}");
+                failed += 1;
+            }
+        }
+    }
+    println!(
+        "vacuum {}: {} file(s), {:.2} GB priced across {} table(s){}",
+        if cli.vacuum_apply { "applied" } else { "dry run" },
+        total_files,
+        total_bytes as f64 / 1_073_741_824.0,
+        tables.len(),
+        if failed > 0 { format!(", {failed} FAILED") } else { String::new() },
+    );
+    if failed > 0 { 1 } else { 0 }
+}
+
 async fn run_verify(
     config: &config::Config,
     local_dir: Option<&std::path::Path>,
@@ -369,7 +467,13 @@ async fn async_main() {
         }
     }
 
-    if let Some(ref verify) = cli.verify {
+    // §10.7: --vacuum runs before --verify so `--vacuum --verify` cannot mean both.
+    if let Some(table) = cli.vacuum.clone() {
+        let code = run_vacuum(&config, local_dir.as_deref(), table, &cli).await;
+        std::process::exit(code);
+    }
+
+if let Some(ref verify) = cli.verify {
         let verify_tables = match resolve_verify_tables(&config.tables, verify.as_deref()) {
             Ok(tables) => tables,
             Err(e) => {

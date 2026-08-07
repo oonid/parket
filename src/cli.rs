@@ -53,6 +53,41 @@ pub struct Cli {
         help = "After a successful sync, reconcile the synced tables against the source DB; a discrepancy makes the process exit non-zero"
     )]
     pub verify_after: bool,
+
+    // §10.7: reclaim superseded/orphaned parquet. Mirrors --verify's shape (all tables, or one).
+    #[arg(
+        long,
+        value_name = "TABLE",
+        num_args = 0..=1,
+        help = "Reclaim superseded/orphaned parquet for all configured tables, or one named table, then exit. DRY RUN unless --vacuum-apply"
+    )]
+    pub vacuum: Option<Option<String>>,
+
+    #[arg(
+        long,
+        help = "With --vacuum, actually delete. Without it --vacuum only reports what WOULD be removed"
+    )]
+    pub vacuum_apply: bool,
+
+    #[arg(
+        long,
+        value_name = "HOURS",
+        default_value_t = 168,
+        help = "With --vacuum, retention window in hours (default 168 = 7 days, the PS-M3 cadence)"
+    )]
+    pub vacuum_retention_hours: u64,
+
+    #[arg(
+        long,
+        help = "With --vacuum, use VacuumMode::Full so parquet that no commit ever referenced (orphans from aborted runs) is reclaimed too; delta-rs defaults to Lite, which skips those"
+    )]
+    pub vacuum_full: bool,
+
+    #[arg(
+        long,
+        help = "With --vacuum, permit --vacuum-retention-hours below 168; required because a short retention can delete files in-flight readers still need"
+    )]
+    pub vacuum_force: bool,
 }
 
 #[cfg(test)]
