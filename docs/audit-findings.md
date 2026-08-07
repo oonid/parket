@@ -909,10 +909,50 @@ alongside the update cursor, or label the column so `hwm_last_id` cannot be mist
 2. **True orphans** — parquet written by the three aborted runs that never reached a commit, so no
    `remove` action references them either.
 
-This is the concrete cost case for the **PS-M3 vacuum work** (already open, previously unquantified).
-Note the interaction with §10.1: the amplification does not only cost time and egress, it also
-multiplies stored bytes by the chunk count until a VACUUM runs. A retention-window VACUUM is the fix;
-until then storage grows monotonically with every two-stream update run.
+**Correction (2026-08-07):** an earlier revision of this item called PS-M3 "already open". It is
+**done** — §8.3 records the one-time reclaim executed 2026-07-18 *and* the ongoing cadence (monthly
+`VACUUM … RETAIN 168 HOURS`, safe because L7's 64-commit lookback survives the no-HWM commits VACUUM
+adds, proven in production). No new procedure is needed here; what was missing is **when** the
+current bloat becomes eligible, and **which vacuum mode** reclaims it.
+
+### Age breakdown and the eligibility date
+
+`developer_journey_trackings` parquet, measured 2026-08-07 (831 files, ~76 GB; live snapshot = 36
+files ≈ 2.4 GB):
+
+| date | files | size | eligible under `RETAIN 168 HOURS` |
+|---|---|---|---|
+| 2026-07-18 | 25 | 2.1 GB | **yes** |
+| 2026-08-05 | 81 | 7.4 GB | 2026-08-12 |
+| **2026-08-06** | **687** | **63.6 GB** | **2026-08-13** |
+| 2026-08-07 | 38 | 3.4 GB | ~36 are the LIVE snapshot |
+
+So a standard VACUUM **today reclaims ~2.1 GB of ~76 GB (3 %)** — precisely what PS-M3 hit on
+2026-07-18 ("a standard 168h VACUUM reclaimed 0 that day, tombstones <7d"). **Run the cadence on or
+after 2026-08-13**, when the 63.6 GB crosses the boundary; running it sooner wastes the trip.
+
+**Do NOT force `retention_hours=0` to reclaim it early.** PS-M3's retention=0 was justified by a
+specific verified-superseded snapshot. The opposite applies now: v0.2.4 ships a NEW write path
+(§10.1's overwrite), and older table versions are exactly the recovery mechanism if it misbehaves.
+Destroying time travel the day before validating new write code is backwards.
+
+### `VacuumMode::Lite` will NOT reclaim all of it
+
+`deltalake-core`'s default is `VacuumMode::Lite`, which removes only files carrying a `remove`
+action. The bloat here has two sources and only one qualifies:
+
+* **superseded** files from §10.1's 839 DELETE chunks — have `remove` actions ⇒ Lite reclaims them;
+* **true orphans** from the three aborted runs plus aborted staged-overwrite parquet (FA11) — were
+  never committed, so nothing references OR removes them ⇒ **Lite skips them; `VacuumMode::Full`
+  is required**, since it scans storage for files no longer named by any `add` action.
+
+Any tooling built for this must therefore choose Full deliberately (see §10.7).
+
+### The root cause is fixed; this is cleanup of historical damage
+
+687 files in a single day is §10.1's amplification measured in bytes rather than hours — the same
+defect. With `fb5c4eb` a two-stream update run adds ~2.4 GB (one rewrite) instead of ~64 GB (839).
+So: ship the fix, then reclaim once. Note the validation run itself adds ~2.4 GB.
 
 ### 10.6 Post-incident verification — NO DATA LOSS (evidence, 2026-08-06)
 
@@ -996,3 +1036,42 @@ for `users` and `completions` there is strong *count* evidence and **no** *conte
 re-running cannot change that. A true PASS would require a quiescent source, or verifying against a
 snapshot captured at the same instant as the sync. Structural limitation of verifying full_refresh
 against a live DB, not a defect in either.
+
+### 10.7 Proposed — parket has no `--vacuum`, and this is now a recurring chore
+
+PS-M3's reclaim was done with **`deltalake` Python** because parket has no vacuum command
+(`grep -ri vacuum src/` finds only log strings and comments). That is now the awkward part of a
+*monthly* cadence: it needs a second toolchain, credentials duplicated outside parket's config, and
+a hand-written script whose retention/mode flags are exactly the dangerous ones. `deltalake` Python
+is not even installed on the current operator host.
+
+**Proposal: `parket --vacuum [<TABLE>]`**, mirroring `--verify [<TABLE>]`'s shape (all configured
+tables, or one named table).
+
+| flag | default | rationale |
+|---|---|---|
+| `--vacuum [<TABLE>]` | — | one table or all; reuses the existing config + S3 storage options |
+| *(dry run)* | **ON** | deletion is irreversible. Report files/bytes and exit 0 without deleting unless `--vacuum-apply` is passed. An ETL binary must not delete data as the default reading of a new flag. |
+| `--vacuum-apply` | off | actually delete |
+| `--vacuum-retention-hours <N>` | `168` | matches the PS-M3 cadence |
+| `--vacuum-full` | off | select `VacuumMode::Full`; without it, Lite leaves true orphans behind (above) |
+| `--vacuum-force` | off | REQUIRED to accept `retention-hours < 168`, i.e. to set
+  `with_enforce_retention_duration(false)`. Keeps "retention=0" from being a typo away. |
+
+Report: files considered, files deleted, bytes reclaimed, footprint before/after — PS-M3's write-up
+had to state these by hand ("71 dead files … 3.7 GB→2.06 GB, 25 live parquet"), which is exactly the
+output a command should produce itself.
+
+Notes for the implementer:
+* delta-rs API is `table.vacuum()` → `VacuumBuilder` with `with_retention_period(Duration)`,
+  `with_mode(VacuumMode::{Lite,Full})`, `with_dry_run(bool)`,
+  `with_enforce_retention_duration(bool)`, `with_keep_versions(&[Version])`. `VacuumMetrics` returns
+  `dry_run` and `files_deleted: Vec<String>` — byte totals must be summed separately from the file
+  listing.
+* VACUUM appends two no-HWM commits (START/END). That is **safe** — L7's 64-commit lookback recovers
+  the watermark past them and PS-M3 proved it in production (`skipped_commits=2`, exit 0) — but a
+  regression test should pin it, because the failure mode is a silent HWM reset (H-2026-07-11-1).
+* It must refuse to run while a sync/overwrite session is in progress for the same table
+  (single-writer assumption).
+* `with_keep_versions` is worth exposing later if time-travel windows are ever needed; not needed
+  for the monthly cadence.
