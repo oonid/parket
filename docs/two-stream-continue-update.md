@@ -14,8 +14,15 @@
 > performs **one full-table rewrite per 1024 update keys**, not one target scan per run as §3
 > originally claimed. On a 115 M-row table over remote object storage an 858 k-key window projects to
 > **≈ 56 h / ≈ 2 TB egress** (839 chunks); on local disk the same window is ≈ 74 min. See the
-> correction in §3 and audit-findings §10.1. Nothing here about MERGE's memory behaviour changes —
-> that analysis was verified and is why DELETE+APPEND is still the default on small hosts.
+> correction in §3 and audit-findings §10.1.
+>
+> **AMENDED AGAIN 2026-08-07 — the memory conclusion is now scoped.** "Cannot be memory-bounded" and
+> the ~6–7 GB floor hold for a **fresh bootstrap**. A measured **continue-update** (115.2 M-row
+> table, 26 k-row window, `MERGE_MEMORY_MB=2048`, `PARTITIONS=1`) peaked at **1.757 GB** under a hard
+> 8 GiB cap with `swap.max=0` — memory tracked the WINDOW, not the target. DELETE+APPEND remains the
+> default (it needs no tuning and is bounded by construction), but `UPDATE_STRATEGY=merge` is no
+> longer disqualified on memory for routine windows. Large windows remain unmeasured. See the §2.1
+> correction.
 
 Generic `orders` table throughout: integer PK `id`, nullable `completed_at` (update cursor),
 ordinary columns. Numbers are from the real 112M-row table the design was validated on.
@@ -37,6 +44,33 @@ performs that upsert**, and why the obvious choice (delta-rs MERGE) doesn't scal
 `deltalake-core-0.32.4/src/operations/merge/mod.rs:1020`). A full outer join forces datafusion to
 **materialize a side** and flow **every** target row through (matched→updated, unmatched→kept),
 then rewrite touched files. So memory scales with the **whole target**, not the change set.
+
+> ### ⚠ CORRECTION (2026-08-07): measured, and it scales with the SOURCE
+>
+> A continue-update MERGE was run under a hard 8 GiB cgroup cap (`MemoryMax=8G`, `MemorySwapMax=0`)
+> against the real **115.2 M-row** table with a **26,171-row** window, using this document's own
+> best config (`MERGE_MEMORY_MB=2048`, `MERGE_TARGET_PARTITIONS=1`):
+>
+> ```
+> cgroup peak : 1.757 GB of 8.000 GB   (22 % of cap)
+> peak VmHWM  : 1.824 GB
+> peak VmSwap : 0.000 GB               <- swap.max=0, so this is a genuine pass
+> ```
+>
+> 1.76 GB on a table **larger** than the 112 M used below, where §2.3 records 6,908 MB. The claim
+> above is therefore wrong for the continue-update case: `FULL OUTER JOIN` materialises the
+> **smaller** side — the source/change set — while the target *streams*. Memory tracks the WINDOW.
+>
+> Two independent observations support that model. §2.3's rows are a **fresh bootstrap** (its own
+> heading says so), where the insert stream appends all 112 M rows — a different workload from the
+> continue-update this document is about. And *time* behaves oppositely to memory: this 26 k-row
+> merge took **8.8 min** while an 858 k-row merge on the same table took **8.7 min** — near
+> identical, because both rewrite the whole target. So **time is target-bound and
+> window-independent; memory is source-bound and window-dependent.**
+>
+> **Still unmeasured:** a large window. If memory tracks the source, an 858 k-row window is ~33×
+> more source rows and could be several GB. Merging after an extended outage is therefore the
+> remaining risk case — see audit-findings §10.1.
 
 - Unbounded (default `SessionContext::new()`): **21–25 GB** on the 112M-row table → OOM on any
   small VM. Lowering `TARGET_MEMORY_MB` does nothing (it bounds the extract chunk, not the join).
@@ -67,7 +101,13 @@ pool never sees pressure → never spills → RSS grows → the **OS swaps**, th
 **The spill machinery only bounds the `SortExec`; a MERGE is join-stream + output-rewrite bound,
 not sort-bound. Memory tuning is exhausted.**
 
-### 2.3 Empirical sizing runs (112M-row `orders`, fresh bootstrap, `TARGET_MEMORY_MB=512`)
+### 2.3 Empirical sizing runs — FRESH BOOTSTRAP only (112M-row `orders`, `TARGET_MEMORY_MB=512`)
+
+> **Scope warning.** Every row below is a **fresh bootstrap**, not the continue-update this document
+> is about. They are the right numbers for sizing a bootstrap and the wrong ones for sizing a
+> steady-state run — a measured continue-update came in at **1.757 GB** (§2.1 correction, and the
+> continue-update row appended to the table below).
+
 Top block = default multi-partition (~14 sorters); bottom = `MERGE_TARGET_PARTITIONS=1`.
 
 | VM cap | `MERGE_MEMORY_MB` | Enforced? | Peak RSS | Peak swap | Spill | Result |
@@ -80,6 +120,8 @@ Top block = default multi-partition (~14 sorters); bottom = `MERGE_TARGET_PARTIT
 | `sudo` 7500M | 4096 + `PARTITIONS=1` | **yes** | 7446 MB | **4088 MB** | ~0 | ✅ completed — streamed in-RAM, over-buffered → 4 GB swap |
 | `sudo` 7500M | 2048 + `PARTITIONS=1` | **yes** | **6908 MB** | **0** | ~0 | ✅ completed clean — merge 47 s (best MERGE config) |
 | `sudo` 7500M | 2048 + `PARTITIONS=2` + `RES=2` | **yes** | 7551 MB | 3660 MB | (spilled) | ❌ OOM in the merge-of-runs |
+| **CONTINUE-UPDATE, 115.2M rows, 26k-row window (2026-08-07)** | | | | | | |
+| `sudo` **8G**, `swap.max=0` | 2048 + `PARTITIONS=1` | **yes** | **1757 MB** | **0** | ~0 | ✅ completed clean — merge **8.8 min**, 22 % of cap |
 
 Key lessons, in order of discovery:
 1. `MERGE_MEMORY_MB` (the `FairSpillPool`) is a **hard internal cap** independent of VM RAM — too
@@ -90,8 +132,13 @@ Key lessons, in order of discovery:
 3. At one partition the merge **streams** (≈ no spill); `MERGE_MEMORY_MB` is then an **in-memory
    buffering cap, not a spill trigger** — `4096` over-buffers into swap, `2048` fits at ~6.9 GB.
 4. **~6–7 GB working-set floor** for 112M rows, ~independent of the pool → a real 4 GB VM is
-   infeasible for the MERGE, and the floor **grows with the table**. Best MERGE config: **8 GB VM,
-   `MERGE_MEMORY_MB=2048`, `MERGE_TARGET_PARTITIONS=1`** (size the VM to peak RSS, not the pool).
+   infeasible for the MERGE. Best MERGE config: **8 GB VM, `MERGE_MEMORY_MB=2048`,
+   `MERGE_TARGET_PARTITIONS=1`** (size the VM to peak RSS, not the pool).
+   **Amended 2026-08-07:** this floor is a **BOOTSTRAP** figure. A continue-update on a larger
+   (115.2 M-row) table peaked at **1.757 GB** with the same config, so there is no 6–7 GB floor for
+   steady-state runs. The "floor **grows with the table**" note is likewise unsupported for
+   continue-update — memory tracked the 26 k-row window, not the 115 M-row target (§2.1 correction).
+   What does grow with the table is the merge's *runtime*, since it rewrites the whole target.
 5. **Runtime is DB-bound** (the `completed_at` filesort in MariaDB), not parket — `user+sys ≈ 0`.
 
 ### 2.4 Rejected: forcing a streaming/hash join

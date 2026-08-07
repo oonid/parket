@@ -18,9 +18,10 @@ worthwhile Lows FA6/FA7/FA8/FA9/FA10/FA12 and §5's L5/L6 (L2 found already-fixe
 > accurate through `v0.2.3`, but a production two-stream sync has since surfaced a **High** —
 > **§10.1, `delete_then_append` write amplification**: one full-table rewrite per 1024 update keys,
 > measured at ~56 h and ~2 TB of egress to apply an 840 k-row update window to a 115 M-row table.
-> It is a cost defect, not a correctness one. The workaround for a memory-constrained host is a
-> one-shot `TABLE_RECONCILE_<table>=true`; `UPDATE_STRATEGY=merge` also avoids it but is **NOT
-> recommended** until its peak RSS is measured on the 8–16 GB target (see §10.1).
+> It is a cost defect, not a correctness one, and is **FIXED** — see the §10.1 header. For the
+> record: `UPDATE_STRATEGY=merge` was measured on 2026-08-07 at **1.757 GB peak under an 8 GiB cap**
+> for a routine 26 k-row window, so the earlier "not recommended on memory grounds" gate is lifted
+> for routine syncs (large windows still unmeasured).
 
 Apart from §10, what remains open is
 exclusively **Low-tier / deferred residuals**, each documented below with rationale: FA11, FA4-r, V8-r,
@@ -789,21 +790,31 @@ satisfies both:
 **`TABLE_RECONCILE_<table>=true`**: single pass, bounded memory, correct on an 8 GB host. It costs a
 full re-extract of the source table, which is the price of staying inside the memory budget.
 
-`UPDATE_STRATEGY=merge` is **deliberately NOT recommended**, and must not be until the gap below is
-closed:
+`UPDATE_STRATEGY=merge` — **gap closed for routine windows, 2026-08-07:**
 
-> **UNVALIDATED at the target size.** The 17.8 min run above was on a **46.5 GB** workstation with a
-> 23.8 GB pool, and **peak RSS was never sampled** — that measurement was not taken and cannot be
-> reconstructed after the fact. §2.3's sizing puts the floor at ~6.9 GB peak RSS for **112 M** rows
-> under the best config (8 GB VM, `MERGE_MEMORY_MB=2048`, `MERGE_TARGET_PARTITIONS=1`), and
-> explicitly notes the floor **grows with the table**. The table is now **115.2 M** rows, i.e. past
-> the size that measurement covers, so the honest status is: *the 8 GB case is unproven and the
-> margin was already thin at a smaller size.*
+> **MEASURED and it passes comfortably.** The experiment prescribed here was run: MERGE path under a
+> hard cgroup cap (`sudo systemd-run --scope -p MemoryMax=8G -p MemorySwapMax=0`) against the real
+> **115.2 M-row** table with a **26,171-row** window, at §2.3's best config
+> (`MERGE_MEMORY_MB=2048`, `MERGE_TARGET_PARTITIONS=1`):
 >
-> **To close it:** run the MERGE path under a real memory cap
-> (`sudo systemd-run -p MemoryMax=8G` / `-p MemoryMax=16G`) against a genuine update window, sampling
-> `VmHWM`, and extend §2.3's table with a 115 M-row row. Until then treat `merge` as a
-> large-host-only escape hatch, not guidance.
+> ```
+> cgroup peak : 1.757 GB of 8.000 GB   (22 % of cap)
+> peak VmHWM  : 1.824 GB
+> peak VmSwap : 0.000 GB               <- swap.max=0, so not a swap-assisted "pass"
+> merge write : 8.8 min                completed, succeeded=1 failed=0
+> ```
+>
+> That is **4× below** §2.3's 6,908 MB on a **larger** table, and it overturned the model rather than
+> confirming it: §2.3's rows are a **fresh bootstrap** while `FULL OUTER JOIN` materialises the
+> *smaller* side, so continue-update memory tracks the **window**, not the target. Corroborated by
+> timing — this 26 k merge took 8.8 min against 8.7 min for an 858 k merge, i.e. **time is
+> target-bound, memory is source-bound**. The two documents have been corrected (§2.1, §2.3).
+>
+> **Still NOT established: large windows.** 26 k rows is a routine daily window. An 858 k window
+> (the post-outage case) is ~33× more source rows and, under the source-bound model, could cost
+> several GB. Measuring it needs a deliberately widened window. Until then `merge` is supportable
+> for routine syncs and unproven for recovery-after-outage — which is the case
+> `TABLE_RECONCILE_<table>=true` and the §10.1 overwrite path already cover.
 
 `delete_then_append` remains correct and bounded — just do not point it at remote object storage
 with a large update window.
