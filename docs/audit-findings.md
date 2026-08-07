@@ -1,8 +1,10 @@
 # Audit findings register (living document)
 
-**Release v0.2.4 (2026-08-07):** §10.1 fixed — large two-stream update windows now apply as ONE
-atomic overwrite instead of `ceil(keys/1024)` full-table DELETEs (`fb5c4eb`), plus the §10.x findings
-and the corrected MERGE memory guidance. **Not yet validated at production scale** — see §10.1.
+**Release v0.2.5 (2026-08-07):** second attempt at §10.1. v0.2.4's overwrite path (`fb5c4eb`) FAILED
+on its first production run — a SQL `NOT IN` anti-join planned as a non-spilling null-aware HashJoin
+and exhausted the memory pool — and was **rolled back**. v0.2.5 (`0c0c270`) selects survivors with a
+Rust `HashSet` filter instead, removing the join. **§10.1 is REOPENED and v0.2.4 is a pre-release:
+neither is validated at production scale.** Read §10.1 before deploying either.
 
 **Status date:** 2026-08-07. This is the single source of truth for audit findings and remediation
 process — it consolidates `docs/audit-2026-07-04.md` and `docs/handoff-2026-07-06.md` (both retired;
@@ -635,19 +637,57 @@ misdiagnosed as a network failure (one host suspend, one transient connect stall
 at ~40 minutes each run had applied roughly **3%** of its update window. The network errors
 merely interrupted a run that could not have finished.
 
-### 10.1 ~~Open~~ **FIXED (`fb5c4eb`)** — High: one full-table rewrite per 1024 update keys
+### 10.1 REOPENED — High: one full-table rewrite per 1024 update keys
 
-> **Resolved 2026-08-06** by fix #2 below (anti-join + atomic overwrite), after fix #1 turned out to
-> be impossible through delta-rs. `delete_then_append` now routes windows above 8 projected chunks
-> (>8192 keys) to `delete_then_append_via_overwrite`: ONE table rewrite and ONE commit instead of
-> `ceil(keys/1024)` rewrites plus two commits, with memory still bounded (anti-join build side = the
-> small key set; survivors staged in 200k-row chunks). Smaller windows keep the chunked DELETE,
-> which is cheaper for them and unchanged. Gate: 665 lib tests, clippy clean, llvm-cov 92.59%.
+> **Attempt 1 (`fb5c4eb`, v0.2.4) FAILED IN PRODUCTION on its first real run. Rolled back to
+> v0.2.3.** Attempt 2 (`0c0c270`, v0.2.5) is committed but **NOT yet validated at scale**.
 >
-> **Still to validate at scale:** the fix is exercised only against local-filesystem tables in
-> tests. The projection is that one ~2.4 GB rewrite replaces 839; confirm against the real 115 M-row
-> table before trusting the numbers. §10.2 (SIGINT) should also be re-checked — the long writer-side
-> loop it was trapped behind no longer runs on this path.
+> **What happened.** Routing worked — a routine 9,412-key window logged
+> `projected_chunks=10 → using one atomic overwrite` — then:
+>
+> ```
+> abort_overwrite: staged-overwrite session released without committing
+> ERROR table failed  cause=reading an anti-join batch
+> cause=Resources exhausted: Failed to allocate additional 3.5 MB for HashJoinInput with
+>       2044.6 MB already allocated for this reservation - 3.4 MB remain available
+> ```
+>
+> **Why the design claim was wrong.** `fb5c4eb` asserted "the BUILD side is the small key set while
+> the huge target STREAMS, and that is what makes it a valid replacement rather than a second
+> `merge_batch`". False. `NOT IN (SELECT …)` carries three-valued-logic semantics, so datafusion plans
+> a **null-aware** LeftAnti join; `null_aware` is **HashJoin-only**
+> (`datafusion-physical-plan …/hash_join/exec.rs:407`) and HashJoin does **not** spill (§2.2 of
+> `two-stream-continue-update.md` already tabulated that). It hash-built the 115 M-row TARGET.
+> `prefer_hash_join=false` — which `build_bounded_session` already sets — cannot help, because the
+> null-aware variant has no SortMergeJoin implementation. Plain LeftAnti *is* supported by
+> SortMergeJoin, so `NOT EXISTS` would dodge null-awareness, but it would then SORT the whole target.
+>
+> **It was POOL-bound, not host-bound.** It died on `MERGE_MEMORY_MB=2048` with cgroup RSS at 1.02 GB
+> of an 8 GB cap ⇒ it fails identically on a 46 GB machine. The validation was framed around the
+> wrong variable.
+>
+> **Blast radius: none.** `abort_overwrite` released the session cleanly, so nothing partial was
+> committed; the commit that did land (87→88) was the independent INSERT stream; the census afterwards
+> was clean (115,282,620 `count == distinct`); the update HWM never advanced, so the window is intact
+> and retryable. Staged parquet was orphaned, adding to §10.5's VACUUM pile.
+>
+> **Why the tests missed it, and what that cost.** The fixture is 12,000 rows, where any hash build
+> fits — the same defect this very finding documents about the chunking ("at test scale a full-table
+> rewrite is microseconds, so the amplification is invisible"), reproduced in the fix for it. A
+> fixture-scale test CANNOT catch this class, which is why `0c0c270` pins the **structure**
+> (`survivor_scan_sql_is_join_free`) rather than pretending a behavioural test would help. A
+> pool-independence test was attempted and discarded: a 4 MB pool fails on the dedup sort's fixed
+> 10 MB reservation before reaching survivor selection, and making it decisive needs ~1.8 M rows.
+>
+> **Attempt 2 (`0c0c270`).** Drops the join entirely: survivors are selected by a Rust `HashSet`
+> lookup while the target streams (cast key→Int64 with `safe:false` to keep the UInt64 overflow guard,
+> `BooleanArray` mask, `filter_record_batch`). Memory = keyset (~7 MB at the largest observed window)
+> + `STAGE_ROWS` buffer, both independent of target size. NULL keys are kept, matching the chunked
+> path's `NULL IN (…)` → `is_not_true()` rescue.
+>
+> **DO NOT mark this fixed until a real run succeeds** at >8,192 keys against the 115 M-row table.
+> Attempt 1's memory claim was also argued from structure and was refuted by production; attempt 2's
+> is a better argument, not evidence.
 
 The original finding follows.
 
