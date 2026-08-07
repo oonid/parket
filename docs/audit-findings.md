@@ -1,11 +1,20 @@
 # Audit findings register (living document)
 
-**Release v0.2.6 (2026-08-07):** §10.1 **FIXED and validated at production scale** by v0.2.5
-(`0c0c270`) — a 12,715-key window applied as ONE atomic overwrite in 14.4 min at **0.210 GB peak**
-(vs ~52.6 min for the chunked path, and vs attempt 1 dying at 2,044.6 MB). v0.2.6 fixes the one
-caveat that validation exposed: `STAGE_ROWS` 200k→5M, because flushing per staged chunk produced
-**564 output files** where MERGE produces ~36. v0.2.4 is a **pre-release** — its overwrite path
-failed in production; do not deploy it.
+**Release v0.2.6 (2026-08-07)** — four findings, superseding the notes on the `0597d8a` release
+commit, which described a `STAGE_ROWS` change that a later commit replaced:
+
+* **§10.1 FIXED and validated at production scale.** A 12,715-key window applied as ONE atomic
+  overwrite in 14.4 min at **0.210 GB peak** (vs ~52.6 min for the chunked path; attempt 1, v0.2.4,
+  died at 2,044.6 MB). Survivors are selected by a Rust `HashSet` filter, not a SQL anti-join.
+* **§10.1-r3** — staged chunks are bounded in **BYTES** (`with_stage_bytes`, default 256 MB,
+  measured with `get_array_memory_size`), replacing the row count. A row count cannot bound memory
+  across schemas, and the interim `STAGE_ROWS = 5_000_000` was an unmeasured 25× guess. Also pins the
+  **858 000-key** axis in the unit suite, so the post-outage window is no longer unvalidated.
+* **§10.2 FIXED** — the writer honours shutdown inside its long loops; `SIGINT` no longer needs to
+  become `SIGTERM`.
+* **§10.4 FIXED** — `--check` shows the two-stream INSERT watermark and labels the pagination cursor.
+
+v0.2.4 is a **pre-release**: its overwrite path failed in production. v0.2.5 was never tagged.
 
 **Status date:** 2026-08-07. This is the single source of truth for audit findings and remediation
 process — it consolidates `docs/audit-2026-07-04.md` and `docs/handoff-2026-07-06.md` (both retired;
