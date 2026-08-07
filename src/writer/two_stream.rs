@@ -248,9 +248,29 @@ impl DeltaWriter {
         use std::sync::Arc;
 
         const TARGET_TABLE: &str = "__parket_overwrite_target";
-        /// Rows buffered before staging a parquet chunk. Bounds peak memory independently of how
-        /// large the surviving set is; the staged chunks are what the final commit references.
-        const STAGE_ROWS: usize = 200_000;
+        /// Rows buffered before staging a parquet chunk.
+        ///
+        /// This bounds peak memory independently of the surviving set's size — but it ALSO decides
+        /// the output file count, because `stage_overwrite_chunk` calls `writer.flush()` on every
+        /// invocation, so one staged chunk is (at least) one parquet file.
+        ///
+        /// §10.1-r2: the first value here was 200_000, chosen purely for the memory bound. Validated
+        /// in production it produced **564 files** for a 115 M-row table where the MERGE path
+        /// produces ~36 — averaging ~4 MB each. Same mistake as the original
+        /// `DELETE_KEYS_PER_CHUNK = 1024`: an input-side limit tuned in isolation, multiplying an
+        /// output-side cost.
+        ///
+        /// The read penalty is real but selective, and worth stating precisely: a Delta key census
+        /// (bounded session, `MERGE_TARGET_PARTITIONS=1`) went from a reliable ~5 min to over 10,
+        /// while the `course_progress` rollup — same table, but `target_partitions=14` — was
+        /// unaffected (93 s, versus 104 s before the file count tripled). So many small files hurt
+        /// SINGLE-PARTITION scans, which is exactly the shape every memory-bounded path here uses.
+        ///
+        /// 5 M rows keeps the chunk count near the file count Delta actually wants
+        /// (115 M / 5 M ≈ 23 files, vs ~36 from MERGE) and is still trivially bounded: the whole
+        /// validated run peaked at **0.21 GB**, and ~5 M rows of this schema buffers on the order of
+        /// a few hundred MB against an 8 GB budget. Memory was never the scarce resource here.
+        const STAGE_ROWS: usize = 5_000_000;
 
         let key_count = ids.len();
         let table = self.open_table(table_name).await?;
