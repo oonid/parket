@@ -55,6 +55,24 @@ fn strip_view_types(schema: &deltalake::arrow::datatypes::Schema) -> deltalake::
     deltalake::arrow::datatypes::Schema::new(fields)
 }
 
+/// The scan the overwrite path selects survivors from: a bare projected read of the target, with
+/// **no** join, subquery or filter. Survivor selection happens in Rust (see
+/// `stage_surviving_rows_and_new_versions`).
+///
+/// Extracted so `survivor_scan_sql_is_join_free` can pin that. §10.1-r: the first implementation put
+/// `WHERE key NOT IN (SELECT ...)` here, which datafusion plans as a null-aware LeftAnti HashJoin —
+/// HashJoin-only and non-spilling — so it hash-built the 115M-row target and exhausted the pool in
+/// production. Any future edit that reintroduces a join here must fail a test, not a sync.
+fn survivor_scan_sql(target_table: &str, target_schema: &deltalake::arrow::datatypes::Schema) -> String {
+    let col_list = target_schema
+        .fields()
+        .iter()
+        .map(|f| backtick(f.name()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("SELECT {col_list} FROM {target_table}")
+}
+
 /// Arguments for `delete_then_append_via_overwrite` (§10.1). Grouped into a struct purely to keep
 /// the call under clippy's argument-count limit; every field is what the chunked path already had.
 struct OverwriteUpsert<'a> {
@@ -227,11 +245,9 @@ impl DeltaWriter {
         ctx: &SessionContext,
     ) -> Result<()> {
         let OverwriteUpsert { table_name, deduped_batches, key_col, ids, insert_id, update_hwm } = args;
-        use deltalake::arrow::datatypes::{Field, Schema};
         use std::sync::Arc;
 
         const TARGET_TABLE: &str = "__parket_overwrite_target";
-        const KEYS_TABLE: &str = "__parket_overwrite_keys";
         /// Rows buffered before staging a parquet chunk. Bounds peak memory independently of how
         /// large the surviving set is; the staged chunks are what the final commit references.
         const STAGE_ROWS: usize = 200_000;
@@ -244,31 +260,28 @@ impl DeltaWriter {
         let target_schema = Arc::new(strip_view_types(&provider_schema));
         ctx.register_table(TARGET_TABLE, provider)?;
 
-        let key_schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-        let key_batch = RecordBatch::try_new(key_schema.clone(), vec![Arc::new(Int64Array::from(ids))])
-            .context("building the overwrite key batch")?;
-        ctx.register_table(
-            KEYS_TABLE,
-            Arc::new(
-                MemTable::try_new(key_schema, vec![vec![key_batch]])
-                    .context("registering the overwrite key table")?,
-            ),
-        )?;
+        // §10.1-r: the survivors are selected by filtering the target scan IN RUST against a key
+        // HashSet — deliberately NOT with a SQL anti-join.
+        //
+        // The first implementation used `WHERE key NOT IN (SELECT k FROM keys)` on the belief that
+        // it would decorrelate to a LeftAnti join with the small key set on the build side. That was
+        // WRONG and it failed in production: `NOT IN` carries three-valued-logic semantics, so
+        // datafusion plans a **null-aware** LeftAnti join, null_aware is HashJoin-only
+        // (`hash_join/exec.rs:407`), and HashJoin does not spill — so it hash-built against the
+        // 115M-row TARGET and blew the pool at 2044.6 MB of 2048 MB
+        // (`Resources exhausted: ... for HashJoinInput`). Note that is POOL-bound, not host-bound:
+        // it fails the same way on a 46 GB host, and `prefer_hash_join=false` cannot help because
+        // the null-aware variant has no SortMergeJoin implementation. `NOT EXISTS` would dodge
+        // null-awareness but SortMergeJoin would then SORT the whole target — still worse than not
+        // joining at all.
+        //
+        // Filtering in Rust removes the join entirely: `ids` is already in memory, so a HashSet is
+        // the only extra allocation (858k i64 ≈ 7 MB even for the largest observed window) and the
+        // target streams batch-by-batch with nothing accumulating. No pool pressure, no sort.
+        let keyset: std::collections::HashSet<i64> = ids.into_iter().collect();
 
-        // Project the target's own columns explicitly so the staged batches match the schema
-        // `begin_overwrite` was given. `NOT IN` decorrelates to a LeftAnti join; the key column is
-        // cast to Int64 to match the key table, mirroring the chunked path's predicate cast.
-        let col_list = target_schema
-            .fields()
-            .iter()
-            .map(|f| backtick(f.name()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT {col_list} FROM {TARGET_TABLE} \
-             WHERE CAST({key} AS BIGINT) NOT IN (SELECT k FROM {KEYS_TABLE})",
-            key = backtick(key_col)
-        );
+        // A plain projected scan — no WHERE, no join, so nothing here buffers.
+        let sql = survivor_scan_sql(TARGET_TABLE, &target_schema);
 
         let new_rows: usize = deduped_batches.iter().map(|b| b.num_rows()).sum();
         self.begin_overwrite(table_name, target_schema).await?;
@@ -276,7 +289,9 @@ impl DeltaWriter {
         // Any failure after begin_overwrite must drain the session, or the next call for this
         // table fails with "no overwrite session in progress"/"already in progress" (FA11).
         let staged = self
-            .stage_anti_join_and_new_versions(table_name, ctx, &sql, deduped_batches, STAGE_ROWS)
+            .stage_surviving_rows_and_new_versions(
+                table_name, ctx, &sql, key_col, &keyset, deduped_batches, STAGE_ROWS,
+            )
             .await;
         let survivors = match staged {
             Ok(n) => n,
@@ -301,34 +316,70 @@ impl DeltaWriter {
         Ok(())
     }
 
-    /// Stream the anti-join survivors into staged parquet chunks, then stage the new versions.
-    /// Split out so the caller can `abort_overwrite` on any error without duplicating cleanup.
-    async fn stage_anti_join_and_new_versions(
+    /// Stream the target, keep rows whose key is NOT in `keyset`, stage them, then stage the new
+    /// versions. Split out so the caller can `abort_overwrite` on any error without duplicating
+    /// cleanup. Returns the number of surviving rows.
+    ///
+    /// §10.1-r: the survivor test is a Rust `HashSet` lookup, not a SQL join — see the call site for
+    /// why the SQL anti-join was unbounded. Memory here is the keyset plus at most `stage_rows`
+    /// buffered rows, both independent of the target's size.
+    #[allow(clippy::too_many_arguments)]
+    async fn stage_surviving_rows_and_new_versions(
         &self,
         table_name: &str,
         ctx: &SessionContext,
         sql: &str,
+        key_col: &str,
+        keyset: &std::collections::HashSet<i64>,
         deduped_batches: Vec<RecordBatch>,
         stage_rows: usize,
     ) -> Result<usize> {
+        use deltalake::arrow::array::BooleanArray;
+        use deltalake::arrow::compute::{CastOptions, cast_with_options, filter_record_batch};
         use futures::StreamExt;
 
         let mut stream = ctx
             .sql(sql)
             .await
-            .context("planning the overwrite anti-join")?
+            .context("planning the overwrite target scan")?
             .execute_stream()
             .await
-            .context("executing the overwrite anti-join")?;
+            .context("executing the overwrite target scan")?;
+
+        // safe:false so a UInt64 key above i64::MAX errors instead of wrapping, matching the
+        // overflow guard the chunked path applies when collecting `ids`.
+        let cast_opts = CastOptions { safe: false, ..Default::default() };
 
         let mut survivors = 0usize;
         let mut buffered = 0usize;
         let mut buf: Vec<RecordBatch> = Vec::new();
         while let Some(batch) = stream.next().await {
-            let batch = batch.context("reading an anti-join batch")?;
-            survivors += batch.num_rows();
-            buffered += batch.num_rows();
-            buf.push(batch);
+            let batch = batch.context("reading a target batch")?;
+            let idx = batch
+                .schema()
+                .index_of(key_col)
+                .with_context(|| format!("key column `{key_col}` missing from the target scan"))?;
+            let keys = cast_with_options(batch.column(idx), &DataType::Int64, &cast_opts)
+                .with_context(|| format!("casting key column `{key_col}` to Int64"))?;
+            let keys = keys
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("cast to Int64 yields Int64Array");
+
+            // Keep a row when its key is NOT among the incoming keys. A NULL key is kept: it cannot
+            // be one of the incoming keys, and this matches the chunked path, where
+            // `NULL IN (...)` evaluates to NULL and the rescue filter (`predicate.is_not_true()`)
+            // therefore retains the row.
+            let mask: BooleanArray = (0..keys.len())
+                .map(|i| Some(keys.is_null(i) || !keyset.contains(&keys.value(i))))
+                .collect();
+            let kept = filter_record_batch(&batch, &mask).context("filtering surviving rows")?;
+
+            if kept.num_rows() > 0 {
+                survivors += kept.num_rows();
+                buffered += kept.num_rows();
+                buf.push(kept);
+            }
             if buffered >= stage_rows {
                 self.stage_overwrite_chunk(table_name, std::mem::take(&mut buf)).await?;
                 buffered = 0;
@@ -341,6 +392,7 @@ impl DeltaWriter {
         self.stage_overwrite_chunk(table_name, deduped_batches).await?;
         Ok(survivors)
     }
+
 
     fn build_bounded_session(&self, table_name: &str) -> Result<SessionContext> {
         let pool_bytes = (self.merge_memory_mb as usize) * 1024 * 1024;
@@ -1983,7 +2035,34 @@ mod tests {
         assert_eq!(insert_hwm, Some(3));
     }
 
-    #[tokio::test]
+        /// §10.1-r regression pin: the overwrite path's survivor scan must stay JOIN-FREE.
+    ///
+    /// The production failure was not a logic bug — the SQL was correct — it was that
+    /// `NOT IN (SELECT ...)` plans as a null-aware LeftAnti HashJoin, which cannot spill and so
+    /// hash-built a 115M-row target into a 2 GB pool. No fixture-sized test can reproduce that
+    /// (12k or even 400k rows fit any pool), so pin the STRUCTURE instead: survivor selection must
+    /// not be expressed as a join/subquery at all.
+    #[test]
+    fn survivor_scan_sql_is_join_free() {
+        let schema = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("Mixed Case", DataType::Utf8, true),
+        ]);
+        let sql = survivor_scan_sql("tgt", &schema).to_uppercase();
+
+        for forbidden in ["JOIN", "NOT IN", "EXISTS", "WHERE", "SELECT K FROM"] {
+            assert!(
+                !sql.contains(forbidden),
+                "survivor scan must be a bare projected read; found `{forbidden}` in: {sql}"
+            );
+        }
+        // And it must still project the real columns, quoted (FA5 mixed-case safety).
+        let raw = survivor_scan_sql("tgt", &schema);
+        assert!(raw.contains("`id`"), "got {raw}");
+        assert!(raw.contains("`Mixed Case`"), "mixed-case column must be backtick-quoted: {raw}");
+    }
+
+#[tokio::test]
     async fn delete_then_append_empty_batch_noop() {
         let temp = tempfile::tempdir().unwrap();
         let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
