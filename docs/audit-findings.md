@@ -926,29 +926,30 @@ never referenced by the log (orphans, not corruption), and a Delta-side key cens
 the update stream's HWM only advances on a successful commit, and `delete_then_append` is
 idempotent. Orphaned parquet accumulates and is not reclaimed by anything short of VACUUM.
 
-### 10.4 Open — Low: `--check` preflight hides the two-stream INSERT watermark
+### 10.4 **FIXED** — Low: `--check` preflight hid the two-stream INSERT watermark
 
-The preflight table prints `hwm_updated_at / hwm_last_id`. For a **two-stream** table those are both
-*update-stream* values, and `hwm_last_id` is the update window's keyset-pagination cursor — **not**
-the insert frontier. `hwm_insert_id`, the value an operator actually reasons about for a two-stream
-table, is not shown at all.
-
-Observed consequence (2026-08-06, during a post-incident recheck): preflight read
-`… 2026-07-18T17:17:23 / 500147844` before a sync and `… 2026-08-06T14:31:31 / 173218080` after it,
-which looks exactly like an insert watermark **regressing by 327 M** — the H-2026-07-11-1 failure
-shape. It had not. The commit carried all three keys correctly:
-
-```
-hwm_insert_id  = 502658778     <- advanced from 500147844, correct
-hwm_updated_at = 2026-08-06T14:31:31.000000
-hwm_last_id    = 173218080     <- update-window pagination cursor
-```
-
-`read_insert_hwm` reads `hwm_insert_id` and `read_hwm` reads `hwm_updated_at`/`hwm_last_id`, so the
-two streams resume from the right places and there is **no correctness bug**. The defect is purely
-that the diagnostic most likely to be run *during an incident* displays a number that resembles the
-insert watermark and can appear to move backwards. FIX: for two-stream tables print `hwm_insert_id`
-alongside the update cursor, or label the column so `hwm_last_id` cannot be mistaken for it.
+> **Fixed 2026-08-07.** Preflight printed `updated_at / last_id` for every mode. For a **two-stream**
+> table both are UPDATE-stream values, and `last_id` is the update window's keyset-pagination cursor,
+> not the insert frontier — while `hwm_insert_id`, the value an operator actually reasons about, was
+> not shown at all. Because the pagination cursor can legitimately move BACKWARDS between runs, the
+> output read as an insert watermark regressing by 327 M during a post-incident check, i.e. exactly
+> the H-2026-07-11-1 watermark-reset shape. Nothing was wrong: the commit carried
+> `hwm_insert_id=502658778` (correctly advanced), and `read_insert_hwm`/`read_hwm` consume separate
+> keys. The defect was that the diagnostic most likely to be run DURING an incident was the one that
+> misled.
+>
+> `PreflightHwm` gains `read_insert_hwm`, and two-stream rows now label every field. Verified against
+> production:
+>
+> ```
+> before:  two-stream: id + completed_at  2026-07-18T17:17:23.000000 / 500147844
+> after:   two-stream: id + completed_at  ins=502767312 upd=2026-08-07T15:26:53.000000 page=502767294
+> ```
+>
+> Incremental rows keep the original format, where `last_id` genuinely IS the keyset cursor. Unknowns
+> render as `—` so a missing value cannot be mistaken for a real one. `format_two_stream_hwm` is
+> extracted and pinned by `two_stream_hwm_display_labels_insert_and_pagination_cursors`, so an edit
+> that drops `ins=` fails a test rather than an incident.
 
 ### 10.5 Open — Medium: superseded parquet is never reclaimed (PS-M3, now quantified)
 

@@ -28,9 +28,33 @@ pub trait PreflightStorage: Send + Sync {
 pub trait PreflightHwm: Send + Sync {
     async fn read_hwm(&self, table: &str) -> Result<Option<crate::writer::Hwm>>;
 
+    /// §10.4: the two-stream INSERT watermark (`hwm_insert_id`), which `read_hwm` does not carry.
+    /// `read_hwm` returns the UPDATE-stream watermark — `updated_at` plus `last_id`, where
+    /// `last_id` is the update window's keyset-pagination cursor, NOT the insert frontier. Showing
+    /// only those for a two-stream table made the preflight output look like the insert watermark
+    /// had regressed by 327 M during a post-incident check (it had not), so preflight needs the real
+    /// value to display alongside.
+    async fn read_insert_hwm(&self, table: &str) -> Result<Option<i64>>;
+
     /// O7-rest-b: fetch the existing Delta schema for a table (None if the table doesn't exist
     /// yet), so preflight can run the same schema-evolution check the run does.
     async fn delta_schema(&self, table: &str) -> Result<Option<deltalake::arrow::datatypes::SchemaRef>>;
+}
+
+/// §10.4: render a TWO-STREAM table's watermarks with every field labelled.
+///
+/// `read_hwm` returns the UPDATE-stream watermark: `updated_at` plus `last_id`, where `last_id` is
+/// the update window's keyset-pagination cursor. It is NOT the insert frontier and can legitimately
+/// move backwards between runs — which, printed bare as `updated_at / last_id`, reads exactly like
+/// the H-2026-07-11-1 watermark-reset failure. The real insert frontier is `hwm_insert_id`, read
+/// separately via `read_insert_hwm`. Labelling all three removes the ambiguity; unknowns render as
+/// `—` so a missing value can never be mistaken for a real one.
+fn format_two_stream_hwm(insert_hwm: Option<i64>, hwm: Option<&crate::writer::Hwm>) -> String {
+    let ins = insert_hwm.map(|v| v.to_string()).unwrap_or_else(|| "—".to_string());
+    match hwm {
+        Some(h) => format!("ins={} upd={} page={}", ins, h.updated_at, h.last_id),
+        None => format!("ins={ins} upd=— page=—"),
+    }
 }
 
 pub struct NoopPreflightStorage;
@@ -154,10 +178,21 @@ where
             }
         };
 
-        // Format HWM
-        let hwm_str = match hwm {
-            Some(h) => format!("{} / {}", h.updated_at, h.last_id),
-            None => "—".to_string(),
+        // Format HWM.
+        //
+        // §10.4: for a TWO-STREAM table the bare `updated_at / last_id` pair is actively
+        // misleading — both are UPDATE-stream values, and `last_id` is the update window's
+        // keyset-pagination cursor, which readers naturally mistake for the insert frontier. It can
+        // legitimately move BACKWARDS between runs, which reads exactly like the H-2026-07-11-1
+        // watermark-reset failure. So label every field and show the real insert watermark.
+        let hwm_str = if matches!(mode, crate::config::ExtractionMode::TwoStream) {
+            let insert_hwm = self.hwm.read_insert_hwm(table_name).await?;
+            format_two_stream_hwm(insert_hwm, hwm.as_ref())
+        } else {
+            match &hwm {
+                Some(h) => format!("{} / {}", h.updated_at, h.last_id),
+                None => "—".to_string(),
+            }
         };
 
         let mode_str = match mode {
@@ -326,6 +361,10 @@ impl PreflightHwmAdapter {
 impl PreflightHwm for PreflightHwmAdapter {
     async fn read_hwm(&self, table: &str) -> Result<Option<crate::writer::Hwm>> {
         self.inner.read_hwm(table).await
+    }
+
+    async fn read_insert_hwm(&self, table: &str) -> Result<Option<i64>> {
+        self.inner.read_insert_hwm(table).await
     }
 
     async fn delta_schema(&self, table: &str) -> Result<Option<deltalake::arrow::datatypes::SchemaRef>> {
@@ -720,6 +759,7 @@ mod tests {
 
         storage.expect_check_writable().returning(|| Ok(()));
         hwm.expect_read_hwm().returning(|_| Ok(None));
+        hwm.expect_read_insert_hwm().returning(|_| Ok(Some(502_658_778)));
         hwm.expect_delta_schema().returning(|_| Ok(None));
         inspect
             .expect_discover_columns()
@@ -964,6 +1004,7 @@ mod tests {
 
         storage.expect_check_writable().returning(|| Ok(()));
         hwm.expect_read_hwm().returning(|_| Ok(None));
+        hwm.expect_read_insert_hwm().returning(|_| Ok(Some(502_658_778)));
         hwm.expect_delta_schema().returning(|_| Ok(None));
         let cols = incremental_columns();
         inspect
@@ -977,6 +1018,34 @@ mod tests {
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
         assert!(result.is_ok());
+    }
+
+    /// §10.4 regression pin: for a TWO-STREAM table the preflight HWM column must show the real
+    /// INSERT watermark and must label the update-window pagination cursor.
+    ///
+    /// The bare `updated_at / last_id` pair it printed before is both update-stream values, and
+    /// `last_id` — the update window's keyset cursor — can legitimately move BACKWARDS between runs.
+    /// During a post-incident check that read as the insert watermark regressing by 327 M, i.e. the
+    /// H-2026-07-11-1 watermark-reset shape, when nothing was wrong. `format_two_stream_hwm` is
+    /// therefore pinned directly: `read_hwm` is the wrong source for the insert frontier, so any
+    /// future edit that drops `ins=` fails here.
+    #[test]
+    fn two_stream_hwm_display_labels_insert_and_pagination_cursors() {
+        let h = crate::writer::Hwm {
+            updated_at: "2026-08-07T15:26:53.000000".to_string(),
+            last_id: 173_218_080,
+        };
+        let s = format_two_stream_hwm(Some(502_767_312), Some(&h));
+
+        assert!(s.contains("ins=502767312"), "the real insert watermark must be shown: {s}");
+        assert!(s.contains("upd=2026-08-07T15:26:53.000000"), "got {s}");
+        assert!(
+            s.contains("page=173218080"),
+            "the update-window cursor must be LABELLED, not left to look like the insert frontier: {s}"
+        );
+        // Unknowns must be visible rather than rendered as a plausible number.
+        assert!(format_two_stream_hwm(None, Some(&h)).contains("ins=—"));
+        assert!(format_two_stream_hwm(Some(1), None).contains("upd=—"));
     }
 
     #[tokio::test]
