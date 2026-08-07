@@ -149,6 +149,15 @@ impl DeltaWriterAdapter {
     }
 }
 
+impl DeltaWriterAdapter {
+    /// §10.2: hand the orchestrator's shutdown receiver to the inner writer so its long loops
+    /// (the overwrite survivor stream, the chunked DELETE loop) can stop between commits.
+    pub fn with_shutdown(mut self, shutdown: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.inner = self.inner.with_shutdown(shutdown);
+        self
+    }
+}
+
 impl DeltaWrite for DeltaWriterAdapter {
     async fn ensure_table(&self, table_name: &str, schema: SchemaRef) -> Result<()> {
         self.inner.ensure_table(table_name, schema).await?;
@@ -278,6 +287,14 @@ impl LocalDeltaWriterAdapter {
             inner: DeltaWriter::new_local(&dir.to_string_lossy())
                 .with_merge_limits(config.merge_memory_mb, config.merge_spill_dir.clone()),
         }
+    }
+}
+
+impl LocalDeltaWriterAdapter {
+    /// §10.2: see `DeltaWriterAdapter::with_shutdown`.
+    pub fn with_shutdown(mut self, shutdown: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.inner = self.inner.with_shutdown(shutdown);
+        self
     }
 }
 

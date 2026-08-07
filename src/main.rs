@@ -421,7 +421,7 @@ async fn async_main() {
     let verify_deep = cli.verify_deep;
 
     let sync_exit = if let Some(ref dir) = local_dir {
-        let writer = LocalDeltaWriterAdapter::new(dir, &config);
+        let writer = LocalDeltaWriterAdapter::new(dir, &config).with_shutdown(shutdown_rx.clone());
         let mut orchestrator = Orchestrator::new(
             config,
             schema_inspect,
@@ -434,7 +434,7 @@ async fn async_main() {
         );
         orchestrator.run().await as i32
     } else {
-        let writer = DeltaWriterAdapter::new(&config);
+        let writer = DeltaWriterAdapter::new(&config).with_shutdown(shutdown_rx.clone());
         let mut orchestrator = Orchestrator::new(
             config,
             schema_inspect,

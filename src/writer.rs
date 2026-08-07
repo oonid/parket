@@ -146,6 +146,9 @@ pub struct DeltaWriter {
     use_local_fs: bool,
     /// Memory budget (MB) for the MERGE datafusion session's bounded FairSpillPool.
     merge_memory_mb: u64,
+    /// §10.2: shutdown signal, so the writer's LONG-RUNNING loops can stop between commits.
+    /// `None` (the default, and what every test constructs) means "never interrupt".
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     /// Optional spill dir for the MERGE external sort; None = system temp.
     merge_spill_dir: Option<std::path::PathBuf>,
     /// P1: per-table DeltaTable handle reuse across the per-batch write loop, so each
@@ -183,6 +186,7 @@ impl DeltaWriter {
             storage_options,
             use_local_fs: false,
             merge_memory_mb: 512,
+            shutdown: None,
             merge_spill_dir: None,
             table_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
             overwrite_sessions: std::sync::Arc::new(Mutex::new(HashMap::new())),
@@ -196,6 +200,7 @@ impl DeltaWriter {
             storage_options: HashMap::new(),
             use_local_fs: true,
             merge_memory_mb: 512,
+            shutdown: None,
             merge_spill_dir: None,
             table_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
             overwrite_sessions: std::sync::Arc::new(Mutex::new(HashMap::new())),
@@ -207,6 +212,24 @@ impl DeltaWriter {
         self.merge_memory_mb = merge_memory_mb;
         self.merge_spill_dir = merge_spill_dir;
         self
+    }
+
+    /// §10.2: give the writer the orchestrator's shutdown receiver so its long loops can stop.
+    ///
+    /// The orchestrator checks `check_shutdown()` between extract windows, but the expensive loops
+    /// live BELOW that boundary in the writer — the overwrite path's per-batch survivor stream
+    /// (14.4 min at production scale) and `delete_then_append`'s per-chunk DELETE loop. Without this
+    /// a `SIGINT` cannot land until the whole window finishes: observed in production, where two
+    /// further chunks committed after the signal and `SIGTERM` was required.
+    pub fn with_shutdown(mut self, shutdown: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.shutdown = Some(shutdown);
+        self
+    }
+
+    /// True once a shutdown signal has been observed. Cheap (a `watch` borrow), so it is safe to
+    /// call once per batch/chunk.
+    pub(crate) fn shutdown_requested(&self) -> bool {
+        self.shutdown.as_ref().map(|rx| *rx.borrow()).unwrap_or(false)
     }
 
     /// Memory budget (MB) for bounded datafusion sessions (MERGE and the verify probes).

@@ -865,39 +865,41 @@ full re-extract of the source table, which is the price of staying inside the me
 `delete_then_append` remains correct and bounded — just do not point it at remote object storage
 with a large update window.
 
-### 10.2 Open — Low: `SIGINT` cannot land inside the writer's chunk loop
+### 10.2 **FIXED** — Low: `SIGINT` could not land inside the writer's long loops
 
-Interrupting the run above with `SIGINT` had no effect: two further DELETE chunks committed after
-the signal, and `SIGTERM` was required.
-
-**Corrected 2026-08-06.** An earlier revision of this item guessed that interruption is "checked
-between tables, not between batches/chunks". That is wrong and would send a reader to the wrong
-file — the shutdown plumbing is finer-grained than that, and the gap is one level lower:
-
-```
-orchestrator/two_stream.rs:133   if self.check_shutdown() { break; }   <- top of insert-stream loop
-orchestrator/two_stream.rs:212   if self.check_shutdown() { break; }   <- top of update-stream loop
-writer/two_stream.rs             (no shutdown check anywhere in the file)
-```
-
-The orchestrator checks between **extract windows**, which is a real and reasonable boundary. But
-`delete_then_append`'s `for chunk in ids.chunks(DELETE_KEYS_PER_CHUNK)` loop (§10.1) sits *below*
-that boundary, inside the writer, which has no shutdown awareness at all. One extract window
-therefore becomes one `delete_then_append` call containing `ceil(keys/1024)` independent Delta
-commits — **839** in the observed run — with no opportunity to honour the signal until they all
-finish. The next check would have arrived roughly 56 hours later.
-
-So the polite signal fails precisely when it matters most: during a run long enough that an operator
-wants to stop it. The escalation is `SIGTERM`/`SIGKILL`, which only happens to be safe because of
-Delta's commit atomicity (§10.3) rather than by design.
-
-**FIX:** check the shutdown flag once per chunk inside the writer loop — each chunk is already a
-complete, independent commit, so it is a safe stopping point and no partial state can leak.
-
-**Note the composition with §10.1:** fixing §10.1 properly (the single-DELETE anti-join predicate,
-fix #1 there) **dissolves this finding**, because there would no longer be a long-running loop
-inside the writer for the signal to be trapped behind. If §10.1 is fixed, re-check whether §10.2
-still reproduces before spending effort on it.
+> **Fixed 2026-08-07.** And note the prediction recorded here earlier was WRONG: §10.1's overwrite fix
+> was expected to *dissolve* this finding by removing the long writer-side loop. It did not — it
+> **moved** it. The writer had zero shutdown checks anywhere, and after §10.1 it had two long loops
+> rather than one:
+>
+> * `stage_surviving_rows_and_new_versions`' per-batch survivor stream — **14.4 min** at production
+>   scale, and the new default for any window above the routing threshold;
+> * `delete_then_append`'s per-chunk DELETE loop — still used for windows below it.
+>
+> `DeltaWriter` now takes the orchestrator's `watch::Receiver<bool>` via `with_shutdown` (wired in
+> `main.rs` through both writer adapters; `None` by default, so every test and any other caller is
+> unaffected) and checks it once per batch and once per chunk.
+>
+> **The two paths stop with different guarantees, and the difference is the interesting part:**
+>
+> | path | on shutdown | table state |
+> |---|---|---|
+> | overwrite | bail before `commit_overwrite` ⇒ caller's error path runs `abort_overwrite` | **untouched** — staged parquet discarded (orphans only, VACUUM-able), nothing committed |
+> | chunked | bail before the append commit | **temporarily short** — keys deleted so far are not yet re-appended |
+>
+> The chunked case is deliberately allowed to leave the table short, because the alternative is worse.
+> The update HWM only advances on the append, so the next run re-extracts exactly this window and
+> restores those rows — the identical state a crash mid-loop produces, which the design already
+> tolerates ("a failed append self-heals next run via the unchanged watermark",
+> `docs/two-stream-continue-update.md` §3). Continuing to the append after a partial delete would be
+> the unsafe option: the un-deleted keys would then hold two versions. Both error messages say which
+> case occurred and how it recovers, since an operator seeing a failed table needs to know whether to
+> act or simply re-run.
+>
+> Tests: `delete_then_append_chunked_stops_on_shutdown_without_appending` and
+> `delete_then_append_overwrite_stops_on_shutdown_and_commits_nothing` both pre-signal a
+> `watch::channel`, then assert the call errors, the message explains recovery, **the table version is
+> unchanged**, and every row retains its pre-update value.
 
 ### 10.3 Note — killing mid-write is safe, and confirmed so
 

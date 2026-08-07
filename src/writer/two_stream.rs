@@ -374,6 +374,17 @@ impl DeltaWriter {
         let mut buffered = 0usize;
         let mut buf: Vec<RecordBatch> = Vec::new();
         while let Some(batch) = stream.next().await {
+            // §10.2: honour shutdown per batch. Bailing here is the CLEANEST possible interruption
+            // point in the whole writer — the caller's error path calls `abort_overwrite`, so the
+            // staged parquet is discarded and the live table is untouched (only orphaned files
+            // remain, reclaimable by VACUUM). Nothing is committed, so nothing self-heals because
+            // nothing changed.
+            if self.shutdown_requested() {
+                anyhow::bail!(
+                    "shutdown requested while staging the overwrite for `{table_name}` — nothing \
+                     committed, the live table is unchanged; re-run to resume"
+                );
+            }
             let batch = batch.context("reading a target batch")?;
             let idx = batch
                 .schema()
@@ -743,7 +754,26 @@ impl DeltaWriter {
             );
         }
         if !ids.is_empty() {
+            let mut deleted_keys = 0usize;
             for chunk in ids.chunks(DELETE_KEYS_PER_CHUNK) {
+                // §10.2: honour shutdown per chunk. Unlike the overwrite path this leaves the table
+                // TEMPORARILY SHORT — the keys deleted so far have not been re-appended yet, since
+                // the append is a separate commit below. That is deliberate and safe: the update
+                // HWM only advances on the append, so the next run re-extracts exactly this window
+                // and re-appends those rows. It is the same state a crash mid-loop produces, which
+                // this design already tolerates ("a failed append self-heals next run via the
+                // unchanged watermark", docs/two-stream-continue-update.md §3). Stopping and NOT
+                // appending is correct; continuing to the append after a partial delete would be
+                // the unsafe option, since the un-deleted keys would then hold two versions.
+                if self.shutdown_requested() {
+                    anyhow::bail!(
+                        "shutdown requested after deleting {} of {} keys for `{table_name}` — the \
+                         append was skipped, so those rows are temporarily absent and the NEXT run \
+                         restores them (the update watermark did not advance)",
+                        deleted_keys,
+                        ids.len()
+                    );
+                }
                 let list: Vec<_> = chunk.iter().map(|id| lit(*id)).collect();
                 // FA5: Column::new_unqualified stores the name verbatim (no parsing/
                 // normalization), unlike `col(key_col)` which would lowercase it.
@@ -752,6 +782,7 @@ impl DeltaWriter {
                         .in_list(list, false);
                 let (t, _metrics) = table.delete().with_predicate(predicate).await?;
                 table = t;
+                deleted_keys += chunk.len();
             }
             info!(table = table_name, keys = ids.len(), "delete_then_append: deleted existing rows for incoming keys");
         }
@@ -1940,7 +1971,141 @@ mod tests {
         assert_eq!(insert_hwm, Some(3));
     }
 
+        /// §10.2: an already-signalled shutdown must stop the CHUNKED delete loop before it commits
+    /// anything, and must say how to recover.
+    ///
+    /// The production symptom was the opposite: `SIGINT` was ignored, two further DELETE chunks
+    /// committed, and `SIGTERM` was needed — because the orchestrator checks `check_shutdown()`
+    /// between extract windows while the expensive loops live below that boundary in the writer.
     #[tokio::test]
+    async fn delete_then_append_chunked_stops_on_shutdown_without_appending() {
+        let temp = tempfile::tempdir().unwrap();
+        // Pre-signalled receiver: shutdown is already true, so the FIRST chunk check trips.
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap()).with_shutdown(rx);
+        tx.send(true).unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        writer.ensure_table("t", schema.clone()).await.unwrap();
+        let seed = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2, 3])),
+                Arc::new(StringArray::from(vec!["old", "old", "old"])),
+            ],
+        )
+        .unwrap();
+        let t = writer.open_table("t").await.unwrap();
+        t.write(vec![seed]).with_save_mode(SaveMode::Append).await.unwrap();
+        let version_before = writer.open_table("t").await.unwrap().version();
+
+        // 2 keys -> 1 chunk, well under OVERWRITE_ABOVE_CHUNKS, so this is the chunked path.
+        let update = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2])),
+                Arc::new(StringArray::from(vec!["new", "new"])),
+            ],
+        )
+        .unwrap();
+        let err = writer
+            .delete_then_append("t", vec![update], "id", Some(3), None)
+            .await
+            .expect_err("must refuse to proceed once shutdown is signalled");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("shutdown requested"), "got: {msg}");
+        assert!(
+            msg.contains("NEXT run restores them") || msg.contains("next run"),
+            "the error must tell the operator how this recovers: {msg}"
+        );
+
+        // Nothing committed: no delete, no append.
+        let t = writer.open_table("t").await.unwrap();
+        assert_eq!(
+            t.version(),
+            version_before,
+            "shutdown before the first chunk must leave the table version untouched"
+        );
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        ctx.register_table("t", t.table_provider().await.unwrap()).unwrap();
+        let b = &ctx
+            .sql("SELECT COUNT(*) AS c, SUM(CASE WHEN value = 'old' THEN 1 ELSE 0 END) AS o FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap()[0];
+        let g = |i: usize| b.column(i).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+        assert_eq!(g(0), 3, "all seed rows still present");
+        assert_eq!(g(1), 3, "and still the pre-update values");
+    }
+
+    /// §10.2: the same for the OVERWRITE path — and there the guarantee is stronger, because
+    /// `abort_overwrite` discards the staged parquet so the live table cannot even be temporarily
+    /// short.
+    #[tokio::test]
+    async fn delete_then_append_overwrite_stops_on_shutdown_and_commits_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap()).with_shutdown(rx);
+        tx.send(true).unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        writer.ensure_table("t", schema.clone()).await.unwrap();
+        let total: i64 = 12_000;
+        let seed = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from((1..=total).collect::<Vec<i64>>())),
+                Arc::new(StringArray::from(vec!["old"; total as usize])),
+            ],
+        )
+        .unwrap();
+        let t = writer.open_table("t").await.unwrap();
+        t.write(vec![seed]).with_save_mode(SaveMode::Append).await.unwrap();
+        let version_before = writer.open_table("t").await.unwrap().version();
+
+        // 10_000 keys -> 10 projected chunks -> routes to the overwrite path.
+        let updated: i64 = 10_000;
+        let update = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from((1..=updated).collect::<Vec<i64>>())),
+                Arc::new(StringArray::from(vec!["new"; updated as usize])),
+            ],
+        )
+        .unwrap();
+        let err = writer
+            .delete_then_append("t", vec![update], "id", Some(total), None)
+            .await
+            .expect_err("must refuse to proceed once shutdown is signalled");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("shutdown requested"), "got: {msg}");
+        assert!(msg.contains("live table is unchanged"), "got: {msg}");
+
+        let t = writer.open_table("t").await.unwrap();
+        assert_eq!(t.version(), version_before, "no commit may land");
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        ctx.register_table("t", t.table_provider().await.unwrap()).unwrap();
+        let b = &ctx
+            .sql("SELECT COUNT(*) AS c, SUM(CASE WHEN value = 'old' THEN 1 ELSE 0 END) AS o FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap()[0];
+        let g = |i: usize| b.column(i).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+        assert_eq!(g(0), total, "every row survives an interrupted overwrite");
+        assert_eq!(g(1), total, "and none were rewritten");
+    }
+
+#[tokio::test]
     async fn delete_then_append_upsert_uint32_key() {
         use deltalake::arrow::array::StringViewArray;
         let temp = tempfile::tempdir().unwrap();
