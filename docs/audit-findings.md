@@ -665,9 +665,24 @@ merely interrupted a run that could not have finished.
 > the MERGE path's 1.757 GB. Removing the join did not merely fix the failure — it made this the
 > cheapest of the three strategies.
 >
-> **Caveat carried forward → §10.1-r2 (`STAGE_ROWS`).** `files_added=564` where MERGE produces ~36,
-> because `stage_overwrite_chunk` flushes per call and `STAGE_ROWS` was 200 000. Fixed in v0.2.6 by
-> raising it to 5 M (≈23 chunks). The read penalty is selective: a bounded single-partition key census
+> **Caveat carried forward → §10.1-r2/-r3 (staged-chunk size).** `files_added=564` where MERGE
+> produces ~36, because `stage_overwrite_chunk` flushes per call and `STAGE_ROWS` was 200 000. First
+> "fixed" by raising it to 5 M rows — **which was itself unsound**: a row count cannot bound memory
+> (5 M rows is a different size for a 9-column table than a 40-column one), the 25× increase rested
+> on an estimate, and it had never been run at any window size, so the validated 0.210 GB figure did
+> NOT apply to it. Superseded by **-r3**: the budget is now `with_stage_bytes`, measured with
+> `get_array_memory_size()`, defaulting to 256 MB — which bounds memory for any schema AND lands the
+> file count at ~40 for a 115 M-row table. Mirrors the M2 circuit breaker, which already accumulates
+> real buffer bytes for the same reason.
+>
+> **§10.1-r3 also closes the large-window gap without waiting for an outage.** Memory here has two
+> independent axes: TARGET SIZE (the survivor scan streams — validated in production at 115 M rows)
+> and KEY COUNT (`ids`, the `HashSet`, the fully-materialised `deduped_batches`, the staging buffer).
+> The key-count axis needs no 115 M-row target, so
+> `delete_then_append_overwrite_handles_production_scale_key_count` drives it at **858 000 keys** —
+> the largest window observed in production — with a 2 MB staging budget to force many flushes, and
+> asserts one commit, no duplicates, and the untouched remainder surviving. The 858 k post-outage case
+> is therefore no longer unmeasured. The read penalty is selective: a bounded single-partition key census
 > went from ~5 min to >10, while the `target_partitions=14` rollup was unaffected (93 s vs 104 s). So
 > it degrades exactly the single-partition scans every memory-bounded path here relies on. The 564
 > files become reclaimable in the §10.5 VACUUM.

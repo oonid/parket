@@ -107,6 +107,10 @@ struct OverwriteSession {
 /// column (e.g. a value now exceeding the stored INTEGER range) would write silent NULLs, exit 0 —
 /// the exact silent-corruption class N5's `align_batches_to_schema` (which also uses `safe: false`)
 /// exists to prevent. A data-losing narrowing now fails the table loudly and actionably instead.
+/// §10.1-r3: default staged-chunk byte budget. 256 MB keeps peak buffering small against the 8 GB
+/// target while producing ~40 output files for a 115 M-row table (the MERGE path produces ~36).
+const DEFAULT_STAGE_BYTES: usize = 256 * 1024 * 1024;
+
 fn coerce_batch_to_schema(
     batch: &RecordBatch,
     target: &deltalake::arrow::datatypes::SchemaRef,
@@ -146,6 +150,8 @@ pub struct DeltaWriter {
     use_local_fs: bool,
     /// Memory budget (MB) for the MERGE datafusion session's bounded FairSpillPool.
     merge_memory_mb: u64,
+    /// §10.1-r3: byte budget for one staged overwrite chunk — see `with_stage_bytes`.
+    stage_bytes: usize,
     /// §10.2: shutdown signal, so the writer's LONG-RUNNING loops can stop between commits.
     /// `None` (the default, and what every test constructs) means "never interrupt".
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
@@ -186,6 +192,7 @@ impl DeltaWriter {
             storage_options,
             use_local_fs: false,
             merge_memory_mb: 512,
+            stage_bytes: DEFAULT_STAGE_BYTES,
             shutdown: None,
             merge_spill_dir: None,
             table_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
@@ -200,6 +207,7 @@ impl DeltaWriter {
             storage_options: HashMap::new(),
             use_local_fs: true,
             merge_memory_mb: 512,
+            stage_bytes: DEFAULT_STAGE_BYTES,
             shutdown: None,
             merge_spill_dir: None,
             table_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
@@ -212,6 +220,32 @@ impl DeltaWriter {
         self.merge_memory_mb = merge_memory_mb;
         self.merge_spill_dir = merge_spill_dir;
         self
+    }
+
+    /// §10.1-r3: how many BYTES of surviving rows to buffer before staging a parquet chunk.
+    ///
+    /// Bytes, not rows, deliberately. The previous bound was a row count (`STAGE_ROWS`), which
+    /// cannot bound memory: 5 M rows means something entirely different for a 9-column table than a
+    /// 40-column one, so the memory claim could only ever be an estimate — and the estimate was
+    /// raised 25x on reasoning alone, immediately after two other structural memory claims in this
+    /// same path turned out to be wrong. `get_array_memory_size()` measures the actual buffers, so
+    /// the bound holds for ANY schema. Mirrors the M2 circuit breaker, which already accumulates
+    /// `get_array_memory_size` for exactly this reason.
+    ///
+    /// It also lands the output file count where it should be: at 256 MB, a 115 M-row table stages
+    /// in roughly 40 chunks, close to the ~36 files the MERGE path produces — versus the 564 that a
+    /// 200 k-ROW bound produced in production (§10.1-r2). One knob, both properties, no estimate.
+    ///
+    /// Exposed as a builder mainly so tests can set it small and prove the flush path runs more than
+    /// once; a hardcoded constant would be untestable.
+    pub fn with_stage_bytes(mut self, stage_bytes: usize) -> Self {
+        self.stage_bytes = stage_bytes.max(1);
+        self
+    }
+
+    /// Byte budget for one staged overwrite chunk (§10.1-r3).
+    pub(crate) fn stage_bytes(&self) -> usize {
+        self.stage_bytes
     }
 
     /// §10.2: give the writer the orchestrator's shutdown receiver so its long loops can stop.

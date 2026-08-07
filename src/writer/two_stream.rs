@@ -248,29 +248,8 @@ impl DeltaWriter {
         use std::sync::Arc;
 
         const TARGET_TABLE: &str = "__parket_overwrite_target";
-        /// Rows buffered before staging a parquet chunk.
-        ///
-        /// This bounds peak memory independently of the surviving set's size — but it ALSO decides
-        /// the output file count, because `stage_overwrite_chunk` calls `writer.flush()` on every
-        /// invocation, so one staged chunk is (at least) one parquet file.
-        ///
-        /// §10.1-r2: the first value here was 200_000, chosen purely for the memory bound. Validated
-        /// in production it produced **564 files** for a 115 M-row table where the MERGE path
-        /// produces ~36 — averaging ~4 MB each. Same mistake as the original
-        /// `DELETE_KEYS_PER_CHUNK = 1024`: an input-side limit tuned in isolation, multiplying an
-        /// output-side cost.
-        ///
-        /// The read penalty is real but selective, and worth stating precisely: a Delta key census
-        /// (bounded session, `MERGE_TARGET_PARTITIONS=1`) went from a reliable ~5 min to over 10,
-        /// while the `course_progress` rollup — same table, but `target_partitions=14` — was
-        /// unaffected (93 s, versus 104 s before the file count tripled). So many small files hurt
-        /// SINGLE-PARTITION scans, which is exactly the shape every memory-bounded path here uses.
-        ///
-        /// 5 M rows keeps the chunk count near the file count Delta actually wants
-        /// (115 M / 5 M ≈ 23 files, vs ~36 from MERGE) and is still trivially bounded: the whole
-        /// validated run peaked at **0.21 GB**, and ~5 M rows of this schema buffers on the order of
-        /// a few hundred MB against an 8 GB budget. Memory was never the scarce resource here.
-        const STAGE_ROWS: usize = 5_000_000;
+        // §10.1-r3: staged-chunk size is a BYTE budget on the writer (`with_stage_bytes`),
+        // not a row count — see the doc there for why rows cannot bound memory.
 
         let key_count = ids.len();
         let table = self.open_table(table_name).await?;
@@ -310,7 +289,7 @@ impl DeltaWriter {
         // table fails with "no overwrite session in progress"/"already in progress" (FA11).
         let staged = self
             .stage_surviving_rows_and_new_versions(
-                table_name, ctx, &sql, key_col, &keyset, deduped_batches, STAGE_ROWS,
+                table_name, ctx, &sql, key_col, &keyset, deduped_batches, self.stage_bytes(),
             )
             .await;
         let survivors = match staged {
@@ -352,7 +331,7 @@ impl DeltaWriter {
         key_col: &str,
         keyset: &std::collections::HashSet<i64>,
         deduped_batches: Vec<RecordBatch>,
-        stage_rows: usize,
+        stage_bytes: usize,
     ) -> Result<usize> {
         use deltalake::arrow::array::BooleanArray;
         use deltalake::arrow::compute::{CastOptions, cast_with_options, filter_record_batch};
@@ -408,10 +387,11 @@ impl DeltaWriter {
 
             if kept.num_rows() > 0 {
                 survivors += kept.num_rows();
-                buffered += kept.num_rows();
+                // §10.1-r3: measure real buffer bytes, so the bound holds for any schema width.
+                buffered += kept.get_array_memory_size();
                 buf.push(kept);
             }
-            if buffered >= stage_rows {
+            if buffered >= stage_bytes {
                 self.stage_overwrite_chunk(table_name, std::mem::take(&mut buf)).await?;
                 buffered = 0;
             }
@@ -1860,7 +1840,86 @@ mod tests {
         assert_eq!(value_1, "b", "id=2 should have value 'b'");
     }
 
+        /// §10.1-r3: drive the KEY-COUNT axis at production magnitude (858 k keys, the largest window
+    /// observed in production) with a staging budget small enough to force many flushes.
+    ///
+    /// Why this shape. Memory in the overwrite path splits into two independent axes:
+    ///   * TARGET SIZE — the survivor scan streams, and that is validated in production at 115 M rows;
+    ///   * KEY COUNT — `ids: Vec<i64>`, the `HashSet`, the fully-materialised `deduped_batches`
+    ///     (`collect()`), and the staged-chunk buffer.
+    /// The key-count axis does NOT need a 115 M-row target to exercise, so it can be pinned here
+    /// instead of waiting for a post-outage window. That was the gap: the path was validated at a
+    /// 12,715-key window and the 858 k case routed to it unmeasured.
+    ///
+    /// The tiny `with_stage_bytes` also proves the flush loop runs repeatedly rather than buffering
+    /// everything — the failure mode a row-count bound could not rule out.
     #[tokio::test]
+    async fn delete_then_append_overwrite_handles_production_scale_key_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap())
+            // 2 MB: far below the surviving set, so staging must flush many times.
+            .with_stage_bytes(2 * 1024 * 1024);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        writer.ensure_table("t", schema.clone()).await.unwrap();
+
+        // 1.0M-row target, 858k-key window — the key count that matters, on a target small enough
+        // to keep the test quick (target size is the axis production already validated).
+        let total: i64 = 1_000_000;
+        let updated: i64 = 858_000;
+        let seed = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from((1..=total).collect::<Vec<i64>>())),
+                Arc::new(StringArray::from(vec!["old"; total as usize])),
+            ],
+        )
+        .unwrap();
+        let t = writer.open_table("t").await.unwrap();
+        t.write(vec![seed]).with_save_mode(SaveMode::Append).await.unwrap();
+        let version_before = writer.open_table("t").await.unwrap().version();
+
+        let update = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from((1..=updated).collect::<Vec<i64>>())),
+                Arc::new(StringArray::from(vec!["new"; updated as usize])),
+            ],
+        )
+        .unwrap();
+        writer
+            .delete_then_append("t", vec![update], "id", Some(total), None)
+            .await
+            .expect("858k-key window must complete via the overwrite path");
+
+        let t = writer.open_table("t").await.unwrap();
+        assert_eq!(
+            t.version(),
+            version_before.map(|v| v + 1),
+            "still exactly ONE commit at 858k keys"
+        );
+
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        ctx.register_table("t", t.table_provider().await.unwrap()).unwrap();
+        let b = &ctx
+            .sql("SELECT COUNT(*) AS c, COUNT(DISTINCT id) AS d, \
+                         SUM(CASE WHEN value = 'new' THEN 1 ELSE 0 END) AS n, \
+                         SUM(CASE WHEN value = 'old' THEN 1 ELSE 0 END) AS o FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap()[0];
+        let g = |i: usize| b.column(i).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+        assert_eq!(g(0), total, "row count preserved");
+        assert_eq!(g(1), total, "every id exactly once — no duplicates at scale");
+        assert_eq!(g(2), updated, "all 858k updated keys carry the new value");
+        assert_eq!(g(3), total - updated, "the untouched remainder survived");
+    }
+
+#[tokio::test]
     async fn delete_then_append_upsert_int32_key() {
         use deltalake::arrow::array::StringViewArray;
         let temp = tempfile::tempdir().unwrap();
