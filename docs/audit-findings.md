@@ -1162,7 +1162,14 @@ against a live DB, not a defect in either.
 
 <details><summary>Original proposal (kept for the design rationale)</summary>
 
-### 10.7 Proposed — parket has no `--vacuum`, and this is now a recurring chore
+### 10.7-orig SUPERSEDED 2026-08-07 by the IMPLEMENTED entry above — historical, not an open item
+
+> Retitled 2026-08-10. This heading previously read "10.7 Proposed — parket has no `--vacuum`",
+> which made it indistinguishable from a live finding to anything that scans headings rather than
+> reading the `<details>` wrapper: `grep -E '^### .*(Open|Proposed)'` — the normal way to list what
+> is still outstanding — reported it as open, and the register carried two different `10.7` sections
+> with opposite verdicts. The text below is kept unchanged because the design rationale is still
+> worth reading; only its heading was wrong.
 
 PS-M3's reclaim was done with **`deltalake` Python** because parket has no vacuum command
 (`grep -ri vacuum src/` finds only log strings and comments). That is now the awkward part of a
