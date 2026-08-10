@@ -33,7 +33,7 @@ object_store = { version = "0.12", features = ["aws"] }
 libc = "0.2"
 
 [dev-dependencies]
-aws-sdk-s3 = "1"
+aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 mockall = "0.14"
 serial_test = "3"
 tempfile = "3"
