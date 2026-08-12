@@ -1209,3 +1209,77 @@ Notes for the implementer:
   for the monthly cadence.
 
 </details>
+
+---
+
+### 10.8 Proposed — nothing tells the operator that a vacuum is due
+
+**Registered 2026-08-12.** The monthly cadence in §8.3 is entirely manual and no command reports whether
+it has slipped. The 30× amplification in §10.5 was found by someone going to look, not by parket saying
+so — which is the actual failure mode worth fixing, because a manual cadence with no signal fails
+silently.
+
+What exists today is one warning, and it covers only the orphan case:
+
+```
+orchestrator/full_refresh.rs:149
+  "full refresh aborted after staging N chunk(s); uncommitted parquet may be
+   orphaned in object storage — run VACUUM to reclaim"
+```
+
+That fires only when a full refresh **aborts**. Nothing fires after a SUCCESSFUL sync, which is where
+superseded files accumulate on every run, and `--check` reports schema, modes and watermarks but nothing
+about storage. Nothing records when VACUUM last ran.
+
+#### Why it recurs even with §10.1 fixed
+
+§10.1 removed the pathological case (839 chunked rewrites → one overwrite), but not the steady state:
+
+  * Every `full_refresh` table supersedes its whole previous snapshot each sync. `user_profiles` is
+    1.3 M rows rewritten wholesale every time, because its `updated_at` is nullable and parket refuses a
+    nullable cursor (O3). Seven of the twelve configured tables are in this mode.
+  * The overwrite path in the §10.1 fix still tombstones every file it replaces — fewer rewrites, not
+    zero.
+
+So bloat grows at roughly one table-copy per sync per full-refresh table. That is the equilibrium, not a
+leak, and it is exactly the kind of thing a periodic reminder suits.
+
+#### The API supports the cheap version — checked, not assumed
+
+`DeltaTableState::all_tombstones(&log_store)` is **public** in deltalake-core 0.32.4 and returns a stream
+of `TombstoneView`, which exposes `path()`, `deletion_timestamp()`, `size()` and `data_change()`. So the
+count and the byte total of tombstones older than the retention window are both available **without
+listing the object store** — the log already holds them.
+
+That matters because the expensive part of `--vacuum` is the prefix listing, and a post-sync reminder must
+not pay it. parket already has the table open at the end of a sync, so reading tombstones from the log it
+has just written is incremental cost rather than a new operation.
+
+#### Proposed shape
+
+A post-sync line, and the same figure in `--check`:
+
+```
+developer_journey_trackings: 757 tombstone(s) past 168h retention, ~70.7 GB reclaimable — run --vacuum
+```
+
+Deliberately NOT a failure and not a prompt: the operator decides when, and §10.5 documents a case where
+running early is actively wrong (older versions were the recovery mechanism for a new write path).
+
+#### What the cheap version cannot see
+
+**Orphans.** Parquet that no commit ever referenced has no `remove` action, so a tombstone scan is blind
+to it by construction — and orphans were one of the two sources behind §10.5's 73 GB. The complete answer
+still needs the prefix listing that `--vacuum`'s dry run already does.
+
+That is an argument for the reminder pointing AT the dry run rather than replacing it: cheap signal on the
+class that grows every sync, and an existing safe command for the full picture. A reminder that implied
+completeness would be worse than none, because it would read as "nothing to reclaim" while orphans piled
+up.
+
+#### Unverified
+
+Whether `all_tombstones` replays the log segment or reads a checkpoint. On a table with a recent
+checkpoint the tombstones live in one parquet file and the read is bounded; without one it walks every
+JSON commit since the last checkpoint. That decides whether this is genuinely free per sync or wants a
+cadence of its own, and it has not been measured.
