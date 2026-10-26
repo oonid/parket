@@ -268,11 +268,11 @@ async fn run_verify_archive(config: &config::Config, local_dir: Option<&std::pat
     }
 }
 
-/// Archive mode: archive `units` in every table of TABLES that has `TABLE_ARCHIVE_<table>` set
-/// (docs/design/archive-mode.md), printing one line per unit and table. Exits 0 when every unit is
-/// archived or already was, 1 on the first failure (units committed before it stay committed and a
-/// re-run skips them), 2 on a configuration or connection error.
-async fn run_archive(config: &config::Config, local_dir: Option<&std::path::Path>, units: &[i64]) -> i32 {
+/// Archive mode: archive `units` (or, with `replace` set to `Some(allow_fewer)`, re-extract and
+/// replace them) in every table of TABLES that has `TABLE_ARCHIVE_<table>` set (docs/design/archive-mode.md), printing one line
+/// per unit and table. Exits 0 on success, 1 on the first failure (units committed before it stay
+/// committed and a re-run skips them), 2 on a configuration or connection error.
+async fn run_archive(config: &config::Config, local_dir: Option<&std::path::Path>, units: &[i64], replace: Option<bool>) -> i32 {
     let tables = archive_tables(config);
     if tables.is_empty() {
         eprintln!("archive: no table in TABLES has TABLE_ARCHIVE_<table> set");
@@ -292,13 +292,18 @@ async fn run_archive(config: &config::Config, local_dir: Option<&std::path::Path
     let inspect = SchemaInspectorAdapter::new(pool, extract_database_name(&config.database_url));
     let mut archiver =
         Archiver::new(inspect, ExtractorAdapter::for_archive(config), delta_writer(config, local_dir), zone);
-    match archiver.archive_units(&tables, units).await {
+    let result = match replace {
+        Some(allow_fewer) => archiver.replace_units(&tables, units, allow_fewer).await,
+        None => archiver.archive_units(&tables, units).await,
+    };
+    match result {
         Ok(results) => {
             for r in results {
                 let outcome = match r.outcome {
                     UnitOutcome::Archived { rows } => format!("archived {rows} rows"),
                     UnitOutcome::AlreadyArchived => "already archived".to_string(),
                     UnitOutcome::NoRows => "no rows".to_string(),
+                    UnitOutcome::Replaced { rows, files } => format!("replaced {files} file(s) with {rows} rows"),
                 };
                 println!("archive unit={} table={}: {outcome}", r.unit, r.table);
             }
@@ -583,7 +588,12 @@ async fn async_main() {
     }
 
     if let Some(units) = cli.archive_units.clone() {
-        let code = run_archive(&config, local_dir.as_deref(), &units).await;
+        let code = run_archive(&config, local_dir.as_deref(), &units, None).await;
+        std::process::exit(code);
+    }
+
+    if let Some(units) = cli.replace_archive_units.clone() {
+        let code = run_archive(&config, local_dir.as_deref(), &units, Some(cli.replace_allow_fewer_rows)).await;
         std::process::exit(code);
     }
 

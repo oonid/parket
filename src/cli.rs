@@ -63,6 +63,22 @@ pub struct Cli {
     )]
     pub archive_units: Option<Vec<i64>>,
 
+    // Archive mode: re-extract the given units and replace exactly their files, then exit.
+    #[arg(
+        long,
+        value_name = "UNIT,...",
+        value_delimiter = ',',
+        help = "Re-extract these units (comma-separated ids) in every TABLE_ARCHIVE_<table> table and replace exactly their archived files — the repair for a unit that failed verification. Only for units whose source rows have not been deleted; an empty new copy is refused, and so is a copy with fewer rows than the archived one unless --replace-allow-fewer-rows"
+    )]
+    pub replace_archive_units: Option<Vec<i64>>,
+
+    #[arg(
+        long,
+        requires = "replace_archive_units",
+        help = "With --replace-archive-units, accept a new copy with fewer rows than the archived one (rows deleted from the source on purpose)"
+    )]
+    pub replace_allow_fewer_rows: bool,
+
     // Archive mode: verify the given units exactly, source against Delta, then exit.
     #[arg(
         long,
@@ -263,6 +279,16 @@ mod tests {
         assert!(Cli::try_parse_from(["parket"]).unwrap().archive_units.is_none());
         let cli = Cli::try_parse_from(["parket", "--verify-archive-units", "909"]).unwrap();
         assert_eq!(cli.verify_archive_units, Some(vec![909]));
+    }
+
+    #[test]
+    fn allowing_a_smaller_copy_needs_a_replace() {
+        let cli = Cli::try_parse_from(["parket", "--replace-archive-units", "909"]).unwrap();
+        assert_eq!(cli.replace_archive_units, Some(vec![909]));
+        assert!(!cli.replace_allow_fewer_rows, "refused by default");
+        let cli = Cli::try_parse_from(["parket", "--replace-archive-units", "909", "--replace-allow-fewer-rows"]).unwrap();
+        assert!(cli.replace_allow_fewer_rows);
+        assert!(Cli::try_parse_from(["parket", "--replace-allow-fewer-rows"]).is_err());
     }
 
     #[test]

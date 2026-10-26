@@ -2094,6 +2094,36 @@ async fn verify_archive_units_matches_exactly_and_names_every_difference() {
         "campaign 2 was never archived: {}",
         diffs(2, "messages")
     );
+
+    // The repair: replace campaign 1 from the current source, and it verifies again. A source
+    // row was deleted, so the new copy is smaller: refused by default, accepted when allowed.
+    let archiver = || {
+        Archiver::new(
+            SchemaInspectorAdapter::new(env.pool.clone(), "parket".to_string()),
+            ExtractorAdapter::for_archive(&env.config),
+            writer(),
+            "Asia/Jakarta",
+        )
+    };
+    let refused = format!("{:#}", archiver().replace_units(&tables, &[1], false).await.unwrap_err());
+    assert!(
+        refused.contains("`message_events`") && refused.contains("holds 49 row(s)") && refused.contains("fewer than the 50"),
+        "got: {refused}"
+    );
+    let replaced = archiver().replace_units(&tables, &[1], true).await.expect("replace campaign 1");
+    assert!(
+        replaced.iter().all(|r| matches!(r.outcome, parket::archive::UnitOutcome::Replaced { .. })),
+        "got {replaced:?}"
+    );
+    let repaired = verdicts(verify_units(&inspect, &source, &delta, &tables, &[1]).await.unwrap());
+    assert_eq!(
+        repaired,
+        vec![
+            (1, "messages".to_string(), UnitVerdict::Verified { rows: 25 }),
+            (1, "message_events".to_string(), UnitVerdict::Verified { rows: 49 }),
+            (1, "message_lookup".to_string(), UnitVerdict::Verified { rows: 6 }),
+        ]
+    );
 }
 
 /// A column archive mode cannot extract (here `TIME`) is never silently left out of verification:

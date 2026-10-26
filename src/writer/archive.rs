@@ -17,7 +17,7 @@ use deltalake::arrow::array::Int64Array;
 use deltalake::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use deltalake::arrow::record_batch::RecordBatch;
 use deltalake::kernel::transaction::{CommitBuilder, CommitProperties};
-use deltalake::kernel::{Action, Add, Transaction};
+use deltalake::kernel::{Action, Add, Remove, Transaction};
 use deltalake::parquet::basic::{Compression, ZstdLevel};
 use deltalake::parquet::file::properties::WriterProperties;
 use deltalake::protocol::{DeltaOperation, SaveMode};
@@ -45,7 +45,25 @@ pub(super) struct ArchiveSession {
     unit: i64,
     adds: Vec<Add>,
     rows: u64,
+    /// The version of the unit's transaction marker this commit records: 1 for its first commit,
+    /// one more than the current marker for a replace.
+    marker: i64,
+    /// `Some` for a unit-scoped replace.
+    replacing: Option<Replacing>,
 }
+
+/// What a unit-scoped replace takes out of the table, and the least it must put back.
+pub(super) struct Replacing {
+    /// The unit's current files, removed by the same commit that adds the re-extracted ones.
+    removes: Vec<Remove>,
+    /// How many rows of the unit those files hold.
+    rows: u64,
+    /// Accept a new copy with fewer rows than `rows` (rows legitimately deleted from the source).
+    allow_fewer: bool,
+}
+
+/// The file-path column the replace scan adds to find which files hold a unit.
+const FILE_COLUMN: &str = "__parket_file";
 
 /// An archive is written once and read rarely, the trade ZSTD is made for: on campaign email data
 /// it measured about 40 % smaller than delta-rs's Snappy default. Synced tables keep the default.
@@ -187,6 +205,85 @@ impl DeltaWriter {
                  refusing to append it again"
             );
         }
+        self.begin_session(table_name, table, unit, 1, None).await
+    }
+
+    /// Start a **unit-scoped replace**: re-extracted rows of `unit` will replace exactly the files
+    /// that hold it now, in one commit. Returns how many files that is. Refuses a file holding
+    /// another unit as well — replacing it would drop that unit's rows. The caller must only
+    /// replace a unit it has not handed over for deletion from the source
+    /// (docs/design/archive-mode.md); `commit_archive_unit` refuses an empty new copy, and a copy
+    /// with fewer rows than the archived one unless `allow_fewer`.
+    ///
+    /// The commit records the unit's transaction marker at one more than its current version, so
+    /// a concurrent archive or replace of the same unit fails Delta's conflict check.
+    pub async fn begin_replace_unit(&self, table_name: &str, unit: i64, allow_fewer: bool) -> Result<usize> {
+        let table = self.open_table(table_name).await?;
+        let (removes, rows) = self.unit_files(&table, table_name, unit).await?;
+        let files = removes.len();
+        let current = table.snapshot()?.transaction_version(table.log_store().as_ref(), unit_app_id(unit)).await?;
+        let replacing = Replacing { removes, rows, allow_fewer };
+        self.begin_session(table_name, table, unit, current.unwrap_or(0) + 1, Some(replacing)).await?;
+        Ok(files)
+    }
+
+    /// The files of `table` that hold `unit`, as `Remove` actions, and the rows of `unit` in them.
+    /// Found from the data (a file-path column), not from statistics, and checked: every such file
+    /// must hold `unit` alone.
+    async fn unit_files(&self, table: &DeltaTable, table_name: &str, unit: i64) -> Result<(Vec<Remove>, u64)> {
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        ctx.register_table("t", table.table_provider().with_file_column(FILE_COLUMN).await?)?;
+        let sql = format!(
+            "SELECT {FILE_COLUMN}, min(`{ARCHIVE_UNIT_COLUMN}`), max(`{ARCHIVE_UNIT_COLUMN}`), count(*) FROM t \
+             GROUP BY {FILE_COLUMN} \
+             HAVING sum(CASE WHEN `{ARCHIVE_UNIT_COLUMN}` = {unit} THEN 1 ELSE 0 END) > 0"
+        );
+        let batches = ctx.sql(&sql).await?.collect().await?;
+        let mut paths = Vec::new();
+        let mut rows = 0u64;
+        for b in &batches {
+            for row in 0..b.num_rows() {
+                let path = deltalake::arrow::util::display::array_value_to_string(b.column(0), row)?;
+                let bounds = (
+                    deltalake::arrow::util::display::array_value_to_string(b.column(1), row)?,
+                    deltalake::arrow::util::display::array_value_to_string(b.column(2), row)?,
+                );
+                if bounds != (unit.to_string(), unit.to_string()) {
+                    bail!(
+                        "`{table_name}`: file {path} holds units {} to {}, not unit {unit} alone; \
+                         refusing a replace that would drop another unit's rows",
+                        bounds.0, bounds.1
+                    );
+                }
+                paths.push(path);
+                rows += deltalake::arrow::util::display::array_value_to_string(b.column(3), row)?.parse::<u64>()?;
+            }
+        }
+        let removes: Vec<Remove> = table
+            .snapshot()?
+            .log_data()
+            .iter()
+            .filter(|f| paths.iter().any(|p| p.ends_with(f.path().as_ref())))
+            .map(|f| f.remove_action(true))
+            .collect();
+        if removes.len() != paths.len() {
+            bail!(
+                "`{table_name}`: unit {unit} is in {} file(s) but {} matched the table's file list",
+                paths.len(),
+                removes.len()
+            );
+        }
+        Ok((removes, rows))
+    }
+
+    async fn begin_session(
+        &self,
+        table_name: &str,
+        table: DeltaTable,
+        unit: i64,
+        marker: i64,
+        replacing: Option<Replacing>,
+    ) -> Result<()> {
         let writer = RecordBatchWriter::for_table(&table)?.with_writer_properties(archive_writer_properties());
         if writer.arrow_schema().field_with_name(ARCHIVE_UNIT_COLUMN).is_err() {
             bail!(
@@ -200,7 +297,7 @@ impl DeltaWriter {
         }
         sessions.insert(
             table_name.to_string(),
-            ArchiveSession { writer, table, unit, adds: Vec::new(), rows: 0 },
+            ArchiveSession { writer, table, unit, adds: Vec::new(), rows: 0, marker, replacing },
         );
         Ok(())
     }
@@ -222,35 +319,60 @@ impl DeltaWriter {
         Ok(())
     }
 
-    /// Commit the unit's staged files as ONE append-only commit — `Add` actions only, never a
-    /// `Remove` — and return the rows it added. A unit with no rows gets no commit. `commitInfo`
-    /// carries `archive_unit` and `archive_rows` as an audit trail; `_archive_unit` in the data is
-    /// the record `archive_unit_present` relies on.
+    /// Commit the unit's staged files as ONE commit and return the rows it added. An archive
+    /// commit is append-only — `Add` actions only, never a `Remove`; a unit with no rows gets no
+    /// commit. A replace commit also removes the unit's previous files, and is refused when the new
+    /// copy is empty — with the source rows gone (purged), it would delete archived rows and put
+    /// nothing back — or holds fewer rows than the archived copy, unless the replace allows that. `commitInfo` carries `archive_unit` and `archive_rows` as an audit trail;
+    /// `_archive_unit` in the data is the record `archive_unit_present` relies on.
     pub async fn commit_archive_unit(&self, table_name: &str) -> Result<u64> {
         let session = self.archive_sessions.lock().await.remove(table_name).with_context(|| {
             format!("commit_archive_unit: no archive session in progress for `{table_name}`")
         })?;
-        let ArchiveSession { table, unit, adds, rows, .. } = session;
+        let ArchiveSession { table, unit, adds, rows, marker, replacing, .. } = session;
         if adds.is_empty() {
+            if let Some(r) = replacing.as_ref().filter(|r| !r.removes.is_empty()) {
+                bail!(
+                    "refusing to replace unit {unit} of `{table_name}`: the source holds no rows of it \
+                     now, so the replace would delete its {} archived file(s) and add nothing; the \
+                     table is unchanged",
+                    r.removes.len()
+                );
+            }
             info!(table = table_name, unit, "archive: unit has no rows in this table; nothing to commit");
             return Ok(0);
         }
+        if let Some(r) = replacing.as_ref().filter(|r| rows < r.rows && !r.allow_fewer) {
+            bail!(
+                "refusing to replace unit {unit} of `{table_name}`: the source holds {rows} row(s) of \
+                 it now, fewer than the {} archived; if those rows were deleted from the source on \
+                 purpose, allow a smaller copy explicitly. The table is unchanged",
+                r.rows
+            );
+        }
         let files = adds.len();
-        let actions: Vec<Action> = adds.into_iter().map(Action::Add).collect();
+        let (operation, mut actions) = match replacing {
+            None => (DeltaOperation::Write { mode: SaveMode::Append, partition_by: None, predicate: None }, Vec::new()),
+            Some(Replacing { removes, .. }) => (
+                DeltaOperation::Write {
+                    mode: SaveMode::Overwrite,
+                    partition_by: None,
+                    predicate: Some(format!("{ARCHIVE_UNIT_COLUMN} = {unit}")),
+                },
+                removes.into_iter().map(Action::Remove).collect(),
+            ),
+        };
+        actions.extend(adds.into_iter().map(Action::Add));
         let metadata = HashMap::from([
             ("archive_unit".to_string(), serde_json::Value::String(unit.to_string())),
             ("archive_rows".to_string(), serde_json::Value::String(rows.to_string())),
         ]);
         let properties = CommitProperties::default()
             .with_metadata(metadata)
-            .with_application_transaction(Transaction::new(unit_app_id(unit), 1));
+            .with_application_transaction(Transaction::new(unit_app_id(unit), marker));
         let finalized = CommitBuilder::from(properties)
             .with_actions(actions)
-            .build(
-                Some(table.snapshot()?),
-                table.log_store(),
-                DeltaOperation::Write { mode: SaveMode::Append, partition_by: None, predicate: None },
-            )
+            .build(Some(table.snapshot()?), table.log_store(), operation)
             .await?;
         // The commit advanced the table behind any cached handle.
         self.table_cache.lock().await.remove(table_name);
@@ -538,6 +660,125 @@ mod tests {
         let dropped = with_archive_unit_column(&Schema::new(vec![Field::new("id", DataType::Int64, false)])).unwrap();
         let err = writer.ensure_archive_table("messages", dropped, "UTC").await.unwrap_err().to_string();
         assert!(err.contains("`subject` is in the archive but no longer in the source"), "got: {err}");
+    }
+
+    async fn file_uris(writer: &DeltaWriter) -> Vec<String> {
+        writer.open_table("messages").await.unwrap().get_file_uris().unwrap().collect()
+    }
+
+    async fn replace(writer: &DeltaWriter, unit: i64, chunks: Vec<RecordBatch>, allow_fewer: bool) -> Result<u64> {
+        writer.begin_replace_unit("messages", unit, allow_fewer).await?;
+        for chunk in chunks {
+            writer.stage_archive_chunk("messages", vec![chunk]).await?;
+        }
+        writer.commit_archive_unit("messages").await
+    }
+
+    #[tokio::test]
+    async fn a_replace_swaps_exactly_one_unit_in_one_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = archive_table(dir.path()).await;
+        archive(&writer, 909, vec![rows(1..=60), rows(61..=100)]).await;
+        let unit_909_files = file_uris(&writer).await;
+        archive(&writer, 856, vec![rows(101..=150)]).await;
+        let other_files: Vec<String> =
+            file_uris(&writer).await.into_iter().filter(|f| !unit_909_files.contains(f)).collect();
+        assert_eq!(other_files.len(), 1);
+        let before = writer.open_table("messages").await.unwrap().version();
+
+        assert_eq!(writer.begin_replace_unit("messages", 909, true).await.unwrap(), 2, "unit 909 is in two files");
+        writer.stage_archive_chunk("messages", vec![rows(1..=99)]).await.unwrap();
+        assert_eq!(writer.commit_archive_unit("messages").await.unwrap(), 99);
+
+        let table = writer.open_table("messages").await.unwrap();
+        assert_eq!(table.version(), before.map(|v| v + 1), "one commit");
+        let history = table.history(Some(1)).await.unwrap().collect::<Vec<_>>();
+        let params = history[0].operation_parameters.clone().unwrap_or_default();
+        assert_eq!(params.get("mode"), Some(&serde_json::json!("Overwrite")));
+        assert_eq!(params.get("predicate"), Some(&serde_json::json!("_archive_unit = 909")));
+        let live: Vec<String> = table.get_file_uris().unwrap().collect();
+        assert!(other_files.iter().all(|f| live.contains(f)), "unit 856's file is untouched");
+        assert!(unit_909_files.iter().all(|f| !live.contains(f)), "unit 909's old files are removed");
+        let b = query(&writer, "SELECT count(*) FROM t WHERE `_archive_unit` = 909").await;
+        assert_eq!(i64_cell(&b, 0), 99);
+        let b = query(&writer, "SELECT count(*) FROM t WHERE `_archive_unit` = 856").await;
+        assert_eq!(i64_cell(&b, 0), 50);
+    }
+
+    #[tokio::test]
+    async fn a_replace_refuses_an_empty_new_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = archive_table(dir.path()).await;
+        archive(&writer, 909, vec![rows(1..=10)]).await;
+        let before = writer.open_table("messages").await.unwrap().version();
+        let err = replace(&writer, 909, vec![], true).await.unwrap_err().to_string();
+        assert!(err.contains("refusing to replace unit 909") && err.contains("no rows"), "got: {err}");
+        assert_eq!(writer.open_table("messages").await.unwrap().version(), before, "table unchanged");
+        let b = query(&writer, "SELECT count(*) FROM t WHERE `_archive_unit` = 909").await;
+        assert_eq!(i64_cell(&b, 0), 10, "the archived rows are still there");
+    }
+
+    #[tokio::test]
+    async fn a_replace_refuses_a_file_holding_another_unit_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = archive_table(dir.path()).await;
+        // A file the archive writer would never produce: two units in one file.
+        let mixed = RecordBatch::try_new(
+            with_archive_unit_column(&source_schema()).unwrap(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(Int64Array::from(vec![909, 856])),
+            ],
+        )
+        .unwrap();
+        let table = writer.open_table("messages").await.unwrap();
+        table.write(vec![mixed]).with_save_mode(SaveMode::Append).await.unwrap();
+        let err = writer.begin_replace_unit("messages", 909, false).await.unwrap_err().to_string();
+        assert!(err.contains("not unit 909 alone"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn replacing_a_unit_never_archived_archives_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = archive_table(dir.path()).await;
+        assert_eq!(replace(&writer, 909, vec![rows(1..=5)], false).await.unwrap(), 5);
+        assert!(writer.archive_unit_present("messages", 909).await.unwrap());
+        let err = writer.begin_archive_unit("messages", 909).await.unwrap_err().to_string();
+        assert!(err.contains("already archived"), "the replace recorded the unit's marker: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_replace_refuses_a_smaller_copy_unless_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = archive_table(dir.path()).await;
+        archive(&writer, 909, vec![rows(1..=10)]).await;
+        let before = writer.open_table("messages").await.unwrap().version();
+        let err = replace(&writer, 909, vec![rows(1..=9)], false).await.unwrap_err().to_string();
+        assert!(err.contains("holds 9 row(s)") && err.contains("fewer than the 10 archived"), "got: {err}");
+        assert_eq!(writer.open_table("messages").await.unwrap().version(), before, "table unchanged");
+
+        assert_eq!(replace(&writer, 909, vec![rows(1..=10)], false).await.unwrap(), 10, "the same count is fine");
+        assert_eq!(replace(&writer, 909, vec![rows(1..=12)], false).await.unwrap(), 12, "more rows are fine");
+        assert_eq!(replace(&writer, 909, vec![rows(1..=9)], true).await.unwrap(), 9, "allowed explicitly");
+        let b = query(&writer, "SELECT count(*) FROM t WHERE `_archive_unit` = 909").await;
+        assert_eq!(i64_cell(&b, 0), 9);
+    }
+
+    #[tokio::test]
+    async fn each_replace_advances_the_units_transaction_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = archive_table(dir.path()).await;
+        let marker = async |w: &DeltaWriter| {
+            let t = w.open_table("messages").await.unwrap();
+            t.snapshot().unwrap().transaction_version(t.log_store().as_ref(), unit_app_id(909)).await.unwrap()
+        };
+        archive(&writer, 909, vec![rows(1..=3)]).await;
+        assert_eq!(marker(&writer).await, Some(1));
+        replace(&writer, 909, vec![rows(1..=3)], false).await.unwrap();
+        assert_eq!(marker(&writer).await, Some(2));
+        replace(&writer, 909, vec![rows(1..=3)], false).await.unwrap();
+        assert_eq!(marker(&writer).await, Some(3));
     }
 
     #[test]
