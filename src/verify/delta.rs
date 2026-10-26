@@ -29,27 +29,27 @@ impl DeltaProbeAdapter {
         }
     }
 
-    fn str_at(batch: &deltalake::arrow::record_batch::RecordBatch, col_idx: usize) -> Option<String> {
+    fn str_at(batch: &deltalake::arrow::record_batch::RecordBatch, row: usize, col_idx: usize) -> Option<String> {
         let column = batch.column(col_idx);
         if let Some(arr) = column.as_any().downcast_ref::<StringArray>() {
-            (!arr.is_empty() && !arr.is_null(0)).then(|| arr.value(0).to_string())
+            (row < arr.len() && !arr.is_null(row)).then(|| arr.value(row).to_string())
         } else if let Some(arr) = column.as_any().downcast_ref::<StringViewArray>() {
-            (!arr.is_empty() && !arr.is_null(0)).then(|| arr.value(0).to_string())
+            (row < arr.len() && !arr.is_null(row)).then(|| arr.value(row).to_string())
         } else {
             None
         }
     }
 
-    fn i64_at(batch: &deltalake::arrow::record_batch::RecordBatch, col_idx: usize) -> i64 {
+    fn i64_at(batch: &deltalake::arrow::record_batch::RecordBatch, row: usize, col_idx: usize) -> i64 {
         batch
             .column(col_idx)
             .as_any()
             .downcast_ref::<Int64Array>()
             .and_then(|a| {
-                if a.is_empty() || a.is_null(0) {
+                if row >= a.len() || a.is_null(row) {
                     None
                 } else {
-                    Some(a.value(0))
+                    Some(a.value(row))
                 }
             })
             .unwrap_or(0)
@@ -124,26 +124,26 @@ impl DeltaProbeAdapter {
 
     /// Read one column's slice of the aggregate result batch, matching `column_exprs`'s slot
     /// count for that column's `AggKind`.
-    fn read_column_values(b: &RecordBatch, offset: &mut usize, kind: &AggKind) -> ColumnAggValues {
+    fn read_column_values(b: &RecordBatch, row: usize, offset: &mut usize, kind: &AggKind) -> ColumnAggValues {
         match kind {
             AggKind::Integer | AggKind::Decimal { .. } => {
-                let sum = Self::str_at(b, *offset);
-                let min = Self::str_at(b, *offset + 1);
-                let max = Self::str_at(b, *offset + 2);
-                let non_null_count = Self::i64_at(b, *offset + 3);
+                let sum = Self::str_at(b, row, *offset);
+                let min = Self::str_at(b, row, *offset + 1);
+                let max = Self::str_at(b, row, *offset + 2);
+                let non_null_count = Self::i64_at(b, row, *offset + 3);
                 *offset += 4;
                 ColumnAggValues { sum, min, max, non_null_count }
             }
             AggKind::DatetimeSec | AggKind::DateOnly => {
-                let min = Self::str_at(b, *offset);
-                let max = Self::str_at(b, *offset + 1);
-                let non_null_count = Self::i64_at(b, *offset + 2);
+                let min = Self::str_at(b, row, *offset);
+                let max = Self::str_at(b, row, *offset + 1);
+                let non_null_count = Self::i64_at(b, row, *offset + 2);
                 *offset += 3;
                 ColumnAggValues { sum: None, min, max, non_null_count }
             }
             AggKind::TextMass => {
-                let sum = Self::str_at(b, *offset);
-                let non_null_count = Self::i64_at(b, *offset + 1);
+                let sum = Self::str_at(b, row, *offset);
+                let non_null_count = Self::i64_at(b, row, *offset + 1);
                 *offset += 2;
                 ColumnAggValues { sum, min: None, max: None, non_null_count }
             }
@@ -154,7 +154,7 @@ impl DeltaProbeAdapter {
         let mut offset = 0;
         columns
             .iter()
-            .map(|col| Self::read_column_values(b, &mut offset, &col.kind))
+            .map(|col| Self::read_column_values(b, 0, &mut offset, &col.kind))
             .collect()
     }
 }

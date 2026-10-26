@@ -344,6 +344,17 @@ pub(crate) fn assemble_fingerprints(
     src: &[ColumnAggValues],
     dlt: &[ColumnAggValues],
 ) -> Vec<(String, String)> {
+    fingerprint_pairs(specs, src, dlt, true)
+}
+
+/// `assemble_fingerprints` with the overflow-guard notice optional: the V9 bucketed check builds
+/// fingerprints once per bucket, where printing the notice each time would flood the output.
+fn fingerprint_pairs(
+    specs: &[ColumnAgg],
+    src: &[ColumnAggValues],
+    dlt: &[ColumnAggValues],
+    report_overflow: bool,
+) -> Vec<(String, String)> {
     let empty = ColumnAggValues {
         sum: None,
         min: None,
@@ -360,7 +371,7 @@ pub(crate) fn assemble_fingerprints(
                 AggKind::Integer | AggKind::Decimal { .. } => {
                     let overflow = sum_would_overflow(&spec.kind, s.min.as_deref(), s.max.as_deref(), s.non_null_count)
                         || sum_would_overflow(&spec.kind, d.min.as_deref(), d.max.as_deref(), d.non_null_count);
-                    if overflow {
+                    if overflow && report_overflow {
                         println!(
                             "verify column `{}`: SUM skipped on both sides (decimal precision overflow guard — DataFusion would silently corrupt an overflowing DECIMAL sum)",
                             spec.name
@@ -1059,66 +1070,66 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
             //    scoped-to-HWM (V1b-2).
             //  - non-scoped, non-append-log (full-refresh/basic/two-stream): full compare (V1b-1).
             //  - no-HWM append-log incremental: no fair window -> skip with a note.
-            if matches!(outcome, TableOutcome::Pass | TableOutcome::PartiallyVerified { .. }) {
-                let specs: Vec<ColumnAgg> = scols
-                    .iter()
-                    .filter(|c| {
-                        dnames.contains(c.name.as_str())
-                            && Some(c.name.as_str()) != key_col.as_deref()
-                    })
-                    .filter_map(|c| {
-                        agg_kind(&c.type_str).map(|k| {
-                            // VA2: decimals aggregate at the column's own NATIVE scale
-                            // (from information_schema.NUMERIC_SCALE) instead of a fixed
-                            // scale — otherwise round-then-sum (source) vs sum-then-round
-                            // (fixed-scale cast) diverge deterministically for scale>10.
-                            let kind = match k {
-                                AggKind::Decimal { .. } => AggKind::Decimal {
-                                    scale: c.numeric_scale.unwrap_or(10).min(30),
-                                },
-                                other => other,
-                            };
-                            ColumnAgg { name: c.name.clone(), kind }
-                        })
-                    })
-                    .collect();
-                if !specs.is_empty() {
-                    let pair: Option<(Vec<ColumnAggValues>, Vec<ColumnAggValues>)> =
-                        if let Some(scope) = incremental_scope.as_ref() {
-                            Some((
-                                self.source.value_aggregates_scoped(table, &specs, scope).await?,
-                                self.delta
-                                    .value_aggregates_latest(table, &specs, &scope.cursor_col, scope)
-                                    .await?,
-                            ))
-                        } else if matches!(&delta_keystats, Some(d) if d.count != d.distinct) {
-                            println!(
-                                "verify {table} value-aggregates: skipped (append-log without HWM — no fair comparison window)"
-                            );
-                            None
-                        } else {
-                            Some((
-                                self.source.value_aggregates(table, &specs).await?,
-                                self.delta.value_aggregates(table, &specs).await?,
-                            ))
+            let specs: Vec<ColumnAgg> = scols
+                .iter()
+                .filter(|c| {
+                    dnames.contains(c.name.as_str())
+                        && Some(c.name.as_str()) != key_col.as_deref()
+                })
+                .filter_map(|c| {
+                    agg_kind(&c.type_str).map(|k| {
+                        // VA2: decimals aggregate at the column's own NATIVE scale
+                        // (from information_schema.NUMERIC_SCALE) instead of a fixed
+                        // scale — otherwise round-then-sum (source) vs sum-then-round
+                        // (fixed-scale cast) diverge deterministically for scale>10.
+                        let kind = match k {
+                            AggKind::Decimal { .. } => AggKind::Decimal {
+                                scale: c.numeric_scale.unwrap_or(10).min(30),
+                            },
+                            other => other,
                         };
-                    if let Some((sv, dv)) = pair {
-                        let fingerprints = assemble_fingerprints(&specs, &sv, &dv);
-                        let mismatches: Vec<String> = specs
-                            .iter()
-                            .zip(fingerprints.iter())
-                            .filter(|(_, (s, d))| s != d)
-                            .map(|(spec, (s, d))| {
-                                format!("{} ({:?}: source={} delta={})", spec.name, spec.kind, s, d)
-                            })
-                            .collect();
-                        if mismatches.is_empty() {
-                            println!("verify {table} value-aggregates: {} column(s) match", specs.len());
-                        } else {
-                            outcome = TableOutcome::Discrepancy {
-                                reason: format!("column value mismatch: {}", mismatches.join(", ")),
-                            };
-                        }
+                        ColumnAgg { name: c.name.clone(), kind }
+                    })
+                })
+                .collect();
+            if matches!(outcome, TableOutcome::Pass | TableOutcome::PartiallyVerified { .. })
+                && !specs.is_empty()
+            {
+                let pair: Option<(Vec<ColumnAggValues>, Vec<ColumnAggValues>)> =
+                    if let Some(scope) = incremental_scope.as_ref() {
+                        Some((
+                            self.source.value_aggregates_scoped(table, &specs, scope).await?,
+                            self.delta
+                                .value_aggregates_latest(table, &specs, &scope.cursor_col, scope)
+                                .await?,
+                        ))
+                    } else if matches!(&delta_keystats, Some(d) if d.count != d.distinct) {
+                        println!(
+                            "verify {table} value-aggregates: skipped (append-log without HWM — no fair comparison window)"
+                        );
+                        None
+                    } else {
+                        Some((
+                            self.source.value_aggregates(table, &specs).await?,
+                            self.delta.value_aggregates(table, &specs).await?,
+                        ))
+                    };
+                if let Some((sv, dv)) = pair {
+                    let fingerprints = assemble_fingerprints(&specs, &sv, &dv);
+                    let mismatches: Vec<String> = specs
+                        .iter()
+                        .zip(fingerprints.iter())
+                        .filter(|(_, (s, d))| s != d)
+                        .map(|(spec, (s, d))| {
+                            format!("{} ({:?}: source={} delta={})", spec.name, spec.kind, s, d)
+                        })
+                        .collect();
+                    if mismatches.is_empty() {
+                        println!("verify {table} value-aggregates: {} column(s) match", specs.len());
+                    } else {
+                        outcome = TableOutcome::Discrepancy {
+                            reason: format!("column value mismatch: {}", mismatches.join(", ")),
+                        };
                     }
                 }
             }
