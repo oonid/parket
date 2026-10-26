@@ -5,7 +5,7 @@ use deltalake::arrow::datatypes::SchemaRef;
 use tracing::{info, warn};
 
 use crate::query::QueryBuilder;
-use crate::writer::{extract_hwm_from_batch, hwm_has_advanced};
+use crate::writer::{OVERWRITE_CAVEAT, extract_hwm_from_batch, hwm_has_advanced};
 
 use super::Orchestrator;
 use super::schema::align_batches_to_schema;
@@ -41,7 +41,8 @@ where
                     "incremental cursor `{ts_col}` on table `{table_name}` is nullable and {null_rows} \
                      row(s) have a NULL `{ts_col}` — those rows are EXCLUDED from incremental \
                      extraction (the cursor query filters `{ts_col} IS NOT NULL`) and will never \
-                     sync; run this table as full_refresh if they must be captured (see audit D2/O3)"
+                     sync; run this table as full_refresh if they must be captured (see audit D2/O3) \
+                     ({OVERWRITE_CAVEAT})"
                 );
             }
         }
@@ -66,7 +67,8 @@ where
             anyhow::bail!(
                 "table `{table_name}` already has data in Delta but no stored HWM — refusing to \
                  re-extract from scratch with append (every row would be duplicated). Set \
-                 TABLE_HWM_{table_name} to the snapshot's max cursor, or full-refresh the table"
+                 TABLE_HWM_{table_name} to the snapshot's max cursor, or full-refresh the table \
+                 ({OVERWRITE_CAVEAT})"
             );
         }
 
@@ -128,7 +130,7 @@ where
                      non-empty batch — cursor `{ts_col}`/`{key_col}` is present but not an \
                      extractable type (or the key overflowed i64); appending would duplicate \
                      rows on the next run. Fix the cursor column type or run this table as \
-                     full_refresh"
+                     full_refresh ({OVERWRITE_CAVEAT})"
                 );
             }
             // N2/R2: a FULL batch whose HWM did not advance means keyset pagination is stuck —
@@ -658,6 +660,7 @@ mod tests {
             err.to_string().contains("could not extract a HWM from a non-empty batch"),
             "unexpected error message: {err}"
         );
+        assert!(err.to_string().contains(crate::writer::OVERWRITE_CAVEAT), "got: {err}");
     }
 
     #[tokio::test]
@@ -1032,8 +1035,11 @@ mod tests {
         state_mock.expect_update_table().returning(|_, _, _| Ok(()));
 
         let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
-        let result = orch.run().await;
-        assert!(matches!(result, ExitCode::Fatal), "sole table must fail: {result:?}");
+        let err = orch.process_table("orders").await.expect_err("must refuse to re-extract");
+        let err = err.to_string();
+        // The non-destructive remedy comes first; the overwrite alternative states its cost.
+        assert!(err.contains("TABLE_HWM_orders"), "got: {err}");
+        assert!(err.contains(crate::writer::OVERWRITE_CAVEAT), "got: {err}");
     }
 
     #[tokio::test]

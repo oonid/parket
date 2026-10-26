@@ -4,7 +4,7 @@ use std::collections::HashMap;
 mod delta;
 mod source;
 
-use crate::writer::Hwm;
+use crate::writer::{Hwm, OVERWRITE_CAVEAT};
 pub use delta::DeltaProbeAdapter;
 pub use source::SourceProbeAdapter;
 
@@ -726,7 +726,7 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                 reason: format!(
                     "{delta_label} holds DUPLICATE KEYS: count={} > distinct={} ({surplus} surplus row(s)). \
                      two_stream keeps exactly one row per key, so these are duplicated rows (FA2-class); \
-                     remediate with a TABLE_RECONCILE_<table>=true one-shot. \
+                     remediate with a TABLE_RECONCILE_<table>=true one-shot ({OVERWRITE_CAVEAT}). \
                      ({source_label}: count={} distinct={})",
                     delta_stats.count, delta_stats.distinct, source_stats.count, source_stats.distinct
                 ),
@@ -3599,6 +3599,7 @@ mod tests {
             TableOutcome::Discrepancy { reason } => {
                 assert!(reason.contains("DUPLICATE KEYS"), "got: {reason}");
                 assert!(reason.contains("3 surplus"), "should name the surplus: {reason}");
+                assert!(reason.contains(crate::writer::OVERWRITE_CAVEAT), "got: {reason}");
             }
             other => panic!("expected Discrepancy for duplicate keys, got {other:?}"),
         }

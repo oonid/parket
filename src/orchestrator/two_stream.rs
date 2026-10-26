@@ -5,7 +5,7 @@ use deltalake::arrow::datatypes::SchemaRef;
 use tracing::{info, warn};
 
 use crate::query::QueryBuilder;
-use crate::writer::{extract_hwm_from_batch, extract_max_id, hwm_has_advanced, Hwm};
+use crate::writer::{extract_hwm_from_batch, extract_max_id, hwm_has_advanced, Hwm, OVERWRITE_CAVEAT};
 
 use super::Orchestrator;
 use super::schema::align_batches_to_schema;
@@ -41,7 +41,7 @@ where
                      {null_rows} row(s) have a NULL `{update_col}` — completions on those rows are \
                      EXCLUDED from the update stream (the query filters `{update_col} IS NOT NULL`) \
                      and will never sync; run this table as full_refresh if they must be captured \
-                     (see audit D2/O3)"
+                     (see audit D2/O3) ({OVERWRITE_CAVEAT})"
                 );
             }
         }
@@ -80,7 +80,8 @@ where
             anyhow::bail!(
                 "table `{table_name}` already has data in Delta but no stored insert watermark — \
                  refusing to re-run the insert stream from the beginning (every row would be \
-                 duplicated). Set TABLE_HWM_{table_name}, or full-refresh the table"
+                 duplicated). Set TABLE_HWM_{table_name}, or full-refresh the table \
+                 ({OVERWRITE_CAVEAT})"
             );
         }
 
@@ -248,7 +249,7 @@ where
                     "two-stream update batch for table `{table_name}` could not extract a HWM \
                      from a non-empty batch — cursor `{update_col}`/`{insert_col}` is present but \
                      not an extractable type; re-processing would repeat on the next run. Fix the \
-                     cursor column type or full_refresh the table"
+                     cursor column type or full_refresh the table ({OVERWRITE_CAVEAT})"
                 );
             }
             if chunk_rows == batch_size
@@ -1531,8 +1532,11 @@ mod tests {
         state_mock.expect_update_table().returning(|_, _, _| Ok(()));
 
         let mut orch = make_orchestrator(config, schema_mock, extract_mock, writer_mock, state_mock, dir.path().to_path_buf());
-        let result = orch.run().await;
-        assert!(matches!(result, ExitCode::Fatal), "sole table must fail: {result:?}");
+        let err = orch.process_table("orders").await.expect_err("must refuse to re-extract");
+        let err = err.to_string();
+        // The non-destructive remedy comes first; the overwrite alternative states its cost.
+        assert!(err.contains("TABLE_HWM_orders"), "got: {err}");
+        assert!(err.contains(crate::writer::OVERWRITE_CAVEAT), "got: {err}");
     }
 
     #[tokio::test]
