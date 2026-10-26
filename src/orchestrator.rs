@@ -294,8 +294,8 @@ where
         if let Some(scope) = self.config.archive_scope(table_name) {
             anyhow::bail!(
                 "table `{table_name}` is in archive mode (TABLE_ARCHIVE_{table_name}=`{scope}`); a \
-                 sync run never processes archive tables. Use `--archive-units` and \
-                 `--verify-archive-units` for it"
+                 sync run never processes archive tables. Use `--archive-units`, \
+                 `--verify-archive-units` and `--replace-archive-units` for it"
             );
         }
         let start = Instant::now();

@@ -221,6 +221,7 @@ pub trait ArchiveSink: Send + Sync {
     async fn ensure_archive_table(&self, table: &str, schema: SchemaRef, source_time_zone: &str) -> Result<()>;
     async fn archive_unit_present(&self, table: &str, unit: i64) -> Result<bool>;
     async fn begin_archive_unit(&self, table: &str, unit: i64) -> Result<()>;
+    async fn begin_replace_unit(&self, table: &str, unit: i64, allow_fewer: bool) -> Result<usize>;
     async fn stage_archive_chunk(&self, table: &str, batches: Vec<RecordBatch>) -> Result<()>;
     async fn commit_archive_unit(&self, table: &str) -> Result<u64>;
     async fn abort_archive_unit(&self, table: &str);
@@ -235,6 +236,9 @@ impl ArchiveSink for DeltaWriter {
     }
     async fn begin_archive_unit(&self, table: &str, unit: i64) -> Result<()> {
         DeltaWriter::begin_archive_unit(self, table, unit).await
+    }
+    async fn begin_replace_unit(&self, table: &str, unit: i64, allow_fewer: bool) -> Result<usize> {
+        DeltaWriter::begin_replace_unit(self, table, unit, allow_fewer).await
     }
     async fn stage_archive_chunk(&self, table: &str, batches: Vec<RecordBatch>) -> Result<()> {
         DeltaWriter::stage_archive_chunk(self, table, batches).await
@@ -263,6 +267,8 @@ pub enum UnitOutcome {
     AlreadyArchived,
     /// The source holds no rows of the unit in this table; nothing was committed.
     NoRows,
+    /// A unit-scoped replace swapped the unit's `files` previous files for `rows` re-extracted rows.
+    Replaced { rows: u64, files: usize },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -311,6 +317,25 @@ impl<S: SchemaInspect, E: Extract, W: ArchiveSink> Archiver<S, E, W> {
     /// error, after aborting that table's in-flight unit; units committed before it stay committed
     /// and are skipped by a re-run.
     pub async fn archive_units(&mut self, tables: &[ArchiveTable], units: &[i64]) -> Result<Vec<UnitResult>> {
+        self.run(tables, units, None).await
+    }
+
+    /// Re-extract every unit in `units` in every table of `tables` and replace exactly its files —
+    /// the repair for a unit that failed verification. Only for units not yet handed over for
+    /// deletion from the source: the replace refuses an empty new copy, and a copy with fewer rows
+    /// than the archived one unless `allow_fewer`, but cannot know what the caller has done with
+    /// the unit since.
+    pub async fn replace_units(
+        &mut self,
+        tables: &[ArchiveTable],
+        units: &[i64],
+        allow_fewer: bool,
+    ) -> Result<Vec<UnitResult>> {
+        self.run(tables, units, Some(allow_fewer)).await
+    }
+
+    /// `replace` is `None` to archive, `Some(allow_fewer)` to replace.
+    async fn run(&mut self, tables: &[ArchiveTable], units: &[i64], replace: Option<bool>) -> Result<Vec<UnitResult>> {
         let mut prepared = Vec::with_capacity(tables.len());
         for table in tables {
             prepared.push(self.prepare(table).await?);
@@ -318,10 +343,13 @@ impl<S: SchemaInspect, E: Extract, W: ArchiveSink> Archiver<S, E, W> {
         let mut results = Vec::with_capacity(units.len() * prepared.len());
         for &unit in units {
             for table in &prepared {
-                let outcome = self
-                    .archive_one(table, unit)
-                    .await
-                    .with_context(|| format!("archiving unit {unit} of `{}`", table.name))?;
+                let outcome = match replace {
+                    Some(allow_fewer) => self.replace_one(table, unit, allow_fewer).await,
+                    None => self.archive_one(table, unit).await,
+                }
+                .with_context(|| {
+                    format!("{} unit {unit} of `{}`", if replace.is_some() { "replacing" } else { "archiving" }, table.name)
+                })?;
                 results.push(UnitResult { unit, table: table.name.clone(), outcome });
             }
         }
@@ -392,6 +420,16 @@ impl<S: SchemaInspect, E: Extract, W: ArchiveSink> Archiver<S, E, W> {
             0 => UnitOutcome::NoRows,
             rows => UnitOutcome::Archived { rows },
         })
+    }
+
+    async fn replace_one(&mut self, table: &PreparedTable, unit: i64, allow_fewer: bool) -> Result<UnitOutcome> {
+        let files = self.sink.begin_replace_unit(&table.name, unit, allow_fewer).await?;
+        if let Err(e) = self.stage_pages(table, unit).await {
+            self.sink.abort_archive_unit(&table.name).await;
+            return Err(e);
+        }
+        let rows = self.sink.commit_archive_unit(&table.name).await?;
+        Ok(if rows == 0 { UnitOutcome::NoRows } else { UnitOutcome::Replaced { rows, files } })
     }
 
     async fn stage_pages(&mut self, table: &PreparedTable, unit: i64) -> Result<()> {
@@ -690,6 +728,24 @@ mod tests {
             let sql = seen.lock().unwrap().clone();
             assert!(sql[0].ends_with("LIMIT 8"), "got: {}", sql[0]);
             assert!(sql[1].ends_with("LIMIT 2"), "the breaker's smaller batch is used: {}", sql[1]);
+        }
+
+        #[tokio::test]
+        async fn a_replace_re_reads_the_unit_without_checking_presence() {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let staged = Arc::new(Mutex::new(Vec::new()));
+            let mut s = sink(true, staged.clone());
+            s.expect_archive_unit_present().times(0);
+            s.expect_begin_archive_unit().times(0);
+            s.expect_begin_replace_unit()
+                .withf(|_, unit, allow_fewer| *unit == 909 && *allow_fewer)
+                .times(1)
+                .returning(|_, _, _| Ok(2));
+            let pages = vec![(vec![page(1..=2)], false)];
+            let mut archiver = Archiver::new(inspect(), extract(pages, seen.clone()), s, "UTC").with_max_page_rows(3);
+            let results = archiver.replace_units(&table(), &[909], true).await.unwrap();
+            assert_eq!(results[0].outcome, UnitOutcome::Replaced { rows: 2, files: 2 });
+            assert_eq!(seen.lock().unwrap().len(), 1);
         }
 
         #[tokio::test]
