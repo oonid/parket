@@ -1,6 +1,6 @@
 # Archive mode — design
 
-Status: **proposed**.
+Status: **implemented**.
 
 ## Context
 
@@ -179,11 +179,11 @@ that is the expected state of a purged unit.
 
 Each step ships with tests and passes the gate before the next starts.
 
-1. **Guard** — `TABLE_ARCHIVE_<t>` parsing and the startup refusals.
+1. **Guard** — `TABLE_ARCHIVE_<t>` parsing and the startup refusals. ✅
 2. **Per-unit append** — (a) the writer: one append-only commit per `(table, unit)`, `_archive_unit`,
-   ZSTD, "already archived" from the data; (b) scoped, key-paged extraction in UTC with typed
-   timestamps and zone metadata; (c) the library API and CLI.
-3. **Unit verification** — row-by-row digest comparison on both engines, Docker-tested.
+   ZSTD, "already archived" from the data ✅; (b) scoped, key-paged extraction in UTC with typed
+   timestamps and zone metadata ✅; (c) the library API and CLI ✅.
+3. **Unit verification** — row-by-row digest comparison on both engines, Docker-tested ✅.
 4. **Unit-scoped replace** — refuses a file holding another unit, an empty new copy, and a smaller
-   one unless allowed.
-5. **Operator docs** — configuration and the archive commands.
+   one unless allowed ✅.
+5. **Operator docs** — configuration and the archive commands ✅.
