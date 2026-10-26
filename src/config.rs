@@ -41,6 +41,9 @@ pub struct Config {
     /// predicate (one `?` for the unit id). Such a table never runs a sync mode — see
     /// `parse::validate_archive_guard` and docs/design/archive-mode.md.
     pub table_archive: HashMap<String, String>,
+    /// Archive mode: the source's IANA time zone (`ARCHIVE_SOURCE_TIME_ZONE`), recorded on every
+    /// archived timestamp column. Present whenever `table_archive` is non-empty.
+    pub archive_source_time_zone: Option<String>,
 }
 
 // S1: a derived Debug would print `database_url` (with password) and
@@ -73,6 +76,7 @@ impl std::fmt::Debug for Config {
             .field("table_update_cursor", &self.table_update_cursor)
             .field("table_reconcile", &self.table_reconcile)
             .field("table_archive", &self.table_archive)
+            .field("archive_source_time_zone", &self.archive_source_time_zone)
             .finish()
     }
 }
@@ -236,6 +240,7 @@ impl Config {
             &table_update_cursor,
             &table_reconcile,
         )?;
+        let archive_source_time_zone = parse_archive_source_time_zone(&table_archive)?;
         validate_reconcile_requirements(&table_reconcile, &table_modes, &table_insert_cursor, &table_update_cursor)?;
 
         Ok(Self {
@@ -259,6 +264,7 @@ impl Config {
             table_update_cursor,
             table_reconcile,
             table_archive,
+            archive_source_time_zone,
         })
     }
 
@@ -345,6 +351,7 @@ impl Config {
             &table_update_cursor,
             &table_reconcile,
         )?;
+        let archive_source_time_zone = parse_archive_source_time_zone(&table_archive)?;
         validate_reconcile_requirements(&table_reconcile, &table_modes, &table_insert_cursor, &table_update_cursor)?;
 
         Ok(Self {
@@ -368,6 +375,7 @@ impl Config {
             table_update_cursor,
             table_reconcile,
             table_archive,
+            archive_source_time_zone,
         })
     }
 
@@ -411,6 +419,7 @@ mod tests {
         "UPDATE_STRATEGY",
         "MERGE_SORT_RESERVATION_MB",
         "MERGE_TARGET_PARTITIONS",
+        "ARCHIVE_SOURCE_TIME_ZONE",
     ];
 
     fn clear_config_env() {
@@ -1129,10 +1138,39 @@ mod tests {
         set_required_vars();
         unsafe {
             env::set_var("TABLE_ARCHIVE_orders", "  source_id = ?  ");
+            env::set_var("ARCHIVE_SOURCE_TIME_ZONE", "Asia/Jakarta");
         }
         let config = Config::load().expect("load should succeed");
         assert_eq!(config.archive_scope("orders"), Some("source_id = ?"));
         assert_eq!(config.archive_scope("customers"), None);
+        assert_eq!(config.archive_source_time_zone.as_deref(), Some("Asia/Jakarta"));
+    }
+
+    #[test]
+    #[serial]
+    fn archive_tables_require_a_source_time_zone() {
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("TABLE_ARCHIVE_orders", "source_id = ?");
+        }
+        let err = Config::load().unwrap_err().to_string();
+        assert!(err.contains("ARCHIVE_SOURCE_TIME_ZONE is required"), "got: {err}");
+        assert!(err.contains("orders"), "names the archive tables: {err}");
+        unsafe {
+            env::set_var("ARCHIVE_SOURCE_TIME_ZONE", "Asia/Jakarta; DROP");
+        }
+        let err = Config::load().unwrap_err().to_string();
+        assert!(err.contains("IANA time zone name"), "got: {err}");
+    }
+
+    #[test]
+    #[serial]
+    fn the_source_time_zone_is_optional_without_archive_tables() {
+        clear_config_env();
+        set_required_vars();
+        let config = Config::load().expect("load should succeed");
+        assert_eq!(config.archive_source_time_zone, None);
     }
 
     #[test]
@@ -1811,6 +1849,7 @@ mod tests {
             table_update_cursor: parse_table_update_cursor(&["orders".to_string(), "customers".to_string()]),
             table_reconcile: HashSet::new(),
             table_archive: HashMap::new(),
+            archive_source_time_zone: None,
         };
 
         assert_eq!(

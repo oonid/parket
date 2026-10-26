@@ -25,7 +25,7 @@ mod test_support;
 pub use adapters::{DeltaWriterAdapter, ExtractorAdapter, LocalDeltaWriterAdapter, SchemaInspectorAdapter, StateManageAdapter};
 pub(crate) use adapters::get_schema_impl;
 pub(crate) use schema::schema_evolution_check;
-use schema::mariadb_type_to_arrow;
+pub(crate) use schema::mariadb_type_to_arrow;
 use datetime::format_timestamp_now;
 
 #[cfg_attr(test, mockall::automock)]

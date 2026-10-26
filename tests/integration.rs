@@ -67,6 +67,7 @@ fn make_config(db_url: &str, s3_endpoint: &str, tables: Vec<&str>) -> Config {
         table_update_cursor: HashMap::new(),
         table_reconcile: std::collections::HashSet::new(),
         table_archive: std::collections::HashMap::new(),
+        archive_source_time_zone: None,
     }
 }
 
