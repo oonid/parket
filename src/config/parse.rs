@@ -217,6 +217,78 @@ pub(crate) fn validate_reconcile_requirements(
     Ok(())
 }
 
+/// Archive mode: `TABLE_ARCHIVE_<table>=<scope predicate>` marks a table whose rows are copied to
+/// Delta one unit (e.g. one campaign) at a time and later purged from the source, so its Delta copy
+/// may become the only copy (docs/design/archive-mode.md). The value is the SQL predicate that
+/// selects one unit's rows, with exactly one `?` for the unit id — `source_id = ?`, or a subquery
+/// for a table without the unit column. Parsed strictly: an empty value or a placeholder count
+/// other than one bails, naming the key.
+pub(crate) fn parse_table_archive(tables: &[String]) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+    for table in tables {
+        let key = format!("TABLE_ARCHIVE_{table}");
+        if let Ok(val) = std::env::var(&key) {
+            let scope = val.trim();
+            if scope.is_empty() {
+                bail!(
+                    "{key} is set but empty: give the SQL predicate that selects one archive \
+                     unit's rows, with `?` for the unit id (e.g. `source_id = ?`)"
+                );
+            }
+            let placeholders = scope.matches('?').count();
+            if placeholders != 1 {
+                bail!(
+                    "{key}={scope}: the scope predicate must contain exactly one `?` (the archive \
+                     unit id), found {placeholders}"
+                );
+            }
+            map.insert(table.clone(), scope.to_string());
+        }
+    }
+    Ok(map)
+}
+
+/// Archive guard: an archive table has exactly one mode. Every per-table setting that would steer
+/// it into a sync mode is rejected at startup, because the sync modes' repairs (full refresh,
+/// reconcile, re-seeded watermarks) replace the Delta table with the source's current rows, and
+/// after a purge that drops archived rows for good. All conflicts for a table are named at once.
+pub(crate) fn validate_archive_guard(
+    table_archive: &HashMap<String, String>,
+    table_modes: &HashMap<String, ExtractionMode>,
+    table_initial_hwm: &HashMap<String, (String, i64)>,
+    table_timestamp_col: &HashMap<String, String>,
+    table_insert_cursor: &HashMap<String, String>,
+    table_update_cursor: &HashMap<String, String>,
+    table_reconcile: &HashSet<String>,
+) -> Result<()> {
+    let mut tables: Vec<&String> = table_archive.keys().collect();
+    tables.sort();
+    for table in tables {
+        let conflicts: Vec<String> = [
+            ("TABLE_MODE", table_modes.contains_key(table)),
+            ("TABLE_RECONCILE", table_reconcile.contains(table)),
+            ("TABLE_INSERT_CURSOR", table_insert_cursor.contains_key(table)),
+            ("TABLE_UPDATE_CURSOR", table_update_cursor.contains_key(table)),
+            ("TABLE_HWM", table_initial_hwm.contains_key(table)),
+            ("TABLE_TIMESTAMP", table_timestamp_col.contains_key(table)),
+        ]
+        .into_iter()
+        .filter(|(_, set)| *set)
+        .map(|(prefix, _)| format!("{prefix}_{table}"))
+        .collect();
+        if !conflicts.is_empty() {
+            bail!(
+                "table '{table}' is in archive mode (TABLE_ARCHIVE_{table}), so it has exactly one \
+                 mode; remove {}. Each would steer it into a sync mode, and a sync mode's repairs \
+                 replace the whole Delta table with the source's current rows — dropping every row \
+                 already purged from the source",
+                conflicts.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Detect total physical RAM in MB by reading `/proc/meminfo` (`MemTotal:  N kB`).
 /// Returns None on any failure or non-Linux platform, so callers never block when
 /// RAM is unknowable. NOTE: in a container this reports the HOST total, not the
@@ -309,6 +381,71 @@ mod tests {
             err.contains("MERGE_MEMORY_MB"),
             "error should mention MERGE_MEMORY_MB, got: {err}"
         );
+    }
+
+    fn archive(table: &str) -> HashMap<String, String> {
+        HashMap::from([(table.to_string(), "source_id = ?".to_string())])
+    }
+
+    fn guard(
+        archive: &HashMap<String, String>,
+        modes: &HashMap<String, ExtractionMode>,
+        hwm: &HashMap<String, (String, i64)>,
+        ts: &HashMap<String, String>,
+        ins: &HashMap<String, String>,
+        upd: &HashMap<String, String>,
+        reconcile: &HashSet<String>,
+    ) -> Result<()> {
+        validate_archive_guard(archive, modes, hwm, ts, ins, upd, reconcile)
+    }
+
+    #[test]
+    fn archive_guard_accepts_an_archive_table_with_no_other_setting() {
+        let none = HashMap::new();
+        assert!(guard(&archive("messages"), &HashMap::new(), &HashMap::new(), &none, &none, &none, &HashSet::new()).is_ok());
+    }
+
+    #[test]
+    fn archive_guard_names_every_conflicting_setting() {
+        let t = "messages".to_string();
+        let modes = HashMap::from([(t.clone(), ExtractionMode::Auto)]);
+        let hwm = HashMap::from([(t.clone(), ("2026-01-01 00:00:00".to_string(), 1))]);
+        let ts = HashMap::from([(t.clone(), "updated_at".to_string())]);
+        let ins = HashMap::from([(t.clone(), "id".to_string())]);
+        let upd = HashMap::from([(t.clone(), "updated_at".to_string())]);
+        let reconcile = HashSet::from([t.clone()]);
+        let err = guard(&archive("messages"), &modes, &hwm, &ts, &ins, &upd, &reconcile)
+            .unwrap_err()
+            .to_string();
+        for key in [
+            "TABLE_MODE_messages",
+            "TABLE_RECONCILE_messages",
+            "TABLE_INSERT_CURSOR_messages",
+            "TABLE_UPDATE_CURSOR_messages",
+            "TABLE_HWM_messages",
+            "TABLE_TIMESTAMP_messages",
+        ] {
+            assert!(err.contains(key), "{key} missing from: {err}");
+        }
+        assert!(err.contains("archive mode"), "got: {err}");
+    }
+
+    #[test]
+    fn archive_guard_rejects_even_table_mode_auto() {
+        // Any TABLE_MODE value steers mode selection, `auto` included — an archive table has one.
+        let modes = HashMap::from([("messages".to_string(), ExtractionMode::Auto)]);
+        let none = HashMap::new();
+        let err = guard(&archive("messages"), &modes, &HashMap::new(), &none, &none, &none, &HashSet::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("TABLE_MODE_messages"), "got: {err}");
+    }
+
+    #[test]
+    fn archive_guard_ignores_settings_on_other_tables() {
+        let modes = HashMap::from([("orders".to_string(), ExtractionMode::FullRefresh)]);
+        let none = HashMap::new();
+        assert!(guard(&archive("messages"), &modes, &HashMap::new(), &none, &none, &none, &HashSet::new()).is_ok());
     }
 
     // PS-H-B: `validate_reconcile_requirements` is a pure function of already-parsed maps, so

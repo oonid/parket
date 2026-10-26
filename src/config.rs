@@ -37,6 +37,10 @@ pub struct Config {
     /// ALSO stamped with the two-stream HWM keys, so the next (flag-removed) run resumes as
     /// normal two-stream incremental with no manual HWM seed.
     pub table_reconcile: HashSet<String>,
+    /// Archive mode: tables with `TABLE_ARCHIVE_<table>=<scope predicate>`, mapped to that
+    /// predicate (one `?` for the unit id). Such a table never runs a sync mode — see
+    /// `parse::validate_archive_guard` and docs/design/archive-mode.md.
+    pub table_archive: HashMap<String, String>,
 }
 
 // S1: a derived Debug would print `database_url` (with password) and
@@ -68,6 +72,7 @@ impl std::fmt::Debug for Config {
             .field("table_insert_cursor", &self.table_insert_cursor)
             .field("table_update_cursor", &self.table_update_cursor)
             .field("table_reconcile", &self.table_reconcile)
+            .field("table_archive", &self.table_archive)
             .finish()
     }
 }
@@ -130,6 +135,11 @@ impl Config {
     /// should run its one-shot full-snapshot-plus-HWM-reseed path instead of its normal mode.
     pub fn is_reconcile(&self, table: &str) -> bool {
         self.table_reconcile.contains(table)
+    }
+
+    /// Archive mode: the table's scope predicate when `TABLE_ARCHIVE_<table>` is set.
+    pub fn archive_scope(&self, table: &str) -> Option<&str> {
+        self.table_archive.get(table).map(String::as_str)
     }
 
     /// Minimal load for `--inspect`: only DATABASE_URL is required.
@@ -214,6 +224,18 @@ impl Config {
         let table_update_cursor = parse_table_update_cursor(&tables);
         validate_mode_conflicts(&tables, &table_modes, &table_insert_cursor, &table_update_cursor)?;
         let table_reconcile = parse_table_reconcile(&tables)?;
+        // The archive guard runs first, so an archive table that also sets TABLE_RECONCILE gets
+        // the archive-specific refusal rather than a reconcile prerequisite error.
+        let table_archive = parse_table_archive(&tables)?;
+        validate_archive_guard(
+            &table_archive,
+            &table_modes,
+            &table_initial_hwm,
+            &table_timestamp_col,
+            &table_insert_cursor,
+            &table_update_cursor,
+            &table_reconcile,
+        )?;
         validate_reconcile_requirements(&table_reconcile, &table_modes, &table_insert_cursor, &table_update_cursor)?;
 
         Ok(Self {
@@ -236,6 +258,7 @@ impl Config {
             table_insert_cursor,
             table_update_cursor,
             table_reconcile,
+            table_archive,
         })
     }
 
@@ -310,6 +333,18 @@ impl Config {
         let table_update_cursor = parse_table_update_cursor(&tables);
         validate_mode_conflicts(&tables, &table_modes, &table_insert_cursor, &table_update_cursor)?;
         let table_reconcile = parse_table_reconcile(&tables)?;
+        // The archive guard runs first, so an archive table that also sets TABLE_RECONCILE gets
+        // the archive-specific refusal rather than a reconcile prerequisite error.
+        let table_archive = parse_table_archive(&tables)?;
+        validate_archive_guard(
+            &table_archive,
+            &table_modes,
+            &table_initial_hwm,
+            &table_timestamp_col,
+            &table_insert_cursor,
+            &table_update_cursor,
+            &table_reconcile,
+        )?;
         validate_reconcile_requirements(&table_reconcile, &table_modes, &table_insert_cursor, &table_update_cursor)?;
 
         Ok(Self {
@@ -332,6 +367,7 @@ impl Config {
             table_insert_cursor,
             table_update_cursor,
             table_reconcile,
+            table_archive,
         })
     }
 
@@ -398,6 +434,9 @@ mod tests {
                 env::remove_var(&key);
             }
             for (key, _) in env::vars().filter(|(k, _)| k.starts_with("TABLE_RECONCILE_")) {
+                env::remove_var(&key);
+            }
+            for (key, _) in env::vars().filter(|(k, _)| k.starts_with("TABLE_ARCHIVE_")) {
                 env::remove_var(&key);
             }
         }
@@ -1085,6 +1124,66 @@ mod tests {
 
     #[test]
     #[serial]
+    fn archive_scope_is_parsed_and_trimmed() {
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("TABLE_ARCHIVE_orders", "  source_id = ?  ");
+        }
+        let config = Config::load().expect("load should succeed");
+        assert_eq!(config.archive_scope("orders"), Some("source_id = ?"));
+        assert_eq!(config.archive_scope("customers"), None);
+    }
+
+    #[test]
+    #[serial]
+    fn archive_scope_empty_or_without_exactly_one_placeholder_bails() {
+        for (value, needle) in [("   ", "empty"), ("source_id = 7", "found 0"), ("a = ? AND b = ?", "found 2")] {
+            clear_config_env();
+            set_required_vars();
+            unsafe {
+                env::set_var("TABLE_ARCHIVE_orders", value);
+            }
+            let err = Config::load().unwrap_err().to_string();
+            assert!(err.contains("TABLE_ARCHIVE_orders"), "value {value:?} → {err}");
+            assert!(err.contains(needle), "value {value:?} → {err}");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn archive_table_with_a_sync_setting_is_refused_at_load() {
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("TABLE_ARCHIVE_orders", "source_id = ?");
+            env::set_var("TABLE_MODE_orders", "full_refresh");
+        }
+        let err = Config::load().unwrap_err().to_string();
+        assert!(err.contains("archive mode"), "got: {err}");
+        assert!(err.contains("TABLE_MODE_orders"), "got: {err}");
+    }
+
+    #[test]
+    #[serial]
+    fn archive_guard_wins_over_the_reconcile_prerequisite_error() {
+        // Reconcile without cursors would normally fail its own prerequisite check; on an archive
+        // table the operator must instead learn that reconcile is never allowed there.
+        clear_config_env();
+        unsafe {
+            env::set_var("DATABASE_URL", "mysql://user:pass@host:3306/dbname");
+            env::set_var("TABLES", "orders");
+            env::set_var("TARGET_MEMORY_MB", "512");
+            env::set_var("TABLE_ARCHIVE_orders", "source_id = ?");
+            env::set_var("TABLE_RECONCILE_orders", "true");
+        }
+        let err = Config::load_local().unwrap_err().to_string();
+        assert!(err.contains("archive mode"), "got: {err}");
+        assert!(err.contains("TABLE_RECONCILE_orders"), "got: {err}");
+    }
+
+    #[test]
+    #[serial]
     fn reconcile_invalid_value_bails() {
         clear_config_env();
         set_required_vars();
@@ -1711,6 +1810,7 @@ mod tests {
             table_insert_cursor: parse_table_insert_cursor(&["orders".to_string(), "customers".to_string()]),
             table_update_cursor: parse_table_update_cursor(&["orders".to_string(), "customers".to_string()]),
             table_reconcile: HashSet::new(),
+            table_archive: HashMap::new(),
         };
 
         assert_eq!(

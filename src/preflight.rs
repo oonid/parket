@@ -117,6 +117,21 @@ where
     async fn check_table(&self, table_name: &str) -> Result<()> {
         let columns = self.inspect.discover_columns(table_name).await?;
         let columns = filter_unsupported_columns(&columns);
+        // Archive guard: report an archive table as `archive` with its scope instead of resolving a
+        // sync mode — auto-detection would print `full_refresh`, which an archive table never runs.
+        if let Some(scope) = self.config.archive_scope(table_name) {
+            let avg_row_length = self.inspect.get_avg_row_length(table_name).await?;
+            println!(
+                "{:<30} {:<15} {:<10} {:<15} {:<20} {:<15}",
+                table_name,
+                "archive",
+                columns.len(),
+                avg_row_length.map(|v| v.to_string()).unwrap_or_else(|| "N/A".to_string()),
+                format!("scope: {scope}"),
+                "—",
+            );
+            return Ok(());
+        }
         let indexes = self.inspect.discover_indexes(table_name).await?;
         let (ts_col, mode) = crate::discovery::resolve_ts_col_and_mode(&columns, &indexes, &self.config, table_name)?;
 
@@ -399,6 +414,7 @@ mod tests {
             table_insert_cursor: HashMap::new(),
             table_update_cursor: HashMap::new(),
             table_reconcile: std::collections::HashSet::new(),
+            table_archive: std::collections::HashMap::new(),
         }
     }
 
@@ -609,6 +625,31 @@ mod tests {
         let check = PreflightCheck::new(config, inspect, storage, hwm);
         let result = check.run().await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn archive_table_preflights_as_archive_without_resolving_a_sync_mode() {
+        // The same nullable-cursor table that auto-resolves to full_refresh above, but marked as
+        // an archive table: --check must not resolve a sync mode for it at all — no index
+        // discovery, no watermark read, no schema-evolution check.
+        let mut config = make_config(vec!["orders".to_string()]);
+        config.table_archive.insert("orders".to_string(), "source_id = ?".to_string());
+        let mut inspect = MockPreflightInspect::new();
+        let mut storage = MockPreflightStorage::new();
+        let mut hwm = MockPreflightHwm::new();
+
+        storage.expect_check_writable().returning(|| Ok(()));
+        hwm.expect_read_hwm().times(0);
+        hwm.expect_delta_schema().times(0);
+        inspect.expect_discover_columns().times(1).returning(|_| {
+            Ok(vec![col("id", "bigint", "bigint(20)"), nullable_col("updated_at", "timestamp", "timestamp")])
+        });
+        inspect.expect_get_avg_row_length().returning(|_| Ok(Some(100)));
+        inspect.expect_discover_indexes().times(0);
+
+        let check = PreflightCheck::new(config, inspect, storage, hwm);
+        let result = check.run().await;
+        assert!(result.is_ok(), "an archive table passes --check as `archive`: {result:?}");
     }
 
     #[tokio::test]
