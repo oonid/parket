@@ -93,6 +93,17 @@ impl ExtractorAdapter {
     }
 }
 
+impl ExtractorAdapter {
+    /// An extractor for archive mode: its connections run `archive::ARCHIVE_SESSION_INIT`, so
+    /// timestamps are read in UTC.
+    pub fn for_archive(config: &Config) -> Self {
+        Self {
+            inner: BatchExtractor::new(&config.database_url, config.target_memory_mb, config.default_batch_size)
+                .with_session_init(&crate::archive::ARCHIVE_SESSION_INIT),
+        }
+    }
+}
+
 impl Extract for ExtractorAdapter {
     fn calculate_batch_size(&mut self, avg_row_length: Option<u64>) -> u64 {
         self.inner.calculate_batch_size(avg_row_length)

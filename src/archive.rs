@@ -19,9 +19,10 @@ use deltalake::arrow::compute::cast;
 use deltalake::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use deltalake::arrow::record_batch::RecordBatch;
 
-use crate::discovery::ColumnInfo;
+use crate::discovery::{ColumnInfo, filter_unsupported_columns};
+use crate::orchestrator::{Extract, SchemaInspect};
 use crate::query::backtick;
-use crate::writer::with_archive_unit_column;
+use crate::writer::{ARCHIVE_UNIT_COLUMN, DeltaWriter, with_archive_unit_column};
 
 /// Field-metadata key (and, prefixed, table property) recording the source time zone.
 pub const SOURCE_TIME_ZONE_KEY: &str = "source_time_zone";
@@ -156,11 +157,13 @@ pub fn last_key(batch: &RecordBatch, key: &[String]) -> Result<Vec<KeyValue>> {
         .collect()
 }
 
-/// Parse MariaDB's `YYYY-MM-DD HH:MM:SS[.ffffff]` text into microseconds since the epoch, reading
-/// it as UTC (the archive session's zone). A zero date or any other unparseable value is an error:
-/// archiving must not guess an instant.
+/// Parse timestamp text into microseconds since the epoch, reading it as UTC (the archive
+/// session's zone). The vendored connector renders `TIMESTAMP`/`DATETIME` as ISO text
+/// (`2026-10-26T04:30:44.000000`); MariaDB's own form (`2026-10-26 04:30:44`) is accepted too. A
+/// zero date or any other unparseable value is an error: archiving must not guess an instant.
 fn parse_micros(column: &str, text: &str) -> Result<i64> {
-    let parsed = NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
+    let parsed = NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f"))
         .with_context(|| format!("column `{column}`: `{text}` is not a valid timestamp; archive refuses to guess"))?;
     Ok(parsed.and_utc().timestamp_micros())
 }
@@ -201,6 +204,192 @@ pub fn to_archive_batch(batch: &RecordBatch, target: &Schema) -> Result<RecordBa
         })
         .collect::<Result<Vec<ArrayRef>>>()?;
     RecordBatch::try_new(Arc::new(target.clone()), columns).context("building the archive batch")
+}
+
+/// The archive writer operations the [`Archiver`] needs; implemented by [`DeltaWriter`].
+#[cfg_attr(test, mockall::automock)]
+#[allow(async_fn_in_trait)]
+pub trait ArchiveSink: Send + Sync {
+    async fn ensure_archive_table(&self, table: &str, schema: SchemaRef, source_time_zone: &str) -> Result<()>;
+    async fn archive_unit_present(&self, table: &str, unit: i64) -> Result<bool>;
+    async fn begin_archive_unit(&self, table: &str, unit: i64) -> Result<()>;
+    async fn stage_archive_chunk(&self, table: &str, batches: Vec<RecordBatch>) -> Result<()>;
+    async fn commit_archive_unit(&self, table: &str) -> Result<u64>;
+    async fn abort_archive_unit(&self, table: &str);
+}
+
+impl ArchiveSink for DeltaWriter {
+    async fn ensure_archive_table(&self, table: &str, schema: SchemaRef, source_time_zone: &str) -> Result<()> {
+        DeltaWriter::ensure_archive_table(self, table, schema, source_time_zone).await.map(|_| ())
+    }
+    async fn archive_unit_present(&self, table: &str, unit: i64) -> Result<bool> {
+        DeltaWriter::archive_unit_present(self, table, unit).await
+    }
+    async fn begin_archive_unit(&self, table: &str, unit: i64) -> Result<()> {
+        DeltaWriter::begin_archive_unit(self, table, unit).await
+    }
+    async fn stage_archive_chunk(&self, table: &str, batches: Vec<RecordBatch>) -> Result<()> {
+        DeltaWriter::stage_archive_chunk(self, table, batches).await
+    }
+    async fn commit_archive_unit(&self, table: &str) -> Result<u64> {
+        DeltaWriter::commit_archive_unit(self, table).await
+    }
+    async fn abort_archive_unit(&self, table: &str) {
+        DeltaWriter::abort_archive_unit(self, table).await
+    }
+}
+
+/// A table in archive mode and the scope predicate that selects one unit's rows in it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArchiveTable {
+    pub name: String,
+    pub scope: String,
+}
+
+/// What archiving one unit did to one table.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnitOutcome {
+    /// The unit's rows were committed in one append-only commit.
+    Archived { rows: u64 },
+    /// Delta already holds the unit (`_archive_unit`); nothing was read or written.
+    AlreadyArchived,
+    /// The source holds no rows of the unit in this table; nothing was committed.
+    NoRows,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnitResult {
+    pub unit: i64,
+    pub table: String,
+    pub outcome: UnitOutcome,
+}
+
+/// A table ready to archive into: what to select, how to page, and the archive schema.
+struct PreparedTable {
+    name: String,
+    scope: String,
+    columns: Vec<String>,
+    key: Vec<String>,
+    /// The archive schema without `_archive_unit`, which the writer stamps.
+    target: Schema,
+    page_rows: u64,
+}
+
+/// Archives given units across archive tables: for each unit, each table's rows are extracted
+/// page by page and appended in one commit, or skipped when Delta already holds them. Which units
+/// to archive is the caller's decision (docs/design/archive-mode.md).
+pub struct Archiver<S, E, W> {
+    inspect: S,
+    extract: E,
+    sink: W,
+    source_time_zone: String,
+    max_page_rows: Option<u64>,
+}
+
+impl<S: SchemaInspect, E: Extract, W: ArchiveSink> Archiver<S, E, W> {
+    /// `extract` should be an archive extractor (`BatchExtractor::with_session_init` with
+    /// [`ARCHIVE_SESSION_INIT`]) so timestamps are read in UTC.
+    pub fn new(inspect: S, extract: E, sink: W, source_time_zone: impl Into<String>) -> Self {
+        Self { inspect, extract, sink, source_time_zone: source_time_zone.into(), max_page_rows: None }
+    }
+
+    /// Cap the rows per page below the memory-derived batch size.
+    pub fn with_max_page_rows(mut self, rows: u64) -> Self {
+        self.max_page_rows = Some(rows.max(1));
+        self
+    }
+
+    /// Archive every unit in `units` in every table of `tables`, unit by unit. Stops at the first
+    /// error, after aborting that table's in-flight unit; units committed before it stay committed
+    /// and are skipped by a re-run.
+    pub async fn archive_units(&mut self, tables: &[ArchiveTable], units: &[i64]) -> Result<Vec<UnitResult>> {
+        let mut prepared = Vec::with_capacity(tables.len());
+        for table in tables {
+            prepared.push(self.prepare(table).await?);
+        }
+        let mut results = Vec::with_capacity(units.len() * prepared.len());
+        for &unit in units {
+            for table in &prepared {
+                let outcome = self
+                    .archive_one(table, unit)
+                    .await
+                    .with_context(|| format!("archiving unit {unit} of `{}`", table.name))?;
+                results.push(UnitResult { unit, table: table.name.clone(), outcome });
+            }
+        }
+        Ok(results)
+    }
+
+    async fn prepare(&mut self, table: &ArchiveTable) -> Result<PreparedTable> {
+        let columns = filter_unsupported_columns(&self.inspect.discover_columns(&table.name).await?);
+        if columns.is_empty() {
+            bail!("archive table `{}` has no extractable columns (does it exist?)", table.name);
+        }
+        let key = self
+            .inspect
+            .discover_indexes(&table.name)
+            .await?
+            .into_iter()
+            .find(|i| i.name == "PRIMARY")
+            .map(|i| i.columns)
+            .filter(|cols| !cols.is_empty())
+            .with_context(|| format!("archive table `{}` has no PRIMARY key to page by", table.name))?;
+        if let Some(missing) = key.iter().find(|k| !columns.iter().any(|c| &c.name == *k)) {
+            bail!("archive table `{}`: primary key column `{missing}` is not extractable", table.name);
+        }
+        let schema = archive_schema(&columns, &self.source_time_zone)?;
+        self.sink.ensure_archive_table(&table.name, schema.clone(), &self.source_time_zone).await?;
+        let target = Schema::new(
+            schema.fields().iter().filter(|f| f.name() != ARCHIVE_UNIT_COLUMN).cloned().collect::<Vec<_>>(),
+        );
+        let avg_row_length = self.inspect.get_avg_row_length(&table.name).await?;
+        let batch = self.extract.calculate_batch_size(avg_row_length).max(1);
+        let page_rows = self.max_page_rows.map_or(batch, |cap| batch.min(cap));
+        Ok(PreparedTable {
+            name: table.name.clone(),
+            scope: table.scope.clone(),
+            columns: columns.into_iter().map(|c| c.name).collect(),
+            key,
+            target,
+            page_rows,
+        })
+    }
+
+    async fn archive_one(&mut self, table: &PreparedTable, unit: i64) -> Result<UnitOutcome> {
+        if self.sink.archive_unit_present(&table.name, unit).await? {
+            return Ok(UnitOutcome::AlreadyArchived);
+        }
+        self.sink.begin_archive_unit(&table.name, unit).await?;
+        if let Err(e) = self.stage_pages(table, unit).await {
+            self.sink.abort_archive_unit(&table.name).await;
+            return Err(e);
+        }
+        Ok(match self.sink.commit_archive_unit(&table.name).await? {
+            0 => UnitOutcome::NoRows,
+            rows => UnitOutcome::Archived { rows },
+        })
+    }
+
+    async fn stage_pages(&mut self, table: &PreparedTable, unit: i64) -> Result<()> {
+        let mut after: Option<Vec<KeyValue>> = None;
+        loop {
+            let sql = page_query(
+                &table.name, &table.columns, &table.scope, unit, &table.key, after.as_deref(), table.page_rows,
+            )?;
+            let extraction = self.extract.extract(&sql)?;
+            let pages: Vec<RecordBatch> = extraction.batches.into_iter().filter(|b| b.num_rows() > 0).collect();
+            let rows: u64 = pages.iter().map(|b| b.num_rows() as u64).sum();
+            let Some(last) = pages.last() else { return Ok(()) };
+            after = Some(last_key(last, &table.key)?);
+            let typed = pages.iter().map(|b| to_archive_batch(b, &table.target)).collect::<Result<Vec<_>>>()?;
+            self.sink.stage_archive_chunk(&table.name, typed).await?;
+            // A short page means the unit is exhausted — unless the memory breaker cut it short,
+            // in which case the next page continues after its last key.
+            if rows < table.page_rows && !extraction.truncated {
+                return Ok(());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -292,7 +481,12 @@ mod tests {
             source,
             vec![
                 Arc::new(UInt32Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec![Some("2026-10-26 04:30:44"), None, Some("2026-10-26 04:30:44.5")])),
+                // The connector's ISO form, a NULL, and MariaDB's own spaced form with a fraction.
+                Arc::new(StringArray::from(vec![
+                    Some("2026-10-26T04:30:44.000000"),
+                    None,
+                    Some("2026-10-26 04:30:44.5"),
+                ])),
             ],
         )
         .unwrap();
@@ -307,6 +501,149 @@ mod tests {
         assert!(ts.is_null(1));
         assert_eq!(ts.value(2), 1_792_989_044_500_000);
         assert_eq!(out.column(0).data_type(), &DataType::Int64, "other columns are cast by name");
+    }
+
+    mod archiver {
+        use super::super::*;
+        use crate::discovery::IndexInfo;
+        use crate::extractor::Extraction;
+        use crate::orchestrator::{MockExtract, MockSchemaInspect};
+        use std::sync::Mutex;
+
+        fn columns() -> Vec<ColumnInfo> {
+            vec![
+                ColumnInfo { name: "id".into(), data_type: "bigint".into(), column_type: "bigint(20)".into(), nullable: false },
+                ColumnInfo { name: "sent_at".into(), data_type: "timestamp".into(), column_type: "timestamp".into(), nullable: true },
+            ]
+        }
+
+        fn page(ids: std::ops::RangeInclusive<i64>) -> RecordBatch {
+            let ids: Vec<i64> = ids.collect();
+            let sent: Vec<&str> = ids.iter().map(|_| "2026-10-26 04:30:44").collect();
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("sent_at", DataType::Utf8, true),
+                ])),
+                vec![Arc::new(Int64Array::from(ids)), Arc::new(StringArray::from(sent))],
+            )
+            .unwrap()
+        }
+
+        fn inspect() -> MockSchemaInspect {
+            let mut m = MockSchemaInspect::new();
+            m.expect_discover_columns().returning(|_| Ok(columns()));
+            m.expect_discover_indexes().returning(|_| {
+                Ok(vec![IndexInfo { name: "PRIMARY".into(), unique: true, columns: vec!["id".into()] }])
+            });
+            m.expect_get_avg_row_length().returning(|_| Ok(Some(100)));
+            m
+        }
+
+        fn table() -> Vec<ArchiveTable> {
+            vec![ArchiveTable { name: "messages".into(), scope: "campaign_id = ?".into() }]
+        }
+
+        /// Pages served in order; every SQL statement is recorded.
+        fn extract(pages: Vec<(Vec<RecordBatch>, bool)>, seen: Arc<Mutex<Vec<String>>>) -> MockExtract {
+            let mut m = MockExtract::new();
+            m.expect_calculate_batch_size().returning(|_| 1_000_000);
+            let pages = Mutex::new(pages.into_iter());
+            m.expect_extract().returning(move |sql| {
+                seen.lock().unwrap().push(sql.to_string());
+                let (batches, truncated) = pages.lock().unwrap().next().unwrap_or_default();
+                Ok(Extraction { batches, truncated })
+            });
+            m
+        }
+
+        fn sink(present: bool, staged: Arc<Mutex<Vec<usize>>>) -> MockArchiveSink {
+            let mut m = MockArchiveSink::new();
+            m.expect_ensure_archive_table().returning(|_, _, _| Ok(()));
+            m.expect_archive_unit_present().returning(move |_, _| Ok(present));
+            m.expect_begin_archive_unit().returning(|_, _| Ok(()));
+            let counted = staged.clone();
+            m.expect_stage_archive_chunk().returning(move |_, b| {
+                counted.lock().unwrap().push(b.iter().map(|x| x.num_rows()).sum());
+                Ok(())
+            });
+            m.expect_commit_archive_unit()
+                .returning(move |_| Ok(staged.lock().unwrap().iter().sum::<usize>() as u64));
+            m
+        }
+
+        #[tokio::test]
+        async fn pages_until_a_short_page_then_commits_once() {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let staged = Arc::new(Mutex::new(Vec::new()));
+            let pages = vec![(vec![page(1..=3)], false), (vec![page(4..=6)], false), (vec![page(7..=7)], false)];
+            let mut archiver = Archiver::new(inspect(), extract(pages, seen.clone()), sink(false, staged.clone()), "Asia/Jakarta")
+                .with_max_page_rows(3);
+            let results = archiver.archive_units(&table(), &[909]).await.unwrap();
+            assert_eq!(results, vec![UnitResult { unit: 909, table: "messages".into(), outcome: UnitOutcome::Archived { rows: 7 } }]);
+            assert_eq!(*staged.lock().unwrap(), vec![3, 3, 1]);
+            let sql = seen.lock().unwrap().clone();
+            assert_eq!(sql.len(), 3, "a short third page ends the unit");
+            assert!(sql[0].contains("WHERE (campaign_id = 909) ORDER BY `id` LIMIT 3"), "got: {}", sql[0]);
+            assert!(sql[1].contains("AND (`id`) > (3)"), "page 2 continues after id 3: {}", sql[1]);
+            assert!(sql[2].contains("AND (`id`) > (6)"), "page 3 continues after id 6: {}", sql[2]);
+        }
+
+        #[tokio::test]
+        async fn a_truncated_short_page_does_not_end_the_unit() {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let staged = Arc::new(Mutex::new(Vec::new()));
+            let pages = vec![(vec![page(1..=2)], true), (vec![page(3..=3)], false)];
+            let mut archiver = Archiver::new(inspect(), extract(pages, seen.clone()), sink(false, staged.clone()), "UTC")
+                .with_max_page_rows(3);
+            archiver.archive_units(&table(), &[909]).await.unwrap();
+            assert_eq!(seen.lock().unwrap().len(), 2, "the breaker cut page 1 short; page 2 follows");
+        }
+
+        #[tokio::test]
+        async fn an_already_archived_unit_is_not_read_again() {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let mut s = sink(true, Arc::new(Mutex::new(Vec::new())));
+            s.expect_begin_archive_unit().times(0);
+            let mut archiver = Archiver::new(inspect(), extract(vec![], seen.clone()), s, "UTC");
+            let results = archiver.archive_units(&table(), &[909]).await.unwrap();
+            assert_eq!(results[0].outcome, UnitOutcome::AlreadyArchived);
+            assert!(seen.lock().unwrap().is_empty(), "no source read for an archived unit");
+        }
+
+        #[tokio::test]
+        async fn a_unit_with_no_source_rows_reports_no_rows() {
+            let staged = Arc::new(Mutex::new(Vec::new()));
+            let mut archiver = Archiver::new(inspect(), extract(vec![], Arc::new(Mutex::new(Vec::new()))), sink(false, staged), "UTC");
+            let results = archiver.archive_units(&table(), &[909]).await.unwrap();
+            assert_eq!(results[0].outcome, UnitOutcome::NoRows);
+        }
+
+        #[tokio::test]
+        async fn a_failing_page_aborts_the_unit_without_committing() {
+            let mut ex = MockExtract::new();
+            ex.expect_calculate_batch_size().returning(|_| 1000);
+            ex.expect_extract().returning(|_| Err(anyhow::anyhow!("connection reset")));
+            let mut s = MockArchiveSink::new();
+            s.expect_ensure_archive_table().returning(|_, _, _| Ok(()));
+            s.expect_archive_unit_present().returning(|_, _| Ok(false));
+            s.expect_begin_archive_unit().returning(|_, _| Ok(()));
+            s.expect_abort_archive_unit().times(1).returning(|_| ());
+            s.expect_commit_archive_unit().times(0);
+            let mut archiver = Archiver::new(inspect(), ex, s, "UTC");
+            let err = format!("{:#}", archiver.archive_units(&table(), &[909]).await.unwrap_err());
+            assert!(err.contains("archiving unit 909 of `messages`") && err.contains("connection reset"), "got: {err}");
+        }
+
+        #[tokio::test]
+        async fn a_table_without_a_primary_key_is_refused() {
+            let mut i = MockSchemaInspect::new();
+            i.expect_discover_columns().returning(|_| Ok(columns()));
+            i.expect_discover_indexes().returning(|_| Ok(vec![]));
+            let mut archiver = Archiver::new(i, MockExtract::new(), MockArchiveSink::new(), "UTC");
+            let err = archiver.archive_units(&table(), &[909]).await.unwrap_err().to_string();
+            assert!(err.contains("no PRIMARY key"), "got: {err}");
+        }
     }
 
     #[test]

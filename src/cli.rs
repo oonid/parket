@@ -54,6 +54,15 @@ pub struct Cli {
     )]
     pub verify_after: bool,
 
+    // Archive mode: archive the given units of every TABLE_ARCHIVE_ table, then exit.
+    #[arg(
+        long,
+        value_name = "UNIT,...",
+        value_delimiter = ',',
+        help = "Archive these units (comma-separated ids) in every table of TABLES that has TABLE_ARCHIVE_<table> set, then exit. A unit already archived is skipped"
+    )]
+    pub archive_units: Option<Vec<i64>>,
+
     // §10.7: reclaim superseded/orphaned parquet. Mirrors --verify's shape (all tables, or one).
     #[arg(
         long,
@@ -235,6 +244,14 @@ mod tests {
             output.contains("--inspect"),
             "help should mention --inspect flag"
         );
+    }
+
+    #[test]
+    fn archive_units_flag_parses_a_comma_separated_list() {
+        let cli = Cli::try_parse_from(["parket", "--archive-units", "909,856"]).unwrap();
+        assert_eq!(cli.archive_units, Some(vec![909, 856]));
+        assert!(Cli::try_parse_from(["parket", "--archive-units", "909,abc"]).is_err());
+        assert!(Cli::try_parse_from(["parket"]).unwrap().archive_units.is_none());
     }
 
     #[test]
