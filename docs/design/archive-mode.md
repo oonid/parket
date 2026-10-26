@@ -113,8 +113,10 @@ with the source zone kept as metadata, so readers can show them in the source's 
   `{"source_time_zone": "<ARCHIVE_SOURCE_TIME_ZONE>"}` as Delta field metadata, and the table the
   same as a property. A Delta `timestamp` cannot hold a zone name itself: delta-rs reads any zone
   annotation as "the value is UTC" and drops the name.
-- **Readers convert with their session zone** — DataFusion `datafusion.execution.time_zone`, or
-  `AT TIME ZONE '<zone>'`; Spark and DuckDB through their own settings.
+- **Readers convert explicitly** — in DataFusion, `ts AT TIME ZONE '<zone>'` (or an `arrow_cast`
+  to a zoned timestamp) renders the instant in that zone with its offset; the
+  `datafusion.execution.time_zone` session setting does not change how a stored timestamp
+  displays. Spark and DuckDB have their own conversions.
 - **`DATETIME` has no zone**, so converting it to an instant would assert something unknown. It is
   archived as `timestamp_ntz`, with the zone the application is assumed to use in its metadata.
 - Verification compares in UTC on both sides.
