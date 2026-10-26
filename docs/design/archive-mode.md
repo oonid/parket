@@ -123,27 +123,39 @@ with the source zone kept as metadata, so readers can show them in the source's 
 
 ## Verifying a unit
 
-For each archive table, the source scoped to the unit (its scope predicate) is compared with Delta
-scoped to the unit (`_archive_unit = X`), leaving `_archive_unit` out of the column comparison:
+Every row of the unit is compared, source against Delta, by its primary key and by a digest of the
+whole row. Both engines render each row canonically and hash it with MD5:
 
-- **key set** — count, distinct, min, max, xor and sum of the key (verify's existing fingerprint);
-  count, distinct and byte-ordered min/max for a string key;
-- **values** — verify's parity-hardened per-column aggregates.
+| Column type | Canonical text |
+|---|---|
+| integers | decimal text |
+| text, `json`, `enum`, `set`, `date`, `decimal` | the stored text (Delta keeps these as text) |
+| `TIMESTAMP`, `DATETIME` | microseconds since the epoch (the source session is UTC) |
+| binary | lowercase hex |
+| `float`, `double` | shortest round-trip text, a trailing `.0` dropped |
 
-Equality must be exact in every table. Unlike sync verification there is no `Drift`: a unit chosen
-for archiving is not expected to change, so any difference fails it. Large units reuse verify's
-per-key bucketing, so a mismatch names the id ranges at fault. The result — per table row counts,
-key fingerprints, and the Delta version holding the unit — is what the caller records as its
-go-ahead for deleting the unit from the source; after that deletion, the same check shows zero
-source rows while Delta keeps its counts.
+Every value is length-prefixed and NULL has its own marker, so neither a separator nor a NULL can
+be confused with data. The source side is the unit's scope predicate; the Delta side is
+`_archive_unit = X`. The result is `Verified`, or a mismatch naming the rows **missing from Delta**,
+**in Delta but not in the source**, **changed**, or **duplicated**, by key.
+
+Column aggregates (sums, extremes, lengths) are not enough for this check: an equal-length text edit
+or a timestamp moved between the extremes leaves them unchanged, and this check is the go-ahead for
+deleting the source rows. Any rendering difference between the engines that remains (for example
+exponent notation for very large or very small floats) fails safe — it shows as a mismatch, never
+as a false match. The Delta side of a unit is held as a key → digest map while the source streams
+against it; a very large unit can be compared in key ranges if that memory becomes a concern.
+
+After the source rows are deleted, the same check shows them as "in Delta but not in the source":
+that is the expected state of a purged unit.
 
 ## Interface
 
 - **Library** — functions to archive a set of units, verify a set of units, and replace a unit,
   returning per-unit, per-table results. Applications that drive archiving (choosing units,
   scheduling runs, handing verified units over for deletion) build on these.
-- **CLI** — `--archive-units <id,…>` and a matching verify, with the same results printed, for
-  manual use.
+- **CLI** — `--archive-units <id,…>` and `--verify-archive-units <id,…>` print one line per unit
+  and table; the verify exits 1 when any unit differs.
 
 ## Implementation steps
 
@@ -152,7 +164,7 @@ Each step ships with tests and passes the gate before the next starts.
 1. **Guard** — `TABLE_ARCHIVE_<t>` parsing and the startup refusals. ✅
 2. **Per-unit append** — (a) the writer: one append-only commit per `(table, unit)`, `_archive_unit`,
    ZSTD, "already archived" from the data ✅; (b) scoped, key-paged extraction in UTC with typed
-   timestamps and zone metadata; (c) the library API and CLI.
-3. **Unit verification** — scoped key-set and value comparison on both engines, Docker-parity tested.
+   timestamps and zone metadata ✅; (c) the library API and CLI ✅.
+3. **Unit verification** — row-by-row digest comparison on both engines, Docker-tested ✅.
 4. **Unit-scoped replace.**
 5. **Operator docs** — configuration and the archive workflow.
