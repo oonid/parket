@@ -4,9 +4,6 @@
 # IDE
 .idea/
 
-# OpenSpec tooling
-.opencode/
-
 # Secrets — never commit .env with real credentials
 .env
 

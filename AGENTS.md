@@ -1,4 +1,4 @@
-# AGENTS.md — Guide for AI Coding Agents
+# AGENTS.md — Contributor Guide
 
 ## Build, Lint, and Test Commands
 

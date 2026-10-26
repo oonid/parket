@@ -355,7 +355,7 @@ and filters on the configured column.
 - **connector_arrow** returns `datetime`/`timestamp` columns as `Utf8`, which
   `extract_hwm_from_batch` already handles for any column name.
 
-### Implementation steps (each step is a confirmation gate; haiku per step, then review)
+### Implementation steps (each step is a confirmation gate; one implementer per step, then review)
 
 - **Step C1 · `config.rs`.** Add `table_timestamp_col: HashMap<String, String>`
   (overrides only) + `parse_table_timestamp_col(tables)` mirroring
@@ -506,7 +506,7 @@ A **timestamp candidate** = a column whose `data_type` is `timestamp` or
    cursor" — that is information, not an error); `2` if the table doesn't exist or
    the DB is unreachable.
 
-### Implementation steps (gated; haiku per step or one feature dispatch, then review)
+### Implementation steps (gated; one implementer per step or one feature-wide pass, then review)
 
 - ✅ **Step D1 · `discovery.rs` introspection.** Add `describe_columns(table) ->
   Vec<ColumnDescribe { name, data_type, column_type, nullable: bool, key: String }>`
@@ -825,7 +825,7 @@ Complete implementation plan for the §12.3 design: keep every row (in-progress 
 completed) current in Delta, incrementally, with no source schema change. This is
 larger than Features A–D — it adds a new extraction **mode**, a **multi-watermark**
 HWM model, and a **MERGE/upsert** write path. Each step below is a confirmation
-gate (haiku per step, review after), and each must compile + pass `cargo test` +
+gate (one implementer per step, review after), and each must compile + pass `cargo test` +
 `cargo clippy --all-targets -- -D warnings` before the next.
 
 ### 14.1 New concepts introduced
@@ -987,7 +987,7 @@ finishes.
 3. **Progress is logged per phase** (fetch → write), gated on `--progress`, with
    elapsed timings, for both streams.
 
-### 14.6.3 Implementation steps (gated; snapshot before each haiku dispatch)
+### 14.6.3 Implementation steps (gated; snapshot before each implementation step)
 
 > **Status: ✅ F10.1 + F10.2 implemented (2026-06-10).** Insert stream now uses
 > `append_two_stream` (cheap, linear) instead of MERGE; update stream still MERGEs;
@@ -1052,7 +1052,7 @@ independent parts:
    (b) **do not update the merge key** in `when_matched_update` (update only
    non-key columns — updating the join key is pointless and risky).
 
-### 14.7.2 Implementation steps (gated; snapshot before each haiku dispatch)
+### 14.7.2 Implementation steps (gated; snapshot before each implementation step)
 
 > **Status: ✅ F10.3a + F10.3b implemented (2026-06-10).** `merge_batch` now dedups
 > the source by key (datafusion `ROW_NUMBER` window) and excludes the key from

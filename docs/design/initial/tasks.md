@@ -3,7 +3,7 @@
 - [x] 1.1 Initialize Rust project with `Cargo.toml` with dependencies: connectorx (features: src_mysql), deltalake (features: s3, datafusion), sqlx (features: mysql, runtime-tokio, macros), tokio (features: full), serde, serde_json, dotenvy, tracing, tracing-subscriber, anyhow; dev-dependencies: mockall, testcontainers, testcontainers-modules
 - [x] 1.2 Create module files: `src/main.rs`, `src/config.rs`, `src/state.rs`, `src/discovery.rs`, `src/query.rs`, `src/extractor.rs`, `src/writer.rs`, `src/orchestrator.rs`
 - [x] 1.3 Create `.env.example` with all configuration variables and comments
-- [x] 1.4 Update `.gitignore` (target/, .env, state.json, .idea/, .opencode/, coverage/)
+- [x] 1.4 Update `.gitignore` (target/, .env, state.json, .idea/, coverage/)
 - [x] 1.5 Create `rust-toolchain.toml` with pinned Rust version
 - [x] 1.6 Verify: `cargo build && cargo clippy -- -D warnings`
 
@@ -150,7 +150,7 @@ connector-x is pinned to arrow v54 with no upgrade path. Add **additional standa
 - [x] 15.7 Write unit tests for: `--local` CLI parsing, config skips S3 validation in local mode, preflight skips S3 check in local mode, orchestrator works with local writer, local writer produces valid Delta table on disk; Cli arg parsing (--check, --version, --progress, default), `Config::display_safe()` masking, pre-flight check success/failure paths (mocked DB + S3), startup banner output
 - [x] 15.8 Document: update `docs/config.md` with `--local <dir>` usage, CLI usage (`--check`, `--version`, `--progress`, `--help`), startup banner format, `--check` output examples; update `AGENTS.md` CLI flags table
 - [x] 15.9 Verify: `cargo build && cargo clippy -- -D warnings && cargo test && cargo llvm-cov --lib --fail-under-lines 90`
-- [x] 15.10 Create `AGENTS.md` at project root: comprehensive guide for AI coding agents covering build/lint/test commands, project conventions, module overview with public API surface, testing patterns, CI expectations, and key design decisions
+- [x] 15.10 Create `AGENTS.md` at project root: comprehensive contributor guide covering build/lint/test commands, project conventions, module overview with public API surface, testing patterns, CI expectations, and key design decisions
 
 ## 16. Real-World Data Compatibility
 
