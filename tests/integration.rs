@@ -2094,6 +2094,30 @@ async fn verify_archive_units_matches_exactly_and_names_every_difference() {
         "campaign 2 was never archived: {}",
         diffs(2, "messages")
     );
+
+    // The repair: replace campaign 1 from the current source, and it verifies again.
+    let replaced = Archiver::new(
+        SchemaInspectorAdapter::new(env.pool.clone(), "parket".to_string()),
+        ExtractorAdapter::for_archive(&env.config),
+        writer(),
+        "Asia/Jakarta",
+    )
+    .replace_units(&tables, &[1])
+    .await
+    .expect("replace campaign 1");
+    assert!(
+        replaced.iter().all(|r| matches!(r.outcome, parket::archive::UnitOutcome::Replaced { .. })),
+        "got {replaced:?}"
+    );
+    let repaired = verdicts(verify_units(&inspect, &source, &delta, &tables, &[1]).await.unwrap());
+    assert_eq!(
+        repaired,
+        vec![
+            (1, "messages".to_string(), UnitVerdict::Verified { rows: 25 }),
+            (1, "message_events".to_string(), UnitVerdict::Verified { rows: 49 }),
+            (1, "message_lookup".to_string(), UnitVerdict::Verified { rows: 6 }),
+        ]
+    );
 }
 
 /// V9: the bucketed check is only meaningful if MariaDB and DataFusion put every key in the same

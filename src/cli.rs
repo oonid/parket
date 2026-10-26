@@ -63,6 +63,15 @@ pub struct Cli {
     )]
     pub archive_units: Option<Vec<i64>>,
 
+    // Archive mode: re-extract the given units and replace exactly their files, then exit.
+    #[arg(
+        long,
+        value_name = "UNIT,...",
+        value_delimiter = ',',
+        help = "Re-extract these units (comma-separated ids) in every TABLE_ARCHIVE_<table> table and replace exactly their archived files — the repair for a unit that failed verification. Only for units whose source rows have not been deleted; an empty new copy is refused"
+    )]
+    pub replace_archive_units: Option<Vec<i64>>,
+
     // Archive mode: verify the given units exactly, source against Delta, then exit.
     #[arg(
         long,
