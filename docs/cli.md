@@ -20,6 +20,10 @@ All flags are defined in `src/cli.rs`.
 | `--verify [<TABLE>]` | optional table name | off | Reconcile all configured Delta tables, or only the named configured table, against the source DB, then exit |
 | `--verify-deep` | — | off | With `--verify`/`--verify-after`, run strict checks even on tables above the 1M-row cap |
 | `--verify-after` | — | off | After a successful sync, run the same reconciliation; a discrepancy makes the process exit non-zero |
+| `--archive-units <IDS>` | comma-separated unit ids | unset | Archive these units in every `TABLE_ARCHIVE_<t>` table of `TABLES`, then exit |
+| `--verify-archive-units <IDS>` | comma-separated unit ids | unset | Verify these archived units row by row, source against Delta, then exit |
+| `--replace-archive-units <IDS>` | comma-separated unit ids | unset | Re-extract these units and replace exactly their archived files, then exit |
+| `--replace-allow-fewer-rows` | flag | off | With `--replace-archive-units`, accept a new copy with fewer rows than the archived one |
 | `--progress` | — | off | Emit detailed per-batch / per-chunk progress logs |
 | `--local <dir>` | path (required) | unset | Write Delta tables to a local directory instead of S3 |
 | `--version` | — | — | Print the version from `Cargo.toml` and exit |
@@ -211,6 +215,69 @@ reconciliation above against the just-synced tables. Because the drift window is
 near-zero immediately after a sync, a reported discrepancy is more meaningful. The
 final exit code becomes the verify exit code (`0`/`1`/`2`); if the sync failed
 (`1`/`2`), verify is skipped and the sync's exit code stands.
+
+## Archive commands
+
+For tables in archive mode (`TABLE_ARCHIVE_<t>`, see [config.md](config.md#per-table-archive-mode-table_archive)).
+Each takes a comma-separated list of unit ids, runs over every archive table in `TABLES`, prints one
+line per unit and table, and exits. All three work with `--local <dir>`.
+
+### `--archive-units <IDS>`
+
+```bash
+parket --archive-units 909,856
+# archive unit=909 table=messages: archived 132370 rows
+# archive unit=909 table=message_events: archived 264740 rows
+# archive unit=856 table=messages: already archived
+```
+
+Archives each unit: one append-only commit per table. A unit already in Delta is skipped without
+reading the source; a table with no rows for the unit reports `no rows`. Two runs archiving the same
+unit at once cannot both commit it: the second fails and changes nothing. On an error the unit's
+in-flight commit for that table is abandoned (the table is unchanged) and the run stops; units
+committed before it stay committed and a re-run skips them.
+
+Exit codes: `0` success · `1` a unit failed · `2` configuration or connection error.
+
+### `--verify-archive-units <IDS>`
+
+```bash
+parket --verify-archive-units 909
+# verify-archive unit=909 table=messages: VERIFIED (132370 rows)
+# verify-archive unit=909 table=message_lookup: MISMATCH: 1 row(s) differ: (msg-0042)
+```
+
+Compares every row of the unit, source against Delta, by primary key and by a digest of the whole
+row (rendered identically on both engines). `MISMATCH` names the rows missing from Delta, in Delta
+but not in the source, changed, or duplicated, by key. **This is the go-ahead for deleting a unit
+from the source: delete only units that verify.** After deletion the same command reports the
+unit's rows as "in Delta but not in the source" — the expected state of a deleted unit.
+
+A column parket cannot compare (for example `TIME`) refuses the table rather than verifying the
+unit without it.
+
+Exit codes: `0` every unit verified · `1` any unit differs · `2` configuration, connection or query
+error.
+
+### `--replace-archive-units <IDS>`
+
+```bash
+parket --replace-archive-units 909
+# archive unit=909 table=message_lookup: replaced 1 file(s) with 132332 rows
+```
+
+The repair for a unit that failed verification: re-extracts it and, in one commit, removes exactly
+the files holding it and adds the new ones. It refuses, leaving the table unchanged:
+
+- a file that also holds another unit;
+- an empty new copy (the source no longer has the unit's rows);
+- a new copy with **fewer rows** than the archived one — unless `--replace-allow-fewer-rows` says
+  the missing rows were deleted from the source on purpose.
+
+Tables are replaced one after another, so a refusal stops the run with the earlier tables of that
+unit already replaced; fix the cause and run it again. **Never replace a unit whose source rows have
+been deleted, even partly:** the replace can only copy what the source still holds. Then verify
+again.
 
 ## `--progress` (detailed progress logging)
 

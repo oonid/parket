@@ -138,6 +138,76 @@ The next run (flag removed) is normal two-stream incremental again, resuming fro
 
 A reconcile reads the entire table (one full snapshot) — expensive relative to a normal incremental run. Run it **occasionally** (to clear accumulated drift), not every run; between reconciles, two-stream incremental carries the load.
 
+## Per-Table Archive Mode (`TABLE_ARCHIVE`)
+
+For tables whose old rows are **copied to Delta, verified, and then deleted from the source** by
+someone else. After that deletion the Delta copy is the only copy, so archive mode never
+overwrites. Design and rationale: [design/archive-mode.md](design/archive-mode.md).
+
+```
+TABLE_ARCHIVE_<TABLENAME>=<scope predicate>
+ARCHIVE_SOURCE_TIME_ZONE=<IANA zone>
+```
+
+Rows are archived in **units** — for example one campaign. The scope predicate is the SQL that
+selects one unit's rows, with exactly one `?` for the unit id:
+
+```env
+TABLES=messages,message_events
+TABLE_ARCHIVE_messages=campaign_id = ?
+TABLE_ARCHIVE_message_events=message_id IN (SELECT id FROM messages WHERE campaign_id = ?)
+ARCHIVE_SOURCE_TIME_ZONE=Asia/Jakarta
+```
+
+### What it does
+
+- **One commit per unit and table, append-only.** A unit's rows are read page by page (ordered by
+  the table's primary key) and committed together; nothing is ever removed, except by an explicit
+  replace (below).
+- **Every row carries `_archive_unit`**, the unit id. It is how parket knows a unit is already
+  archived (a re-run skips it), and how anyone reading the archive selects a unit:
+  `WHERE _archive_unit = 909`.
+- **Timestamps are UTC instants.** The archive connection reads in UTC; `TIMESTAMP` columns become
+  Delta `timestamp` values and carry `source_time_zone` (from `ARCHIVE_SOURCE_TIME_ZONE`) as column
+  metadata and as the table property `parket.source_time_zone`. Read them back in the source zone
+  with `ts AT TIME ZONE 'Asia/Jakarta'`. `DATETIME` columns become `timestamp_ntz`.
+- **Files are ZSTD-compressed** (synced tables keep Snappy), with statistics on every column, so a
+  `_archive_unit` filter skips other units' files even on a wide table.
+- **Overlapping runs cannot store a unit twice.** Each unit's commit carries a Delta transaction
+  marker; a second commit of the same unit, from a concurrent run, fails Delta's conflict check.
+
+Which units to archive, and when, is the caller's decision; parket archives, verifies and repairs
+the units it is given (see the archive commands in [cli.md](cli.md)).
+
+### Requirements & validation (fail at startup)
+
+- The value must be non-empty and contain exactly one `?`.
+- `ARCHIVE_SOURCE_TIME_ZONE` is required as soon as any table is in archive mode, and must look
+  like an IANA zone name (`Asia/Jakarta`, `UTC`).
+- An archive table has exactly one mode: `TABLE_MODE_<t>` (any value, `auto` included),
+  `TABLE_RECONCILE_<t>`, `TABLE_INSERT_CURSOR_<t>` / `TABLE_UPDATE_CURSOR_<t>`, `TABLE_HWM_<t>` and
+  `TABLE_TIMESTAMP_<t>` are refused for it, all conflicts named at once.
+- The table needs a `PRIMARY KEY` (it pages and matches rows by it), and must not already have a
+  column named `_archive_unit`.
+
+Checked before anything is written, refusing the table:
+
+- Every column must be one parket can extract and compare; a type it cannot (for example `TIME`) is
+  named, never silently left out (archiving, replacing and verifying).
+- The source columns must still match the archive table's: a column added, dropped or retyped in the
+  source is named (archiving and replacing). Archived units would no longer read the same as new ones, so this is a decision
+  for the operator (for example a new archive table).
+- Values are converted strictly: a value that does not fit its archive type fails the unit instead
+  of becoming `NULL`.
+
+### In a normal sync run
+
+A sync run **skips** an archive table listed in `TABLES` (logged), before any read or write, and
+syncs the other tables — it can never fall through to an auto-detected `full_refresh`, which would
+replace the archive with the source's current rows. `--verify` and `--verify-after` skip it too
+(`verify <t>: skipped`); `--check` lists it as `archive` with its scope. Use the archive commands for
+it instead.
+
 ## Per-Table Initial High Watermark (HWM)
 
 For incremental tables, you can predefine a starting High Watermark (HWM) to seed the first incremental run:
@@ -373,6 +443,9 @@ Parket validates configuration at startup and exits with code 2 on any failure:
 - `TABLES` must not be empty or whitespace-only.
 - `TARGET_MEMORY_MB` must parse as a positive integer (> 0).
 - `MERGE_MEMORY_MB`, if set, must parse as a positive integer (> 0); defaults to `TARGET_MEMORY_MB`.
+- `TABLE_ARCHIVE_<t>`, if set, must hold a scope predicate with exactly one `?`; the table may set no
+  other per-table mode option, and `ARCHIVE_SOURCE_TIME_ZONE` becomes required (see
+  [Per-Table Archive Mode](#per-table-archive-mode-table_archive)).
 - All required variables must be present and non-empty.
 
 Error messages identify the specific missing or invalid variable.
