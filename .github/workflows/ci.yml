@@ -1,12 +1,20 @@
 name: CI
 
+# One run per commit: a branch is tested through its pull request, and master after the merge.
+# Triggering on every branch push as well ran each PR commit twice (push + pull_request).
+# A branch without a PR can still be run by hand (workflow_dispatch).
 on:
   push:
-    # `**`, not `*`: in GitHub's branch filters `*` stops at `/`, so `*` never matched a
-    # `fix/...` or `feat/...` branch and those pushes ran no CI.
-    branches: ["**"]
+    branches: [master]
   pull_request:
     branches: [master]
+  workflow_dispatch:
+
+# A new push to a PR supersedes its in-flight run; master runs are never cancelled, so every
+# merged commit keeps a result.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
