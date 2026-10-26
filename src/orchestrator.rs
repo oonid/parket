@@ -281,6 +281,17 @@ where
     }
 
     async fn process_table(&mut self, table_name: &str) -> Result<()> {
+        // Archive guard: an archive table never runs a sync mode — not even auto-detection, which
+        // would resolve most such tables to full_refresh and overwrite rows already purged from the
+        // source. Refused before any discovery or write; the archive run itself is a separate
+        // command (docs/design/archive-mode.md).
+        if let Some(scope) = self.config.archive_scope(table_name) {
+            anyhow::bail!(
+                "table `{table_name}` is in archive mode (TABLE_ARCHIVE_{table_name}=`{scope}`); a \
+                 sync run never processes archive tables, and the archive run is not available yet. \
+                 Remove it from TABLES for sync runs"
+            );
+        }
         let start = Instant::now();
 
         let columns = self.schema_inspect.discover_columns(table_name).await?;
@@ -570,6 +581,26 @@ mod tests {
         assert_eq!(ExitCode::Success as i32, 0);
         assert_eq!(ExitCode::PartialFailure as i32, 1);
         assert_eq!(ExitCode::Fatal as i32, 2);
+    }
+
+    #[tokio::test]
+    async fn archive_table_is_refused_before_any_discovery_or_write() {
+        // A sync run must never process an archive table, not even through auto-detection: the
+        // mocks carry no expectations, so any discovery, extraction or write would panic.
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["messages".to_string()]);
+        config.table_archive.insert("messages".to_string(), "source_id = ?".to_string());
+        let mut orch = make_orchestrator(
+            config,
+            MockSchemaInspect::new(),
+            MockExtract::new(),
+            MockDeltaWrite::new(),
+            MockStateManage::new(),
+            dir.path().to_path_buf(),
+        );
+        let err = orch.process_table("messages").await.expect_err("archive tables are refused").to_string();
+        assert!(err.contains("archive mode"), "got: {err}");
+        assert!(err.contains("TABLE_ARCHIVE_messages"), "got: {err}");
     }
 
     #[tokio::test]
