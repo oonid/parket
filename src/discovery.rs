@@ -527,6 +527,7 @@ mod tests {
             table_insert_cursor: HashMap::new(),
             table_update_cursor: HashMap::new(),
             table_reconcile: std::collections::HashSet::new(),
+            table_archive: std::collections::HashMap::new(),
         }
     }
 
