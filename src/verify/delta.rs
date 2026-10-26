@@ -7,7 +7,9 @@ use deltalake::datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use deltalake::datafusion::prelude::{SessionConfig, SessionContext};
 use std::collections::HashMap;
 
-use super::{AggKind, ColumnAgg, ColumnAggValues, ColumnMeta, DeltaProbe, KeyStats, StringKeyStats};
+use super::{
+    AggKind, BucketStats, ColumnAgg, ColumnAggValues, ColumnMeta, DeltaProbe, KeyStats, StringKeyStats,
+};
 use crate::writer::DeltaWriter;
 
 pub struct DeltaProbeAdapter {
@@ -504,6 +506,64 @@ impl DeltaProbe for DeltaProbeAdapter {
             .context("delta value_aggregates_latest: empty result")?;
         Ok(Self::parse_aggregate_batch(b, columns))
     }
+
+    /// V9: the Delta half of the bucketed check — one grouped scan over non-NULL keys whose value
+    /// slots reuse `column_exprs`. Buckets are `(key - lo) / width` on the Int64 key; the offset
+    /// keeps the dividend non-negative, where integer division agrees with MySQL's `DIV`, so both
+    /// sides land a key in the same bucket. The key fingerprint follows the SOURCE's
+    /// convention (xor and sum over all rows, `distinct_xor = xor`) rather than `key_stats`'s
+    /// distinct variants: `bit_xor(distinct …)` fails inside a GROUP BY on this DataFusion, and
+    /// nothing is lost — a source key is unique, so a bucket only matches when Delta's count equals
+    /// its distinct count, where the plain and distinct aggregates coincide. A plain session like
+    /// `key_stats`, which runs the same `count(distinct …)` accumulator.
+    async fn bucketed_aggregates(
+        &self,
+        table: &str,
+        key_col: &str,
+        lo: i64,
+        width: i64,
+        columns: &[ColumnAgg],
+    ) -> Result<Vec<BucketStats>> {
+        let t = self.writer.open_table(table).await?;
+        let ctx = SessionContext::new();
+        ctx.register_table("t", t.table_provider().await?)?;
+        let bucket = format!("(cast(`{key_col}` as bigint) - ({lo})) / {width}");
+        let value_list = columns
+            .iter()
+            .flat_map(Self::column_exprs)
+            .map(|e| format!(", {e}"))
+            .collect::<String>();
+        let sql = format!(
+            "SELECT {bucket} AS b, count(*), count(distinct `{key_col}`), \
+             cast(min(cast(`{key_col}` as decimal(20,0))) as varchar), cast(max(cast(`{key_col}` as decimal(20,0))) as varchar), \
+             bit_xor(cast(`{key_col}` as bigint)), \
+             cast(sum(cast(`{key_col}` as decimal(38,0))) as varchar){value_list} \
+             FROM t WHERE `{key_col}` IS NOT NULL GROUP BY {bucket}"
+        );
+        let batches = ctx.sql(&sql).await?.collect().await?;
+        let mut out = Vec::new();
+        for b in &batches {
+            for row in 0..b.num_rows() {
+                let bound = |i: usize| Self::str_at(b, row, i).and_then(|v| v.parse::<i128>().ok());
+                let keys = KeyStats {
+                    count: Self::i64_at(b, row, 1),
+                    distinct: Self::i64_at(b, row, 2),
+                    min: bound(3),
+                    max: bound(4),
+                    xor: Self::i64_at(b, row, 5),
+                    distinct_xor: Self::i64_at(b, row, 5),
+                    sum: bound(6).unwrap_or(0),
+                };
+                let mut offset = 7;
+                let values = columns
+                    .iter()
+                    .map(|col| Self::read_column_values(b, row, &mut offset, &col.kind))
+                    .collect();
+                out.push(BucketStats { bucket: Self::i64_at(b, row, 0), keys, values, changed_since_sync: 0 });
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -792,6 +852,48 @@ mod tests {
         // Empty column list short-circuits without touching the table.
         let empty = probe.value_aggregates("orders", &[]).await.unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delta_probe_bucketed_aggregates_real() {
+        // V9: ids 1..=25 bucketed as (id - 1) / 10 land in buckets 0 (1..=10), 1 (11..=20) and
+        // 2 (21..=25); each bucket must carry its own key fingerprint and value aggregates, read
+        // from the right row. A row with a NULL key belongs to no bucket at all — before it was
+        // excluded it became bucket 0 and silently merged into the real one.
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = std::sync::Arc::new(deltalake::arrow::datatypes::Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("qty", DataType::Int64, false),
+        ]));
+        writer.ensure_table("orders", schema.clone()).await.unwrap();
+        let ids: Vec<Option<i64>> = (1..=25).map(Some).chain([None]).collect();
+        let qty: Vec<i64> = (1..=26).map(|i| i * 10).collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![std::sync::Arc::new(Int64Array::from(ids)), std::sync::Arc::new(Int64Array::from(qty))],
+        )
+        .unwrap();
+        writer.append_batch("orders", vec![batch], None).await.unwrap();
+
+        let probe = DeltaProbeAdapter::new(writer);
+        let columns = vec![ColumnAgg { name: "qty".to_string(), kind: AggKind::Integer }];
+        let mut buckets = probe.bucketed_aggregates("orders", "id", 1, 10, &columns).await.unwrap();
+        buckets.sort_by_key(|b| b.bucket);
+
+        assert_eq!(buckets.iter().map(|b| b.bucket).collect::<Vec<_>>(), vec![0, 1, 2]);
+        let top = &buckets[2];
+        assert_eq!((top.keys.count, top.keys.distinct), (5, 5));
+        assert_eq!((top.keys.min, top.keys.max), (Some(21), Some(25)));
+        assert_eq!(top.keys.sum, (21..=25).sum::<i128>());
+        assert_eq!(top.keys.xor, (21..=25).fold(0i64, |a, i| a ^ i));
+        assert_eq!(top.values[0].sum, Some(((21..=25).sum::<i64>() * 10).to_string()));
+        assert_eq!(top.values[0].min, Some("210".to_string()));
+        assert_eq!(top.values[0].non_null_count, 5);
+        let first = &buckets[0];
+        assert_eq!((first.keys.count, first.keys.min, first.keys.max), (10, Some(1), Some(10)));
+        assert_eq!(first.values[0].max, Some("100".to_string()), "the NULL-key row (qty 260) is not in bucket 0");
+        assert!(buckets.iter().all(|b| b.changed_since_sync == 0), "Delta never reports changes");
     }
 
     #[tokio::test]

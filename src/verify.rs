@@ -404,6 +404,152 @@ fn fingerprint_pairs(
         .collect()
 }
 
+/// V9: how many key buckets the Drift-time bucketed value check splits a table into. Each side
+/// returns one aggregate row per bucket, so this bounds the result size; it is fine-grained
+/// enough that a few drifted keys leave the large majority of buckets comparable.
+const BUCKET_COUNT: i128 = 1024;
+
+/// V9: most mismatched buckets named individually in the report line; the rest are counted.
+const BUCKET_MISMATCHES_LISTED: usize = 10;
+
+/// V9: the `(lo, width)` that split `[min, max]` into at most `BUCKET_COUNT` buckets of
+/// `(key - lo) DIV width`, with `lo = min`. Offsetting by the minimum keeps every bucket index
+/// non-negative, so `DIV`'s truncation toward zero never folds the ranges either side of zero into
+/// one bucket, and `[lo + b·width, lo + b·width + width - 1]` is exactly bucket `b`'s key range.
+/// `None` when the range does not fit the i64 arithmetic both engines bucket with: a key outside
+/// i64 (a `BIGINT UNSIGNED` key above `i64::MAX`), or a span `key - lo` that would overflow it.
+fn bucket_layout(min: i128, max: i128) -> Option<(i64, i64)> {
+    if max < min || min < i64::MIN as i128 || max > i64::MAX as i128 || max - min > i64::MAX as i128 {
+        return None;
+    }
+    let span = max - min + 1;
+    let width = i64::try_from((span + BUCKET_COUNT - 1) / BUCKET_COUNT).ok()?.max(1);
+    Some((i64::try_from(min).ok()?, width))
+}
+
+/// V9: the source's update cursor and the stored watermark. A source row the update stream has not
+/// consumed yet — `cursor > after`, or `cursor = after` with a key above the watermark's `last_id`
+/// tie-break, exactly as the update stream's own query reads it — changed after the sync, so its
+/// bucket is left out of the value comparison.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangedSince {
+    pub cursor_col: String,
+    pub after: String,
+    pub last_id: i64,
+}
+
+/// V9: one key bucket's fingerprint — key-set stats plus per-column value aggregates over the rows
+/// whose key falls in the bucket.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BucketStats {
+    pub bucket: i64,
+    pub keys: KeyStats,
+    pub values: Vec<ColumnAggValues>,
+    /// Source only: rows in the bucket past the `ChangedSince` watermark. Always 0 on Delta.
+    pub changed_since_sync: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct BucketMismatch {
+    lo: i128,
+    hi: i128,
+    columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct BucketReport {
+    buckets: usize,
+    key_identical: usize,
+    changed_since_sync: usize,
+    compared_rows: i64,
+    source_rows: i64,
+    matched: usize,
+    mismatched: Vec<BucketMismatch>,
+}
+
+/// V9: compare values only inside buckets whose key sets are identical on both sides. A Drift
+/// verdict means the two sides legitimately hold different rows, so a whole-table aggregate
+/// differs by construction; per bucket, the rows that do match can still be value-checked. A
+/// bucket whose keys differ, or whose source rows changed after the sync, is counted but skipped.
+fn compare_buckets(
+    specs: &[ColumnAgg],
+    lo: i64,
+    width: i64,
+    source: &[BucketStats],
+    delta: &[BucketStats],
+) -> BucketReport {
+    let delta_by_bucket: HashMap<i64, &BucketStats> = delta.iter().map(|b| (b.bucket, b)).collect();
+    let mut all: std::collections::HashSet<i64> = delta_by_bucket.keys().copied().collect();
+    all.extend(source.iter().map(|b| b.bucket));
+
+    let mut report = BucketReport {
+        buckets: all.len(),
+        source_rows: source.iter().map(|b| b.keys.count).sum(),
+        ..Default::default()
+    };
+    let mut ordered: Vec<&BucketStats> = source.iter().collect();
+    ordered.sort_by_key(|b| b.bucket);
+    for s in ordered {
+        let Some(d) = delta_by_bucket.get(&s.bucket) else { continue };
+        if s.keys != d.keys {
+            continue;
+        }
+        report.key_identical += 1;
+        if s.changed_since_sync > 0 {
+            report.changed_since_sync += 1;
+            continue;
+        }
+        report.compared_rows += s.keys.count;
+        let columns: Vec<String> = specs
+            .iter()
+            .zip(fingerprint_pairs(specs, &s.values, &d.values, false))
+            .filter(|(_, (fs, fd))| fs != fd)
+            .map(|(spec, _)| spec.name.clone())
+            .collect();
+        if columns.is_empty() {
+            report.matched += 1;
+        } else {
+            let first = lo as i128 + s.bucket as i128 * width as i128;
+            report.mismatched.push(BucketMismatch { lo: first, hi: first + width as i128 - 1, columns });
+        }
+    }
+    report
+}
+
+fn render_bucket_report(table: &str, r: &BucketReport) -> String {
+    let pct = if r.source_rows > 0 {
+        r.compared_rows as f64 * 100.0 / r.source_rows as f64
+    } else {
+        0.0
+    };
+    let mut line = format!(
+        "verify {table} value-aggregates (bucketed, diagnostic — does not affect verdict): \
+         {}/{} buckets key-identical, {} of them skipped as changed since sync; values compared on \
+         {}/{} source rows ({pct:.1}%): match in {}, MISMATCH in {}",
+        r.key_identical,
+        r.buckets,
+        r.changed_since_sync,
+        r.compared_rows,
+        r.source_rows,
+        r.matched,
+        r.mismatched.len()
+    );
+    if !r.mismatched.is_empty() {
+        let listed: Vec<String> = r
+            .mismatched
+            .iter()
+            .take(BUCKET_MISMATCHES_LISTED)
+            .map(|m| format!("ids {}–{} [{}]", m.lo, m.hi, m.columns.join(", ")))
+            .collect();
+        line.push_str(": ");
+        line.push_str(&listed.join("; "));
+        if r.mismatched.len() > BUCKET_MISMATCHES_LISTED {
+            line.push_str(&format!("; … and {} more", r.mismatched.len() - BUCKET_MISMATCHES_LISTED));
+        }
+    }
+    line
+}
+
 /// L2 key-set fingerprint over a table's PK column.
 ///
 /// `min`/`max` are `i128` (not `i64`) so a `BIGINT UNSIGNED` key value above
@@ -467,6 +613,18 @@ pub trait SourceProbe: Send + Sync {
     ) -> Result<HashMap<i64, Vec<Option<String>>>>;
     async fn value_aggregates(&self, table: &str, columns: &[ColumnAgg]) -> Result<Vec<ColumnAggValues>>;
     async fn value_aggregates_scoped(&self, table: &str, columns: &[ColumnAgg], scope: &SourceScope) -> Result<Vec<ColumnAggValues>>;
+    /// V9: per-bucket (`(key - lo) DIV width`) key stats and value aggregates over the non-NULL
+    /// keys, one entry per non-empty bucket, with each bucket's count of rows past `changed` when
+    /// one is given.
+    async fn bucketed_aggregates(
+        &self,
+        table: &str,
+        key_col: &str,
+        lo: i64,
+        width: i64,
+        columns: &[ColumnAgg],
+        changed: Option<ChangedSince>,
+    ) -> Result<Vec<BucketStats>>;
 }
 
 /// Delta-side probe (the synced output).
@@ -494,6 +652,16 @@ pub trait DeltaProbe: Send + Sync {
     ) -> Result<HashMap<i64, Vec<Option<String>>>>;
     async fn value_aggregates(&self, table: &str, columns: &[ColumnAgg]) -> Result<Vec<ColumnAggValues>>;
     async fn value_aggregates_latest(&self, table: &str, columns: &[ColumnAgg], cursor_col: &str, scope: &SourceScope) -> Result<Vec<ColumnAggValues>>;
+    /// V9: per-bucket (`(key - lo) DIV width`) key stats and value aggregates over the non-NULL
+    /// keys, one entry per non-empty bucket — the Delta half of `SourceProbe::bucketed_aggregates`.
+    async fn bucketed_aggregates(
+        &self,
+        table: &str,
+        key_col: &str,
+        lo: i64,
+        width: i64,
+        columns: &[ColumnAgg],
+    ) -> Result<Vec<BucketStats>>;
 }
 
 pub struct VerifyCommand<S, D> {
@@ -870,6 +1038,57 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
 
     /// Per-table verify body, extracted from `run()` so a probe error on one table can be
     /// captured as `Skipped` by the caller instead of aborting every other table (VA4).
+    /// V9: the bucketed value check's report line for a Drift table, or the reason it was skipped.
+    /// Infallible by design: a probe error becomes a skip line, because a diagnostic must never turn
+    /// the table's Drift verdict into a SKIPPED one (an `Err` out of `run_one_table` would).
+    async fn bucketed_value_line(
+        &self,
+        table: &str,
+        plan: &TablePlan,
+        key_col: Option<&str>,
+        scoped: bool,
+        keys: Option<(&KeyStats, &KeyStats)>,
+        specs: &[ColumnAgg],
+    ) -> String {
+        let skipped = |why: &str| format!("verify {table} value-aggregates (bucketed): skipped ({why})");
+        if scoped {
+            return skipped(
+                "incremental table: Delta keeps every version of a row, so no bucket's key set can \
+                 match the source's",
+            );
+        }
+        let (Some(key), Some((s, d))) = (key_col, keys) else {
+            return skipped("no integer key to bucket on");
+        };
+        let (Some(min), Some(max)) = (
+            s.min.zip(d.min).map(|(a, b)| a.min(b)),
+            s.max.zip(d.max).map(|(a, b)| a.max(b)),
+        ) else {
+            return skipped("one side holds no keys");
+        };
+        let Some((lo, width)) = bucket_layout(min, max) else {
+            return skipped("key range does not fit i64 bucketing");
+        };
+        let changed = match &plan.mode {
+            VerifyMode::TwoStream { update_cursor, update_hwm: Some(hwm), .. } => Some(ChangedSince {
+                cursor_col: update_cursor.clone(),
+                after: hwm.updated_at.clone(),
+                last_id: hwm.last_id,
+            }),
+            _ => None,
+        };
+        let buckets = async {
+            let sb = self.source.bucketed_aggregates(table, key, lo, width, specs, changed).await?;
+            let db = self.delta.bucketed_aggregates(table, key, lo, width, specs).await?;
+            anyhow::Ok((sb, db))
+        }
+        .await;
+        match buckets {
+            Ok((sb, db)) => render_bucket_report(table, &compare_buckets(specs, lo, width, &sb, &db)),
+            Err(e) => skipped(&format!("probe error: {e:#}; the verdict stands")),
+        }
+    }
+
     pub async fn run_one_table(&self, table: &str, plan: &TablePlan) -> Result<TableOutcome> {
             println!("verify {table} plan: {}", plan.describe());
 
@@ -975,6 +1194,8 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
             };
 
             let mut delta_keystats: Option<KeyStats> = None;
+            // V9: kept so a Drift verdict can size the key buckets from both sides' key range.
+            let mut source_keystats: Option<KeyStats> = None;
             let skip_pass_layers_reason = if incremental_scope.is_some() {
                 Some("row-level census/sample deferred for incremental scope (value-aggregates checked separately)")
             } else {
@@ -1056,6 +1277,7 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                 let s = self.source.key_stats(table, key).await?;
                 let d = self.delta.key_stats(table, key).await?;
                 delta_keystats = Some(d.clone());
+                source_keystats = Some(s.clone());
                 if matches!(&plan.mode, VerifyMode::TwoStream { .. }) {
                     // FA2-r2: the duplicate-key check lives INSIDE the outcome fn (pure +
                     // directly unit-testable) and dominates it — see there for why.
@@ -1132,6 +1354,21 @@ impl<S: SourceProbe, D: DeltaProbe> VerifyCommand<S, D> {
                         };
                     }
                 }
+            }
+
+            // V9: a Drift verdict skips the whole-table value check above — the two sides hold
+            // different rows, so whole-table aggregates differ by construction. Compare values
+            // per key bucket instead, inside buckets whose key sets are identical. Diagnostic only:
+            // on a live source a row edited between sync and verify mismatches too, and a two-stream
+            // table's cursor misses edits that don't advance it (§8.1), so gating the verdict on
+            // this would fail healthy runs. The archive's pre-purge check is the strict consumer.
+            if matches!(outcome, TableOutcome::Drift { .. }) && !specs.is_empty() {
+                let keys = source_keystats.as_ref().zip(delta_keystats.as_ref());
+                let scoped = incremental_scope.is_some();
+                let line = self
+                    .bucketed_value_line(table, plan, key_col.as_deref(), scoped, keys, &specs)
+                    .await;
+                println!("{line}");
             }
 
             match &outcome {
@@ -2275,6 +2512,237 @@ mod tests {
         let result = cmd.run().await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), VerifyVerdict::Clean);
+    }
+
+    fn bucket(bucket: i64, ids: std::ops::RangeInclusive<i64>, qty_sum: i64, changed: i64) -> BucketStats {
+        let ids: Vec<i64> = ids.collect();
+        BucketStats {
+            bucket,
+            keys: KeyStats {
+                count: ids.len() as i64,
+                distinct: ids.len() as i64,
+                min: ids.first().map(|&i| i as i128),
+                max: ids.last().map(|&i| i as i128),
+                xor: ids.iter().fold(0, |a, i| a ^ i),
+                distinct_xor: ids.iter().fold(0, |a, i| a ^ i),
+                sum: ids.iter().map(|&i| i as i128).sum(),
+            },
+            values: vec![ColumnAggValues {
+                sum: Some(qty_sum.to_string()),
+                min: None,
+                max: None,
+                non_null_count: ids.len() as i64,
+            }],
+            changed_since_sync: changed,
+        }
+    }
+
+    fn qty_spec() -> Vec<ColumnAgg> {
+        vec![ColumnAgg { name: "qty".to_string(), kind: AggKind::Integer }]
+    }
+
+    #[test]
+    fn bucket_layout_splits_the_range_into_at_most_1024_buckets() {
+        assert_eq!(bucket_layout(1, 6), Some((1, 1)));
+        assert_eq!(bucket_layout(1, 1024), Some((1, 1)));
+        assert_eq!(bucket_layout(1, 1025), Some((1, 2)));
+        // span 21_259_775 / 1024 = 20_761.5 → rounded up; offset by the minimum, the last key lands
+        // in bucket (61_259_775 - 40_000_001) / 20_762 = 1023, so there are exactly 1024 buckets.
+        let (lo, width) = bucket_layout(40_000_001, 61_259_775).unwrap();
+        assert_eq!((lo, width), (40_000_001, 20_762));
+        assert_eq!((61_259_775 - lo) / width, 1023);
+        // Negative keys: offsetting keeps every index non-negative, so -9..=9 never share a bucket.
+        let (lo, width) = bucket_layout(-5000, 5000).unwrap();
+        assert_eq!((lo, width), (-5000, 10));
+        assert_ne!((-9 - lo) / width, (9 - lo) / width);
+        assert_eq!(bucket_layout(5, 4), None, "an empty range has no buckets");
+        assert_eq!(bucket_layout(0, i64::MAX as i128 + 1), None, "keys past i64::MAX can't be bucketed");
+        assert_eq!(
+            bucket_layout(i64::MIN as i128, i64::MAX as i128),
+            None,
+            "a span wider than i64 would overflow key - lo"
+        );
+    }
+
+    #[test]
+    fn compare_buckets_checks_values_only_where_keys_match() {
+        let source = vec![
+            bucket(0, 1..=9, 450, 0),
+            bucket(1, 10..=19, 1450, 0),  // value differs on Delta → mismatch
+            bucket(2, 20..=24, 1100, 0),  // Delta holds one more id → key-different, skipped
+            bucket(3, 30..=39, 3450, 2),  // changed since sync → skipped
+        ];
+        let delta = vec![
+            bucket(0, 1..=9, 450, 0),
+            bucket(1, 10..=19, 1449, 0),
+            bucket(2, 20..=25, 1350, 0),
+            bucket(3, 30..=39, 3000, 0),
+            bucket(4, 40..=41, 810, 0), // only on Delta (deleted at source)
+        ];
+        let r = compare_buckets(&qty_spec(), 0, 10, &source, &delta);
+        assert_eq!(r.buckets, 5);
+        assert_eq!(r.key_identical, 3);
+        assert_eq!(r.changed_since_sync, 1);
+        assert_eq!(r.matched, 1);
+        assert_eq!(
+            r.mismatched,
+            vec![BucketMismatch { lo: 10, hi: 19, columns: vec!["qty".to_string()] }]
+        );
+        assert_eq!(r.compared_rows, 19, "buckets 0 and 1 only");
+        assert_eq!(r.source_rows, 34);
+    }
+
+    #[test]
+    fn bucket_report_names_mismatched_ranges_and_caps_the_list() {
+        let report = BucketReport {
+            buckets: 20,
+            key_identical: 18,
+            changed_since_sync: 1,
+            compared_rows: 170,
+            source_rows: 200,
+            matched: 5,
+            mismatched: (0..12)
+                .map(|i| BucketMismatch { lo: i * 10, hi: i * 10 + 9, columns: vec!["qty".to_string()] })
+                .collect(),
+        };
+        let line = render_bucket_report("orders", &report);
+        assert!(line.contains("diagnostic — does not affect verdict"), "got: {line}");
+        assert!(line.contains("18/20 buckets key-identical"), "got: {line}");
+        assert!(line.contains("170/200 source rows (85.0%)"), "got: {line}");
+        assert!(line.contains("MISMATCH in 12"), "got: {line}");
+        assert!(line.contains("ids 0–9 [qty]"), "got: {line}");
+        assert!(line.contains("… and 2 more"), "only 10 ranges are listed: {line}");
+    }
+
+    /// Mocks for a table with one comparable column whose key stats grade Drift for its mode, so
+    /// the bucketed check runs.
+    fn drift_mocks(source_keys: KeyStats, delta_keys: KeyStats) -> (MockSourceProbe, MockDeltaProbe) {
+        let mut source = MockSourceProbe::new();
+        let mut delta = MockDeltaProbe::new();
+        let (src_rows, delta_rows) = (source_keys.count, delta_keys.count);
+        source.expect_row_count().returning(move |_| Ok(src_rows));
+        delta.expect_row_count().returning(move |_| Ok(delta_rows));
+        let cols = || {
+            Ok(vec![
+                ColumnMeta { name: "id".to_string(), type_str: "bigint".to_string(), nullable: false, numeric_scale: None },
+                ColumnMeta { name: "qty".to_string(), type_str: "int".to_string(), nullable: true, numeric_scale: None },
+            ])
+        };
+        source.expect_columns().returning(move |_| cols());
+        delta.expect_columns().returning(move |_| cols());
+        source.expect_integer_pk().returning(|_| Ok(Some("id".to_string())));
+        source.expect_max_cursor().returning(|_, _| Ok(Some("2026-06-30 12:00:00".to_string())));
+        delta.expect_max_cursor().returning(|_, _| Ok(Some("2026-06-30T12:00:00.000000".to_string())));
+        source.expect_key_stats().returning(move |_, _| Ok(source_keys.clone()));
+        delta.expect_key_stats().returning(move |_, _| Ok(delta_keys.clone()));
+        (source, delta)
+    }
+
+    /// ids 2..=4 (3 rows) and ids 1..=5 (5 rows): two-stream grades the 5-row side as Delta
+    /// retaining source-deleted ids; full refresh grades the 3-row side as Delta lagging.
+    fn ks_2_to_4() -> KeyStats {
+        KeyStats { count: 3, distinct: 3, min: Some(2), max: Some(4), xor: 5, distinct_xor: 5, sum: 9 }
+    }
+    fn ks_1_to_5() -> KeyStats {
+        KeyStats { count: 5, distinct: 5, min: Some(1), max: Some(5), xor: 1, distinct_xor: 1, sum: 15 }
+    }
+
+    fn two_stream_plan(last_id: i64) -> TablePlan {
+        TablePlan {
+            table: "orders".to_string(),
+            mode: VerifyMode::TwoStream {
+                insert_cursor: "id".to_string(),
+                update_cursor: "updated_at".to_string(),
+                update_hwm: Some(Hwm { updated_at: "2026-06-30 12:00:00".to_string(), last_id }),
+                insert_hwm: Some(5),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_drift_runs_bucketed_value_check_without_changing_the_verdict() {
+        let (mut source, mut delta) = drift_mocks(ks_2_to_4(), ks_1_to_5());
+        // Range 1..=5 → lo 1, width 1. The update watermark, tie-break id included, is handed to
+        // the source as the change marker.
+        source
+            .expect_bucketed_aggregates()
+            .withf(|t, k, lo, w, specs, changed| {
+                t == "orders"
+                    && k == "id"
+                    && (*lo, *w) == (1, 1)
+                    && specs.len() == 1
+                    && specs[0].name == "qty"
+                    && changed.as_ref().is_some_and(|c| {
+                        c.cursor_col == "updated_at" && c.after == "2026-06-30 12:00:00" && c.last_id == 500
+                    })
+            })
+            .times(1)
+            .returning(|_, _, _, _, _, _| Ok(vec![bucket(1, 2..=2, 20, 0), bucket(2, 3..=3, 30, 0)]));
+        // Bucket 2's value differs: reported, but diagnostic only.
+        delta
+            .expect_bucketed_aggregates()
+            .withf(|t, k, lo, w, _| t == "orders" && k == "id" && (*lo, *w) == (1, 1))
+            .times(1)
+            .returning(|_, _, _, _, _| Ok(vec![bucket(1, 2..=2, 20, 0), bucket(2, 3..=3, 31, 0)]));
+
+        let cmd = VerifyCommand::new(source, delta, vec!["orders".to_string()]);
+        let outcome = cmd.run_one_table("orders", &two_stream_plan(500)).await.unwrap();
+        assert!(matches!(outcome, TableOutcome::Drift { .. }), "a value mismatch must not change Drift: {outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn verify_bucketed_probe_error_keeps_the_drift_verdict() {
+        // The diagnostic failing (a timeout, a DataFusion GROUP BY limitation) must not turn the
+        // table's Drift into the SKIPPED that an Err out of run_one_table would produce.
+        let (mut source, mut delta) = drift_mocks(ks_2_to_4(), ks_1_to_5());
+        source
+            .expect_bucketed_aggregates()
+            .times(1)
+            .returning(|_, _, _, _, _, _| Err(anyhow::anyhow!("Lock wait timeout exceeded")));
+        delta.expect_bucketed_aggregates().times(0);
+        let cmd = VerifyCommand::new(source, delta, vec!["orders".to_string()]);
+        let outcome = cmd.run_one_table("orders", &two_stream_plan(i64::MAX)).await.unwrap();
+        assert!(matches!(outcome, TableOutcome::Drift { .. }), "got {outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn verify_full_refresh_drift_buckets_without_a_change_marker() {
+        // Source advanced past the sync: Delta's ids sit inside the source's range → Drift.
+        let (mut source, mut delta) = drift_mocks(ks_1_to_5(), ks_2_to_4());
+        source
+            .expect_bucketed_aggregates()
+            .withf(|_, _, _, _, _, changed| changed.is_none())
+            .times(1)
+            .returning(|_, _, _, _, _, _| Ok(vec![]));
+        delta.expect_bucketed_aggregates().times(1).returning(|_, _, _, _, _| Ok(vec![]));
+        let cmd = VerifyCommand::new(source, delta, vec!["orders".to_string()]);
+        let plan = TablePlan { table: "orders".to_string(), mode: VerifyMode::FullRefresh };
+        let outcome = cmd.run_one_table("orders", &plan).await.unwrap();
+        assert!(matches!(outcome, TableOutcome::Drift { .. }), "got {outcome:?}");
+    }
+
+    #[test]
+    fn bucketed_skip_reasons_name_the_real_cause() {
+        // Pure paths of bucketed_value_line that return before touching a probe.
+        let cmd = VerifyCommand::new(MockSourceProbe::new(), MockDeltaProbe::new(), vec![]);
+        let plan = TablePlan { table: "t".to_string(), mode: VerifyMode::FullRefresh };
+        let empty = KeyStats { count: 0, distinct: 0, min: None, max: None, xor: 0, distinct_xor: 0, sum: 0 };
+        let huge = KeyStats { max: Some(i64::MAX as i128 + 5), ..ks_1_to_5() };
+        let specs = qty_spec();
+        let line = |key: Option<&'static str>, scoped: bool, keys: Option<(KeyStats, KeyStats)>| {
+            futures::executor::block_on(cmd.bucketed_value_line(
+                "t",
+                &plan,
+                key,
+                scoped,
+                keys.as_ref().map(|(s, d)| (s, d)),
+                &specs,
+            ))
+        };
+        assert!(line(Some("id"), true, None).contains("incremental table"));
+        assert!(line(None, false, None).contains("no integer key"));
+        assert!(line(Some("id"), false, Some((ks_1_to_5(), empty))).contains("one side holds no keys"));
+        assert!(line(Some("id"), false, Some((ks_1_to_5(), huge))).contains("does not fit i64"));
     }
 
     #[tokio::test]
