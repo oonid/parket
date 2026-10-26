@@ -248,6 +248,40 @@ pub(crate) fn parse_table_archive(tables: &[String]) -> Result<HashMap<String, S
     Ok(map)
 }
 
+/// Archive mode: `ARCHIVE_SOURCE_TIME_ZONE` names the source's time zone (an IANA name such as
+/// `Asia/Jakarta`), recorded as metadata on every archived timestamp column. Required as soon as
+/// any table is in archive mode — an archived timestamp must never lose its zone — and unused
+/// otherwise. Checked for the shape of a zone name, not against a zone database.
+pub(crate) fn parse_archive_source_time_zone(
+    table_archive: &HashMap<String, String>,
+) -> Result<Option<String>> {
+    let value = std::env::var("ARCHIVE_SOURCE_TIME_ZONE").ok().map(|v| v.trim().to_string());
+    match value {
+        Some(zone) if !zone.is_empty() => {
+            let shaped = zone
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '+'));
+            if !shaped {
+                bail!(
+                    "ARCHIVE_SOURCE_TIME_ZONE={zone}: expected an IANA time zone name such as \
+                     `Asia/Jakarta` or `UTC`"
+                );
+            }
+            Ok(Some(zone))
+        }
+        _ if !table_archive.is_empty() => {
+            let mut tables: Vec<&String> = table_archive.keys().collect();
+            tables.sort();
+            bail!(
+                "ARCHIVE_SOURCE_TIME_ZONE is required when tables are in archive mode ({}): set the \
+                 source's IANA time zone, e.g. `Asia/Jakarta`, so archived timestamps keep it",
+                tables.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", ")
+            );
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Archive guard: an archive table has exactly one mode. Every per-table setting that would steer
 /// it into a sync mode is rejected at startup, because the sync modes' repairs (full refresh,
 /// reconcile, re-seeded watermarks) replace the Delta table with the source's current rows, and

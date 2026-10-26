@@ -61,6 +61,7 @@ pub(crate) fn make_config(tables: Vec<String>) -> Config {
         table_update_cursor: HashMap::new(),
         table_reconcile: HashSet::new(),
         table_archive: std::collections::HashMap::new(),
+        archive_source_time_zone: None,
     }
 }
 
@@ -201,5 +202,6 @@ pub(crate) fn make_config_with_full_refresh(tables: Vec<String>) -> Config {
         table_update_cursor: HashMap::new(),
         table_reconcile: HashSet::new(),
         table_archive: std::collections::HashMap::new(),
+        archive_source_time_zone: None,
     }
 }
