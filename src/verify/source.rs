@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use crate::query::backtick;
 
 use super::{
-    AggKind, ColumnAgg, ColumnAggValues, ColumnMeta, KeyStats, SourceProbe, SourceScope,
-    StringKeyStats,
+    AggKind, BucketStats, ChangedSince, ColumnAgg, ColumnAggValues, ColumnMeta, KeyStats,
+    SourceProbe, SourceScope, StringKeyStats,
 };
 
 fn scope_predicate_sql(scope: &SourceScope) -> String {
@@ -347,6 +347,79 @@ impl SourceProbe for SourceProbeAdapter {
         scope: &SourceScope,
     ) -> Result<Vec<ColumnAggValues>> {
         self.value_aggregates_impl(table, columns, Some(scope)).await
+    }
+
+    /// V9: one grouped scan. The key fingerprint is `key_fingerprint_select`, the same SQL as
+    /// `key_stats`, and the value slots reuse `column_exprs`, so per-bucket parity rests on the
+    /// same expressions as the whole-table checks. Buckets are `(key - lo) DIV width` over non-NULL
+    /// keys: with `lo` the minimum the index is never negative, so `DIV`'s truncation toward zero
+    /// matches DataFusion's Int64 division on the Delta side. Grouped by the full select
+    /// expression, not an alias: MySQL resolves a GROUP BY name against table columns before select
+    /// aliases, and repeating the exact expression also satisfies ONLY_FULL_GROUP_BY.
+    async fn bucketed_aggregates(
+        &self,
+        table: &str,
+        key_col: &str,
+        lo: i64,
+        width: i64,
+        columns: &[ColumnAgg],
+        changed: Option<ChangedSince>,
+    ) -> Result<Vec<BucketStats>> {
+        let quoted_table = backtick(table);
+        let key = backtick(key_col);
+        let bucket = format!("CAST(({key} - ({lo})) DIV {width} AS SIGNED)");
+        let fingerprint = key_fingerprint_select(&key);
+        // Mirrors the update stream's own predicate (`build_incremental_query`): a row is
+        // unconsumed when its cursor is past the watermark, or on it with a key past the tie-break.
+        let changed_expr = match &changed {
+            Some(c) => {
+                let cursor = backtick(&c.cursor_col);
+                format!(
+                    "CAST(COALESCE(SUM(({cursor} > ?) OR ({cursor} = ? AND CAST({key} AS DECIMAL(20,0)) > ?)), 0) AS SIGNED)"
+                )
+            }
+            None => "CAST(0 AS SIGNED)".to_string(),
+        };
+        let value_list = columns
+            .iter()
+            .flat_map(Self::column_exprs)
+            .map(|e| format!(", {e}"))
+            .collect::<String>();
+        let sql = format!(
+            "SELECT {bucket}, {fingerprint}, {changed_expr}{value_list} \
+             FROM {quoted_table} WHERE {key} IS NOT NULL GROUP BY {bucket}"
+        );
+        let mut query = sqlx::query(&sql);
+        if let Some(c) = &changed {
+            query = query.bind(&c.after).bind(&c.after).bind(c.last_id);
+        }
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .with_context(|| format!("source bucketed_aggregates for `{table}`.`{key_col}`"))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let keys = key_stats_from_row((
+                row.try_get(1)?,
+                row.try_get(2)?,
+                row.try_get(3)?,
+                row.try_get(4)?,
+                row.try_get(5)?,
+                row.try_get(6)?,
+            ));
+            let mut offset = 8;
+            let mut values = Vec::with_capacity(columns.len());
+            for col in columns {
+                values.push(Self::read_column_values(row, &mut offset, &col.kind)?);
+            }
+            out.push(BucketStats {
+                bucket: row.try_get(0)?,
+                keys,
+                values,
+                changed_since_sync: row.try_get(7)?,
+            });
+        }
+        Ok(out)
     }
 }
 

@@ -10,8 +10,8 @@ use parket::orchestrator::{
     SignalHandler, StateManageAdapter,
 };
 use parket::verify::{
-    DeltaProbe, DeltaProbeAdapter, SourceProbe, SourceProbeAdapter, TableOutcome, TablePlan,
-    VerifyCommand, VerifyMode, VerifyVerdict,
+    AggKind, BucketStats, ChangedSince, ColumnAgg, DeltaProbe, DeltaProbeAdapter, SourceProbe,
+    SourceProbeAdapter, TableOutcome, TablePlan, VerifyCommand, VerifyMode, VerifyVerdict,
 };
 use parket::writer::DeltaWriter;
 use sqlx::MySqlPool;
@@ -1861,6 +1861,102 @@ async fn verify_value_aggregates_real_basic_match_across_type_families() {
             .expect("verify basic value aggregates should succeed after corruption");
 
     assert_eq!(verdict_after_corruption, VerifyVerdict::Discrepancy);
+}
+
+/// V9: the bucketed check is only meaningful if MariaDB and DataFusion put every key in the same
+/// bucket and compute byte-identical per-bucket fingerprints. Prove that on a synced table spanning
+/// the integer, decimal, datetime, date and text families — then change the source and check that
+/// only the touched buckets diverge, each in the expected way.
+#[tokio::test]
+#[serial_test::serial]
+async fn verify_bucketed_aggregates_match_across_engines_bucket_by_bucket() {
+    let env = TestEnv::new(vec!["bucket_values"]).await;
+    sqlx::query(
+        "CREATE TABLE bucket_values (id BIGINT PRIMARY KEY, qty INT, amount DECIMAL(18,2), \
+         happened_at DATETIME(6), due_date DATE, note VARCHAR(255) CHARACTER SET utf8mb4, \
+         updated_at DATETIME NOT NULL)",
+    )
+    .execute(&env.pool)
+    .await
+    .expect("create bucket_values");
+    for id in 1..=40i64 {
+        sqlx::query(
+            "INSERT INTO bucket_values VALUES (?, ?, ?, ?, ?, ?, '2026-01-01 00:00:00')",
+        )
+        .bind(id)
+        .bind((id % 7 == 0).then_some(id * 3))
+        .bind(format!("{}.{:02}", id * 11, id % 100))
+        .bind(format!("2026-02-{:02} 10:{:02}:{:02}.{:06}", id % 28 + 1, id % 60, id % 60, id * 1234))
+        .bind((id % 5 != 0).then(|| format!("2026-03-{:02}", id % 28 + 1)))
+        .bind(if id % 9 == 0 { None } else { Some(format!("n{id} héllo 世界")) })
+        .execute(&env.pool)
+        .await
+        .expect("insert bucket_values row");
+    }
+    let mut orchestrator = env.make_orchestrator();
+    assert!(matches!(orchestrator.run().await, ExitCode::Success));
+
+    let columns = vec![
+        ColumnAgg { name: "qty".to_string(), kind: AggKind::Integer },
+        ColumnAgg { name: "amount".to_string(), kind: AggKind::Decimal { scale: 2 } },
+        ColumnAgg { name: "happened_at".to_string(), kind: AggKind::DatetimeSec },
+        ColumnAgg { name: "due_date".to_string(), kind: AggKind::DateOnly },
+        ColumnAgg { name: "note".to_string(), kind: AggKind::TextMass },
+    ];
+    let delta = DeltaProbeAdapter::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let source = SourceProbeAdapter::new(env.pool.clone());
+    let sorted = |mut v: Vec<BucketStats>| {
+        v.sort_by_key(|b| b.bucket);
+        v
+    };
+    let marker = |last_id: i64| {
+        Some(ChangedSince { cursor_col: "updated_at".to_string(), after: "2026-01-01 00:00:00".to_string(), last_id })
+    };
+
+    // (id - 1) DIV 7 over ids 1..=40 → buckets 0..=5 (1..=7, 8..=14, …, 36..=40), the last partial.
+    let s = sorted(source.bucketed_aggregates("bucket_values", "id", 1, 7, &columns, marker(i64::MAX)).await.unwrap());
+    let d = sorted(delta.bucketed_aggregates("bucket_values", "id", 1, 7, &columns).await.unwrap());
+    assert_eq!(s.iter().map(|b| b.bucket).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 5]);
+    assert_eq!(s, d, "MariaDB and DataFusion must agree on every bucket, byte for byte");
+
+    // The marker honours the watermark's tie-break exactly as the update stream reads it: every row
+    // sits ON the watermark timestamp, so with last_id 37 only ids 38..=40 are still unconsumed.
+    let tied = sorted(source.bucketed_aggregates("bucket_values", "id", 1, 7, &columns, marker(37)).await.unwrap());
+    assert_eq!(
+        tied.iter().map(|b| b.changed_since_sync).collect::<Vec<_>>(),
+        vec![0, 0, 0, 0, 0, 3],
+        "ids 38..=40 (bucket 5) are past the tie-break; ids ≤ 37 are consumed"
+    );
+
+    // Bucket 1 (ids 8..=14): delete id 8 at the source → its keys diverge.
+    // Bucket 3 (ids 22..=28): edit a value without touching the cursor → keys equal, values differ.
+    // Bucket 4 (ids 29..=35): edit a value AND advance the cursor → flagged as changed since sync.
+    sqlx::query("DELETE FROM bucket_values WHERE id = 8").execute(&env.pool).await.unwrap();
+    sqlx::query("UPDATE bucket_values SET amount = amount + 1 WHERE id = 22").execute(&env.pool).await.unwrap();
+    sqlx::query("UPDATE bucket_values SET qty = 999, updated_at = '2026-06-01 00:00:00' WHERE id = 30")
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    let s = sorted(source.bucketed_aggregates("bucket_values", "id", 1, 7, &columns, marker(i64::MAX)).await.unwrap());
+    for (sb, db) in s.iter().zip(d.iter()) {
+        match sb.bucket {
+            1 => assert_ne!(sb.keys, db.keys, "bucket 1 lost id 8"),
+            3 => {
+                assert_eq!(sb.keys, db.keys, "bucket 3 keys are untouched");
+                assert_ne!(sb.values, db.values, "bucket 3 carries the edited amount");
+                assert_eq!(sb.changed_since_sync, 0, "the edit did not advance the cursor");
+            }
+            4 => assert_eq!(sb.changed_since_sync, 1, "id 30 advanced its cursor past the watermark"),
+            _ => assert_eq!(sb, db, "bucket {} was not touched", sb.bucket),
+        }
+    }
 }
 
 #[tokio::test]
