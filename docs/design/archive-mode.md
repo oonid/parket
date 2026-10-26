@@ -1,6 +1,6 @@
 # Archive mode — design
 
-Status: **proposed**; implementation in progress.
+Status: **implemented**.
 
 ## Context
 
@@ -154,8 +154,9 @@ that is the expected state of a purged unit.
 - **Library** — functions to archive a set of units, verify a set of units, and replace a unit,
   returning per-unit, per-table results. Applications that drive archiving (choosing units,
   scheduling runs, handing verified units over for deletion) build on these.
-- **CLI** — `--archive-units <id,…>` and `--verify-archive-units <id,…>` print one line per unit
-  and table; the verify exits 1 when any unit differs.
+- **CLI** — `--archive-units`, `--verify-archive-units` and `--replace-archive-units`, each taking
+  unit ids, print one line per unit and table; the verify exits 1 when any unit differs. See
+  [cli.md](../cli.md#archive-commands) and [config.md](../config.md#per-table-archive-mode-table_archive).
 
 ## Implementation steps
 
@@ -166,5 +167,5 @@ Each step ships with tests and passes the gate before the next starts.
    ZSTD, "already archived" from the data ✅; (b) scoped, key-paged extraction in UTC with typed
    timestamps and zone metadata ✅; (c) the library API and CLI ✅.
 3. **Unit verification** — row-by-row digest comparison on both engines, Docker-tested ✅.
-4. **Unit-scoped replace.**
-5. **Operator docs** — configuration and the archive workflow.
+4. **Unit-scoped replace** — refuses a file holding another unit and an empty new copy ✅.
+5. **Operator docs** — configuration and the archive commands ✅.
