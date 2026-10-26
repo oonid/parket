@@ -67,6 +67,31 @@ diagnostic lines for a human to review; they never change the exit code.
   check above is what actually gates value correctness for the verdict.
 - **Non-null census (V6-r).** Per-column non-null counts, source vs. Delta, printed as
   `non-null census: DIFFERS ... (diagnostic — does not affect verdict)`. Same rationale.
+- **Bucketed value check on `Drift` (V9).** A `Drift` verdict means the two sides legitimately hold
+  different rows, so the whole-table value aggregates above would differ by construction and are
+  not run. Instead the non-NULL keys are split into at most 1024 buckets of `(key - min) DIV width`,
+  and the same parity-hardened aggregates are compared **inside buckets whose key sets are
+  identical** on both sides. Buckets whose keys differ (new rows at the source, or rows the source
+  deleted that Delta keeps) are counted and skipped; on a two-stream table, so are buckets holding a
+  source row the update stream has not consumed yet — cursor past the stored watermark, or on it
+  with a key past the watermark's tie-break id (changed since the sync). One line per `Drift` table
+  with comparable columns:
+
+  ```
+  verify users value-aggregates (bucketed, diagnostic — does not affect verdict): 1019/1024 buckets
+  key-identical, 0 of them skipped as changed since sync; values compared on 1449210/1456747 source
+  rows (99.5%): match in 1017, MISMATCH in 2: ids 41000–41999 [name]; 873000–873999 [email]
+  ```
+
+  or, when it cannot run, `value-aggregates (bucketed): skipped (<reason>)` — an incremental table
+  (its Delta side keeps every version of a row), no integer key, one side holding no keys, a key
+  range outside i64, or a probe error. A skip never changes the table's verdict.
+
+  Diagnostic, not verdict-gating, because on a live source a mismatch is usually not a sync error:
+  a `full_refresh` table has no cursor to rule out a row edited between sync and verify, and a
+  two-stream cursor such as `completed_at` misses edits that don't advance it (audit-findings
+  §8.1). A `MISMATCH` names the id ranges to inspect by hand. Cross-engine bucket parity is proven
+  by the Docker test `verify_bucketed_aggregates_match_across_engines_bucket_by_bucket`.
 
 ## Why not just fail on everything?
 

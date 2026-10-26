@@ -1108,6 +1108,11 @@ re-running cannot change that. A true PASS would require a quiescent source, or 
 snapshot captured at the same instant as the sync. Structural limitation of verifying full_refresh
 against a live DB, not a defect in either.
 
+> **Partly addressed (V9):** a DRIFT verdict now runs a *bucketed* value check — the same aggregates,
+> compared only inside key buckets whose key sets match on both sides — so these tables get content
+> evidence on the rows that did not drift. It is diagnostic (does not change the verdict), for the
+> reason above: a live source edits rows between sync and verify. See `docs/verify-checks.md`.
+
 ### 10.7 **IMPLEMENTED** — `parket --vacuum`
 
 > **Shipped 2026-08-07.** Replaces the `deltalake` Python script PS-M3 had to use, which meant a
