@@ -17,12 +17,14 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 use url::Url;
 
+mod archive;
 mod datetime;
 mod hwm;
 mod schema;
 mod two_stream;
 
 use hwm::{build_commit_properties, build_two_stream_commit_properties};
+pub use archive::{ARCHIVE_UNIT_COLUMN, with_archive_unit_column};
 pub use hwm::{extract_hwm_from_batch, extract_max_id, hwm_has_advanced};
 use schema::*;
 
@@ -199,6 +201,10 @@ pub struct DeltaWriter {
     /// O2-r CP1: per-table staged-overwrite sessions (`begin_overwrite` / `stage_overwrite_chunk`
     /// / `commit_overwrite`). Additive; not yet driven by production code in this checkpoint.
     overwrite_sessions: std::sync::Arc<Mutex<HashMap<String, OverwriteSession>>>,
+    /// Archive mode: per-table in-flight `(table, unit)` append sessions (`begin_archive_unit` /
+    /// `stage_archive_chunk` / `commit_archive_unit`), kept apart from the overwrite sessions so
+    /// the archive path cannot reach an overwrite commit.
+    archive_sessions: std::sync::Arc<Mutex<HashMap<String, archive::ArchiveSession>>>,
 }
 
 impl DeltaWriter {
@@ -231,6 +237,7 @@ impl DeltaWriter {
             merge_spill_dir: None,
             table_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
             overwrite_sessions: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            archive_sessions: std::sync::Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -246,6 +253,7 @@ impl DeltaWriter {
             merge_spill_dir: None,
             table_cache: std::sync::Arc::new(Mutex::new(HashMap::new())),
             overwrite_sessions: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            archive_sessions: std::sync::Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
