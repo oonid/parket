@@ -141,6 +141,12 @@ impl Config {
         self.table_reconcile.contains(table)
     }
 
+    /// The tables a sync (and sync verification) processes: `TABLES` minus archive tables, which
+    /// only the archive commands touch.
+    pub fn sync_tables(&self) -> Vec<String> {
+        self.tables.iter().filter(|t| !self.table_archive.contains_key(*t)).cloned().collect()
+    }
+
     /// Archive mode: the table's scope predicate when `TABLE_ARCHIVE_<table>` is set.
     pub fn archive_scope(&self, table: &str) -> Option<&str> {
         self.table_archive.get(table).map(String::as_str)
@@ -1143,6 +1149,7 @@ mod tests {
         let config = Config::load().expect("load should succeed");
         assert_eq!(config.archive_scope("orders"), Some("source_id = ?"));
         assert_eq!(config.archive_scope("customers"), None);
+        assert_eq!(config.sync_tables(), vec!["customers".to_string(), "products".to_string()]);
         assert_eq!(config.archive_source_time_zone.as_deref(), Some("Asia/Jakarta"));
     }
 

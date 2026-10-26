@@ -13,6 +13,7 @@ use parket::preflight::{
     PreflightStorageAdapter,
 };
 use anyhow::Context;
+use parket::archive::{ArchiveTable, Archiver, UnitOutcome};
 use parket::writer::DeltaWriter;
 
 fn init_tracing() {
@@ -190,6 +191,63 @@ fn human_bytes(b: u64) -> String {
         format!("{:.0} KB", f / K)
     } else {
         format!("{b} B")
+    }
+}
+
+/// Archive mode: archive `units` in every table of TABLES that has `TABLE_ARCHIVE_<table>` set
+/// (docs/design/archive-mode.md), printing one line per unit and table. Exits 0 when every unit is
+/// archived or already was, 1 on the first failure (units committed before it stay committed and a
+/// re-run skips them), 2 on a configuration or connection error.
+async fn run_archive(config: &config::Config, local_dir: Option<&std::path::Path>, units: &[i64]) -> i32 {
+    let tables: Vec<ArchiveTable> = config
+        .tables
+        .iter()
+        .filter_map(|t| config.archive_scope(t).map(|scope| ArchiveTable { name: t.clone(), scope: scope.to_string() }))
+        .collect();
+    if tables.is_empty() {
+        eprintln!("archive: no table in TABLES has TABLE_ARCHIVE_<table> set");
+        return 2;
+    }
+    let Some(zone) = config.archive_source_time_zone.clone() else {
+        eprintln!("archive: ARCHIVE_SOURCE_TIME_ZONE is not set");
+        return 2;
+    };
+    let pool = match sqlx::MySqlPool::connect(&config.database_url).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("database connection error: {e}");
+            return 2;
+        }
+    };
+    let inspect = SchemaInspectorAdapter::new(pool, extract_database_name(&config.database_url));
+    let writer = match local_dir {
+        Some(dir) => DeltaWriter::new_local(&dir.to_string_lossy()),
+        None => DeltaWriter::new(
+            &config.s3_bucket,
+            &config.s3_prefix,
+            config.s3_endpoint.as_deref(),
+            &config.s3_region,
+            &config.s3_access_key_id,
+            &config.s3_secret_access_key,
+        ),
+    };
+    let mut archiver = Archiver::new(inspect, ExtractorAdapter::for_archive(config), writer, zone);
+    match archiver.archive_units(&tables, units).await {
+        Ok(results) => {
+            for r in results {
+                let outcome = match r.outcome {
+                    UnitOutcome::Archived { rows } => format!("archived {rows} rows"),
+                    UnitOutcome::AlreadyArchived => "already archived".to_string(),
+                    UnitOutcome::NoRows => "no rows".to_string(),
+                };
+                println!("archive unit={} table={}: {outcome}", r.unit, r.table);
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("archive failed: {e:#}");
+            1
+        }
     }
 }
 
@@ -485,6 +543,11 @@ async fn async_main() {
         }
     }
 
+    if let Some(units) = cli.archive_units.clone() {
+        let code = run_archive(&config, local_dir.as_deref(), &units).await;
+        std::process::exit(code);
+    }
+
     // §10.7: --vacuum runs before --verify so `--vacuum --verify` cannot mean both.
     if let Some(table) = cli.vacuum.clone() {
         let code = run_vacuum(&config, local_dir.as_deref(), table, &cli).await;
@@ -492,7 +555,11 @@ async fn async_main() {
     }
 
 if let Some(ref verify) = cli.verify {
-        let verify_tables = match resolve_verify_tables(&config.tables, verify.as_deref()) {
+        // Sync verification covers synced tables; archive tables are skipped.
+        for skipped in config.tables.iter().filter(|t| config.archive_scope(t).is_some()) {
+            println!("verify {skipped}: skipped (archive table)");
+        }
+        let verify_tables = match resolve_verify_tables(&config.sync_tables(), verify.as_deref()) {
             Ok(tables) => tables,
             Err(e) => {
                 eprintln!("configuration error: {e}");
@@ -576,7 +643,7 @@ if let Some(ref verify) = cli.verify {
             let code = run_verify(
                 &vcfg,
                 verify_after_dir.as_deref(),
-                vcfg.tables.clone(),
+                vcfg.sync_tables(),
                 verify_deep,
             )
             .await;

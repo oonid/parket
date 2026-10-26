@@ -9,6 +9,7 @@ use parket::orchestrator::{
     DeltaWriterAdapter, ExitCode, ExtractorAdapter, Orchestrator, SchemaInspectorAdapter,
     SignalHandler, StateManageAdapter,
 };
+use parket::archive::{ArchiveTable, Archiver, SOURCE_TIME_ZONE_KEY, UnitOutcome};
 use parket::verify::{
     AggKind, BucketStats, ChangedSince, ColumnAgg, DeltaProbe, DeltaProbeAdapter, SourceProbe,
     SourceProbeAdapter, TableOutcome, TablePlan, VerifyCommand, VerifyMode, VerifyVerdict,
@@ -1863,6 +1864,146 @@ async fn verify_value_aggregates_real_basic_match_across_type_families() {
             .expect("verify basic value aggregates should succeed after corruption");
 
     assert_eq!(verdict_after_corruption, VerifyVerdict::Discrepancy);
+}
+
+/// Archive mode end to end, on a source shaped like campaign email data: a messages table
+/// hash-partitioned by campaign with a composite primary key, an events table that only references
+/// messages (subquery scope), and a lookup table with a text key holding a quote and a backslash.
+/// The server runs in +07:00, so archiving must pin its own session to UTC to store the instants.
+#[tokio::test]
+#[serial_test::serial]
+async fn archive_units_copies_one_campaign_in_utc_and_skips_it_on_a_rerun() {
+    use parket::orchestrator::{ExtractorAdapter, SchemaInspectorAdapter};
+
+    let env = TestEnv::new(vec!["messages", "message_events", "message_lookup"]).await;
+    let mut conn = env.pool.acquire().await.unwrap();
+    for stmt in [
+        "SET GLOBAL time_zone = '+07:00'",
+        "SET time_zone = '+07:00'",
+        "CREATE TABLE messages (id INT UNSIGNED NOT NULL AUTO_INCREMENT, campaign_id INT UNSIGNED NOT NULL, \
+         subject VARCHAR(255), sent_at TIMESTAMP NULL, PRIMARY KEY (id, campaign_id)) \
+         PARTITION BY HASH(campaign_id) PARTITIONS 4",
+        "CREATE TABLE message_events (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, \
+         message_id INT UNSIGNED NOT NULL, kind VARCHAR(20), at TIMESTAMP NULL)",
+        "CREATE TABLE message_lookup (message_key VARCHAR(255) NOT NULL PRIMARY KEY, \
+         campaign_id INT UNSIGNED NOT NULL, created_at TIMESTAMP NULL)",
+    ] {
+        sqlx::query(stmt).execute(&mut *conn).await.expect(stmt);
+    }
+    // Campaign 1: 25 messages; campaign 2: 10. Two events per message. Written in WIB.
+    for (campaign, count) in [(1u32, 25), (2, 10)] {
+        for i in 0..count {
+            let id: u64 = sqlx::query(
+                "INSERT INTO messages (campaign_id, subject, sent_at) VALUES (?, ?, '2026-10-26 11:30:44')",
+            )
+            .bind(campaign)
+            .bind(format!("campaign {campaign} newsletter"))
+            .execute(&mut *conn)
+            .await
+            .unwrap()
+            .last_insert_id();
+            for kind in ["delivered", "opened"] {
+                sqlx::query("INSERT INTO message_events (message_id, kind, at) VALUES (?, ?, '2026-10-26 12:00:00')")
+                    .bind(id)
+                    .bind(kind)
+                    .execute(&mut *conn)
+                    .await
+                    .unwrap();
+            }
+            let _ = i;
+        }
+    }
+    for (key, campaign) in [
+        ("a'b", 1u32), (r"c\d", 1), ("e", 1), ("f\\", 1), ("g", 1), ("h'", 1), ("z", 2),
+    ] {
+        sqlx::query("INSERT INTO message_lookup VALUES (?, ?, '2026-10-26 11:30:44')")
+            .bind(key)
+            .bind(campaign)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+    }
+    drop(conn);
+
+    let tables = vec![
+        ArchiveTable { name: "messages".into(), scope: "campaign_id = ?".into() },
+        ArchiveTable {
+            name: "message_events".into(),
+            scope: "message_id IN (SELECT id FROM messages WHERE campaign_id = ?)".into(),
+        },
+        ArchiveTable { name: "message_lookup".into(), scope: "campaign_id = ?".into() },
+    ];
+    let writer = || {
+        DeltaWriter::new(
+            &env.config.s3_bucket,
+            &env.config.s3_prefix,
+            env.config.s3_endpoint.as_deref(),
+            &env.config.s3_region,
+            &env.config.s3_access_key_id,
+            &env.config.s3_secret_access_key,
+        )
+    };
+    let archiver = || {
+        Archiver::new(
+            SchemaInspectorAdapter::new(env.pool.clone(), "parket".to_string()),
+            ExtractorAdapter::for_archive(&env.config),
+            writer(),
+            "Asia/Jakarta",
+        )
+        .with_max_page_rows(4)
+    };
+
+    let results = archiver().archive_units(&tables, &[1, 3]).await.expect("archive campaigns 1 and 3");
+    let outcome = |unit: i64, table: &str| {
+        results.iter().find(|r| r.unit == unit && r.table == table).unwrap().outcome.clone()
+    };
+    assert_eq!(outcome(1, "messages"), UnitOutcome::Archived { rows: 25 });
+    assert_eq!(outcome(1, "message_events"), UnitOutcome::Archived { rows: 50 });
+    assert_eq!(outcome(1, "message_lookup"), UnitOutcome::Archived { rows: 6 });
+    for table in ["messages", "message_events", "message_lookup"] {
+        assert_eq!(outcome(3, table), UnitOutcome::NoRows, "campaign 3 has no rows in {table}");
+    }
+
+    let query = |table: &'static str, sql: &'static str| {
+        let writer = writer();
+        async move {
+            let t = writer.open_table(table).await.unwrap();
+            let ctx = deltalake::datafusion::prelude::SessionContext::new();
+            ctx.register_table("t", t.table_provider().await.unwrap()).unwrap();
+            let b = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            deltalake::arrow::util::display::array_value_to_string(b[0].column(0), 0).unwrap()
+        }
+    };
+    assert_eq!(query("messages", "SELECT count(*) FROM t").await, "25", "campaign 2 was not read");
+    assert_eq!(query("messages", "SELECT count(DISTINCT id) FROM t WHERE `_archive_unit` = 1").await, "25");
+    assert_eq!(
+        query("messages", "SELECT cast(min(sent_at) AS varchar) FROM t").await,
+        "2026-10-26T04:30:44Z",
+        "WIB 11:30:44 stored as the UTC instant even though the server runs in +07:00"
+    );
+    assert_eq!(
+        query("messages", "SELECT cast(min(sent_at AT TIME ZONE 'Asia/Jakarta') AS varchar) FROM t").await,
+        "2026-10-26T11:30:44+07:00"
+    );
+    assert_eq!(query("message_events", "SELECT count(*) FROM t WHERE kind = 'opened'").await, "25");
+    assert_eq!(
+        query("message_lookup", "SELECT string_agg(message_key, '|' ORDER BY message_key) FROM t").await,
+        r"a'b|c\d|e|f\|g|h'",
+        "paging across keys holding a quote and a backslash lost or duplicated none"
+    );
+    let schema = writer().open_table("messages").await.unwrap().snapshot().unwrap().schema().clone();
+    let sent = schema.field("sent_at").unwrap();
+    assert!(
+        format!("{:?}", sent.metadata().get(SOURCE_TIME_ZONE_KEY)).contains("Asia/Jakarta"),
+        "the source zone is recorded on the column"
+    );
+
+    // A re-run reads nothing and changes nothing.
+    let version = writer().open_table("messages").await.unwrap().version();
+    let rerun = archiver().archive_units(&tables, &[1]).await.unwrap();
+    assert!(rerun.iter().all(|r| r.outcome == UnitOutcome::AlreadyArchived), "got {rerun:?}");
+    assert_eq!(writer().open_table("messages").await.unwrap().version(), version);
+    assert_eq!(query("messages", "SELECT count(*) FROM t").await, "25");
 }
 
 /// V9: the bucketed check is only meaningful if MariaDB and DataFusion put every key in the same
