@@ -94,7 +94,7 @@ The graceful shutdown test sends the signal (`tx.send(true)`) before calling `or
 ```
 TestEnv::new(tables)
   ├── Start MariaDB container (mariadb:11.3)
-  ├── Start MinIO container (minio/minio:RELEASE.2025-02-28T09-55-16Z)
+  ├── Start MinIO container (cgr.dev/chainguard/minio, pinned by digest — see `minio()`)
   ├── Create S3 bucket via aws-sdk-s3
   ├── Connect MySqlPool
   ├── Construct Config with dynamic ports

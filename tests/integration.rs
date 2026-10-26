@@ -16,10 +16,10 @@ use parket::verify::{
 use parket::writer::DeltaWriter;
 use sqlx::MySqlPool;
 use tempfile::TempDir;
+use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
-use testcontainers::ImageExt;
+use testcontainers::{ContainerRequest, GenericImage, ImageExt};
 use testcontainers_modules::mariadb::Mariadb;
-use testcontainers_modules::minio::MinIO;
 use tokio::sync::watch;
 
 async fn create_minio_bucket(endpoint: &str, bucket: &str) {
@@ -77,7 +77,28 @@ struct TestEnv {
     pool: MySqlPool,
     state_dir: TempDir,
     _db: testcontainers::ContainerAsync<Mariadb>,
-    _storage: testcontainers::ContainerAsync<MinIO>,
+    _storage: testcontainers::ContainerAsync<GenericImage>,
+}
+
+/// MinIO no longer publishes an anonymously pullable image — `minio/minio` on Docker Hub and
+/// `quay.io/minio/minio` both refuse an unauthenticated pull — so CI could not start the
+/// `testcontainers-modules` MinIO preset. Chainguard's build is public. It is pinned by digest
+/// (`tag@digest` is a valid reference, and testcontainers composes `name:tag`) so every run tests
+/// against the same server; bump the digest if Chainguard stops serving it. The image declares no
+/// `EXPOSE`, hence the explicit port. Command, console address and readiness check mirror the
+/// preset this replaces.
+const MINIO_IMAGE: &str = "cgr.dev/chainguard/minio";
+const MINIO_TAG: &str =
+    "latest@sha256:268d68a2a3b6fc65f905a61f84d7eab6345ce6bff14f551e2b028ec31e6a1341";
+
+fn minio() -> ContainerRequest<GenericImage> {
+    GenericImage::new(MINIO_IMAGE, MINIO_TAG)
+        .with_exposed_port(9000.tcp())
+        .with_wait_for(WaitFor::message_on_stderr("API:"))
+        .with_cmd(["server", "/data"])
+        .with_env_var("MINIO_CONSOLE_ADDRESS", ":9001")
+        .with_env_var("MINIO_ROOT_USER", "minioadmin")
+        .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
 }
 
 impl TestEnv {
@@ -89,12 +110,7 @@ impl TestEnv {
             .await
             .expect("MariaDB container failed to start");
 
-        let storage = MinIO::default()
-            .with_env_var("MINIO_ROOT_USER", "minioadmin")
-            .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
-            .start()
-            .await
-            .expect("MinIO container failed to start");
+        let storage = minio().start().await.expect("MinIO container failed to start");
 
         let db_host = db.get_host().await.unwrap();
         let db_port = db.get_host_port_ipv4(3306).await.unwrap();
@@ -192,12 +208,7 @@ async fn smoke_mariadb_and_minio_containers_start() {
         .await
         .expect("MariaDB container failed to start");
 
-    let storage = MinIO::default()
-        .with_env_var("MINIO_ROOT_USER", "minioadmin")
-        .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
-        .start()
-        .await
-        .expect("MinIO container failed to start");
+    let storage = minio().start().await.expect("MinIO container failed to start");
 
     let db_host = db.get_host().await.unwrap();
     let db_port = db.get_host_port_ipv4(3306).await.unwrap();
