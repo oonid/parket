@@ -31,7 +31,7 @@ impl DeltaProbeAdapter {
         }
     }
 
-    fn str_at(batch: &deltalake::arrow::record_batch::RecordBatch, row: usize, col_idx: usize) -> Option<String> {
+    pub(crate) fn str_at(batch: &deltalake::arrow::record_batch::RecordBatch, row: usize, col_idx: usize) -> Option<String> {
         let column = batch.column(col_idx);
         if let Some(arr) = column.as_any().downcast_ref::<StringArray>() {
             (row < arr.len() && !arr.is_null(row)).then(|| arr.value(row).to_string())

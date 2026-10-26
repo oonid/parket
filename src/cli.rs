@@ -63,6 +63,15 @@ pub struct Cli {
     )]
     pub archive_units: Option<Vec<i64>>,
 
+    // Archive mode: verify the given units exactly, source against Delta, then exit.
+    #[arg(
+        long,
+        value_name = "UNIT,...",
+        value_delimiter = ',',
+        help = "Verify these archived units (comma-separated ids) in every TABLE_ARCHIVE_<table> table: the source scoped to the unit must match Delta exactly. Exit 1 if any unit differs"
+    )]
+    pub verify_archive_units: Option<Vec<i64>>,
+
     // §10.7: reclaim superseded/orphaned parquet. Mirrors --verify's shape (all tables, or one).
     #[arg(
         long,
@@ -252,6 +261,8 @@ mod tests {
         assert_eq!(cli.archive_units, Some(vec![909, 856]));
         assert!(Cli::try_parse_from(["parket", "--archive-units", "909,abc"]).is_err());
         assert!(Cli::try_parse_from(["parket"]).unwrap().archive_units.is_none());
+        let cli = Cli::try_parse_from(["parket", "--verify-archive-units", "909"]).unwrap();
+        assert_eq!(cli.verify_archive_units, Some(vec![909]));
     }
 
     #[test]

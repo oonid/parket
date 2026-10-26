@@ -13,7 +13,9 @@ use parket::preflight::{
     PreflightStorageAdapter,
 };
 use anyhow::Context;
-use parket::archive::{ArchiveTable, Archiver, UnitOutcome};
+use parket::archive::{
+    ArchiveTable, Archiver, DeltaUnitProbe, SourceUnitProbe, UnitOutcome, UnitVerdict, verify_units,
+};
 use parket::writer::DeltaWriter;
 
 fn init_tracing() {
@@ -194,16 +196,83 @@ fn human_bytes(b: u64) -> String {
     }
 }
 
+/// The tables of TABLES that have `TABLE_ARCHIVE_<table>` set, with their scopes.
+fn archive_tables(config: &config::Config) -> Vec<ArchiveTable> {
+    config
+        .tables
+        .iter()
+        .filter_map(|t| config.archive_scope(t).map(|scope| ArchiveTable { name: t.clone(), scope: scope.to_string() }))
+        .collect()
+}
+
+fn archive_writer(config: &config::Config, local_dir: Option<&std::path::Path>) -> DeltaWriter {
+    match local_dir {
+        Some(dir) => DeltaWriter::new_local(&dir.to_string_lossy()),
+        None => DeltaWriter::new(
+            &config.s3_bucket,
+            &config.s3_prefix,
+            config.s3_endpoint.as_deref(),
+            &config.s3_region,
+            &config.s3_access_key_id,
+            &config.s3_secret_access_key,
+        ),
+    }
+}
+
+/// Archive mode: verify `units` exactly in every archive table of TABLES, printing one verdict per
+/// unit and table. Exits 0 when every unit matches, 1 when any differs, 2 on a configuration,
+/// connection or query error.
+async fn run_verify_archive(config: &config::Config, local_dir: Option<&std::path::Path>, units: &[i64]) -> i32 {
+    let tables = archive_tables(config);
+    if tables.is_empty() {
+        eprintln!("verify-archive: no table in TABLES has TABLE_ARCHIVE_<table> set");
+        return 2;
+    }
+    let source = match SourceUnitProbe::connect(&config.database_url).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("database connection error: {e:#}");
+            return 2;
+        }
+    };
+    let pool = match sqlx::MySqlPool::connect(&config.database_url).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("database connection error: {e}");
+            return 2;
+        }
+    };
+    let inspect = SchemaInspectorAdapter::new(pool, extract_database_name(&config.database_url));
+    let delta = DeltaUnitProbe::new(archive_writer(config, local_dir));
+    match verify_units(&inspect, &source, &delta, &tables, units).await {
+        Ok(results) => {
+            let mut all_verified = true;
+            for r in results {
+                match r.verdict {
+                    UnitVerdict::Verified { rows } => {
+                        println!("verify-archive unit={} table={}: VERIFIED ({rows} rows)", r.unit, r.table)
+                    }
+                    UnitVerdict::Mismatch(diffs) => {
+                        all_verified = false;
+                        println!("verify-archive unit={} table={}: MISMATCH: {}", r.unit, r.table, diffs.join("; "));
+                    }
+                }
+            }
+            if all_verified { 0 } else { 1 }
+        }
+        Err(e) => {
+            eprintln!("verify-archive failed: {e:#}");
+            2
+        }
+    }
+}
+
 /// Archive mode: archive `units` in every table of TABLES that has `TABLE_ARCHIVE_<table>` set
 /// (docs/design/archive-mode.md), printing one line per unit and table. Exits 0 when every unit is
 /// archived or already was, 1 on the first failure (units committed before it stay committed and a
 /// re-run skips them), 2 on a configuration or connection error.
 async fn run_archive(config: &config::Config, local_dir: Option<&std::path::Path>, units: &[i64]) -> i32 {
-    let tables: Vec<ArchiveTable> = config
-        .tables
-        .iter()
-        .filter_map(|t| config.archive_scope(t).map(|scope| ArchiveTable { name: t.clone(), scope: scope.to_string() }))
-        .collect();
+    let tables = archive_tables(config);
     if tables.is_empty() {
         eprintln!("archive: no table in TABLES has TABLE_ARCHIVE_<table> set");
         return 2;
@@ -220,18 +289,8 @@ async fn run_archive(config: &config::Config, local_dir: Option<&std::path::Path
         }
     };
     let inspect = SchemaInspectorAdapter::new(pool, extract_database_name(&config.database_url));
-    let writer = match local_dir {
-        Some(dir) => DeltaWriter::new_local(&dir.to_string_lossy()),
-        None => DeltaWriter::new(
-            &config.s3_bucket,
-            &config.s3_prefix,
-            config.s3_endpoint.as_deref(),
-            &config.s3_region,
-            &config.s3_access_key_id,
-            &config.s3_secret_access_key,
-        ),
-    };
-    let mut archiver = Archiver::new(inspect, ExtractorAdapter::for_archive(config), writer, zone);
+    let mut archiver =
+        Archiver::new(inspect, ExtractorAdapter::for_archive(config), archive_writer(config, local_dir), zone);
     match archiver.archive_units(&tables, units).await {
         Ok(results) => {
             for r in results {
@@ -545,6 +604,11 @@ async fn async_main() {
 
     if let Some(units) = cli.archive_units.clone() {
         let code = run_archive(&config, local_dir.as_deref(), &units).await;
+        std::process::exit(code);
+    }
+
+    if let Some(units) = cli.verify_archive_units.clone() {
+        let code = run_verify_archive(&config, local_dir.as_deref(), &units).await;
         std::process::exit(code);
     }
 
