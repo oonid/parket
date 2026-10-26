@@ -6,6 +6,10 @@
 //! The source time zone is kept as metadata on each timestamp column (and as a table property),
 //! because a Delta `timestamp` cannot carry a zone name itself.
 
+mod verify;
+
+pub use verify::{DeltaUnitProbe, SourceUnitProbe, UnitVerdict, UnitVerification, verify_units};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

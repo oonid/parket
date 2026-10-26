@@ -1866,23 +1866,19 @@ async fn verify_value_aggregates_real_basic_match_across_type_families() {
     assert_eq!(verdict_after_corruption, VerifyVerdict::Discrepancy);
 }
 
-/// Archive mode end to end, on a source shaped like campaign email data: a messages table
-/// hash-partitioned by campaign with a composite primary key, an events table that only references
-/// messages (subquery scope), and a lookup table with a text key holding a quote and a backslash.
-/// The server runs in +07:00, so archiving must pin its own session to UTC to store the instants.
-#[tokio::test]
-#[serial_test::serial]
-async fn archive_units_copies_one_campaign_in_utc_and_skips_it_on_a_rerun() {
-    use parket::orchestrator::{ExtractorAdapter, SchemaInspectorAdapter};
-
+/// A source shaped like campaign email data, written with the server in +07:00: `messages`
+/// (hash-partitioned by campaign, composite key; campaign 1 has 25 rows, campaign 2 has 10),
+/// `message_events` (two per message, linked only by `message_id`) and `message_lookup` (text keys
+/// holding a quote and a backslash).
+async fn archive_fixture() -> TestEnv {
     let env = TestEnv::new(vec!["messages", "message_events", "message_lookup"]).await;
     let mut conn = env.pool.acquire().await.unwrap();
     for stmt in [
         "SET GLOBAL time_zone = '+07:00'",
         "SET time_zone = '+07:00'",
         "CREATE TABLE messages (id INT UNSIGNED NOT NULL AUTO_INCREMENT, campaign_id INT UNSIGNED NOT NULL, \
-         subject VARCHAR(255), sent_at TIMESTAMP NULL, PRIMARY KEY (id, campaign_id)) \
-         PARTITION BY HASH(campaign_id) PARTITIONS 4",
+         subject VARCHAR(255) CHARACTER SET utf8mb4, amount DECIMAL(10,2), score DOUBLE, sent_at TIMESTAMP NULL, \
+         PRIMARY KEY (id, campaign_id)) PARTITION BY HASH(campaign_id) PARTITIONS 4",
         "CREATE TABLE message_events (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, \
          message_id INT UNSIGNED NOT NULL, kind VARCHAR(20), at TIMESTAMP NULL)",
         "CREATE TABLE message_lookup (message_key VARCHAR(255) NOT NULL PRIMARY KEY, \
@@ -1894,10 +1890,13 @@ async fn archive_units_copies_one_campaign_in_utc_and_skips_it_on_a_rerun() {
     for (campaign, count) in [(1u32, 25), (2, 10)] {
         for i in 0..count {
             let id: u64 = sqlx::query(
-                "INSERT INTO messages (campaign_id, subject, sent_at) VALUES (?, ?, '2026-10-26 11:30:44')",
+                "INSERT INTO messages (campaign_id, subject, amount, score, sent_at) \
+                 VALUES (?, ?, ?, ? / 3.0, '2026-10-26 11:30:44')",
             )
             .bind(campaign)
-            .bind(format!("campaign {campaign} newsletter"))
+            .bind(format!("campaign {campaign} newsletter héllo 世界"))
+            .bind(format!("{}.{:02}", i, i * 7 % 100))
+            .bind(i as f64)
             .execute(&mut *conn)
             .await
             .unwrap()
@@ -1910,7 +1909,6 @@ async fn archive_units_copies_one_campaign_in_utc_and_skips_it_on_a_rerun() {
                     .await
                     .unwrap();
             }
-            let _ = i;
         }
     }
     for (key, campaign) in [
@@ -1924,15 +1922,33 @@ async fn archive_units_copies_one_campaign_in_utc_and_skips_it_on_a_rerun() {
             .unwrap();
     }
     drop(conn);
+    env
+}
 
-    let tables = vec![
+/// The three fixture tables with their campaign scopes.
+fn archive_fixture_tables() -> Vec<ArchiveTable> {
+    vec![
         ArchiveTable { name: "messages".into(), scope: "campaign_id = ?".into() },
         ArchiveTable {
             name: "message_events".into(),
             scope: "message_id IN (SELECT id FROM messages WHERE campaign_id = ?)".into(),
         },
         ArchiveTable { name: "message_lookup".into(), scope: "campaign_id = ?".into() },
-    ];
+    ]
+}
+
+/// Archive mode end to end, on a source shaped like campaign email data: a messages table
+/// hash-partitioned by campaign with a composite primary key, an events table that only references
+/// messages (subquery scope), and a lookup table with a text key holding a quote and a backslash.
+/// The server runs in +07:00, so archiving must pin its own session to UTC to store the instants.
+#[tokio::test]
+#[serial_test::serial]
+async fn archive_units_copies_one_campaign_in_utc_and_skips_it_on_a_rerun() {
+    use parket::orchestrator::{ExtractorAdapter, SchemaInspectorAdapter};
+
+    let env = archive_fixture().await;
+
+    let tables = archive_fixture_tables();
     let writer = || {
         DeltaWriter::new(
             &env.config.s3_bucket,
@@ -2004,6 +2020,108 @@ async fn archive_units_copies_one_campaign_in_utc_and_skips_it_on_a_rerun() {
     assert!(rerun.iter().all(|r| r.outcome == UnitOutcome::AlreadyArchived), "got {rerun:?}");
     assert_eq!(writer().open_table("messages").await.unwrap().version(), version);
     assert_eq!(query("messages", "SELECT count(*) FROM t").await, "25");
+}
+
+/// Archive verification against a real source: an archived campaign verifies exactly in every
+/// table, and each kind of later source difference — an edited text value, an edited timestamp, a
+/// deleted row in a subquery-scoped table — is caught and named. A campaign that was never
+/// archived fails on its row count.
+#[tokio::test]
+#[serial_test::serial]
+async fn verify_archive_units_matches_exactly_and_names_every_difference() {
+    use parket::archive::{DeltaUnitProbe, SourceUnitProbe, UnitVerdict, verify_units};
+    use parket::orchestrator::{ExtractorAdapter, SchemaInspectorAdapter};
+
+    let env = archive_fixture().await;
+    let tables = archive_fixture_tables();
+    let writer = || {
+        DeltaWriter::new(
+            &env.config.s3_bucket,
+            &env.config.s3_prefix,
+            env.config.s3_endpoint.as_deref(),
+            &env.config.s3_region,
+            &env.config.s3_access_key_id,
+            &env.config.s3_secret_access_key,
+        )
+    };
+    let inspect = SchemaInspectorAdapter::new(env.pool.clone(), "parket".to_string());
+    Archiver::new(
+        SchemaInspectorAdapter::new(env.pool.clone(), "parket".to_string()),
+        ExtractorAdapter::for_archive(&env.config),
+        writer(),
+        "Asia/Jakarta",
+    )
+    .archive_units(&tables, &[1])
+    .await
+    .expect("archive campaign 1");
+
+    let source = SourceUnitProbe::connect(&env.db_url).await.unwrap();
+    let delta = DeltaUnitProbe::new(writer());
+    let verdicts = |results: Vec<parket::archive::UnitVerification>| {
+        results.into_iter().map(|r| (r.unit, r.table, r.verdict)).collect::<Vec<_>>()
+    };
+
+    let clean = verdicts(verify_units(&inspect, &source, &delta, &tables, &[1]).await.unwrap());
+    assert_eq!(
+        clean,
+        vec![
+            (1, "messages".to_string(), UnitVerdict::Verified { rows: 25 }),
+            (1, "message_events".to_string(), UnitVerdict::Verified { rows: 50 }),
+            (1, "message_lookup".to_string(), UnitVerdict::Verified { rows: 6 }),
+        ],
+        "an archived campaign matches exactly, timestamps included (the server runs in +07:00)"
+    );
+
+    // Change the source after archiving, one kind of difference per table. The message edit keeps
+    // the subject's length — the kind of change column aggregates (sums, extremes) cannot see.
+    for stmt in [
+        "UPDATE messages SET subject = REPLACE(subject, 'newsletter', 'newsletteR') WHERE campaign_id = 1 AND id = 1",
+        "DELETE FROM message_events WHERE id = 2",
+        "UPDATE message_lookup SET created_at = created_at + INTERVAL 1 SECOND WHERE message_key = 'e'",
+    ] {
+        sqlx::query(stmt).execute(&env.pool).await.expect(stmt);
+    }
+    let after = verdicts(verify_units(&inspect, &source, &delta, &tables, &[1, 2]).await.unwrap());
+    let diffs = |unit: i64, table: &str| match after.iter().find(|(u, t, _)| *u == unit && t == table).unwrap() {
+        (_, _, UnitVerdict::Mismatch(d)) => d.join("; "),
+        (_, _, v) => panic!("unit {unit} {table} should mismatch, got {v:?}"),
+    };
+    assert_eq!(diffs(1, "messages"), "1 row(s) differ: (1, 1)", "the equal-length edit, named by its key");
+    assert_eq!(diffs(1, "message_events"), "1 row(s) in Delta but not in the source: (2)");
+    assert_eq!(diffs(1, "message_lookup"), "1 row(s) differ: (e)");
+    assert!(
+        diffs(2, "messages").starts_with("10 row(s) missing from Delta: (26, 2), (27, 2)"),
+        "campaign 2 was never archived: {}",
+        diffs(2, "messages")
+    );
+}
+
+/// A column archive mode cannot extract (here `TIME`) is never silently left out of verification:
+/// `verify_units` refuses the table instead of reporting a unit verified with that column unchecked.
+#[tokio::test]
+#[serial_test::serial]
+async fn verify_archive_units_refuses_a_column_it_cannot_compare() {
+    use parket::archive::{DeltaUnitProbe, SourceUnitProbe, verify_units};
+    use parket::orchestrator::SchemaInspectorAdapter;
+
+    let env = TestEnv::new(vec!["opens"]).await;
+    sqlx::query("CREATE TABLE opens (id INT PRIMARY KEY, campaign_id INT NOT NULL, opened_time TIME)")
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    let inspect = SchemaInspectorAdapter::new(env.pool.clone(), "parket".to_string());
+    let source = SourceUnitProbe::connect(&env.db_url).await.unwrap();
+    let delta = DeltaUnitProbe::new(DeltaWriter::new(
+        &env.config.s3_bucket,
+        &env.config.s3_prefix,
+        env.config.s3_endpoint.as_deref(),
+        &env.config.s3_region,
+        &env.config.s3_access_key_id,
+        &env.config.s3_secret_access_key,
+    ));
+    let tables = vec![ArchiveTable { name: "opens".into(), scope: "campaign_id = ?".into() }];
+    let err = verify_units(&inspect, &source, &delta, &tables, &[1]).await.unwrap_err().to_string();
+    assert!(err.contains("cannot extract or compare: `opened_time` (time)"), "got: {err}");
 }
 
 /// V9: the bucketed check is only meaningful if MariaDB and DataFusion put every key in the same
