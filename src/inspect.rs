@@ -1,5 +1,6 @@
 use anyhow::Result;
 use crate::discovery::{ColumnDescribe, IndexInfo};
+use crate::writer::OVERWRITE_CAVEAT;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Verdict {
@@ -102,7 +103,9 @@ pub fn evaluate_cursor(
 
     // Build recommendation
     let recommendation = if !has_integer_key {
-        "No `id` column or other single-column integer PRIMARY key — use full_refresh.".to_string()
+        format!(
+            "No `id` column or other single-column integer PRIMARY key — use full_refresh. ({OVERWRITE_CAVEAT})"
+        )
     } else {
         // Find best non-Unsafe candidate by rank Ideal > Ok > UsableButSlow
         let best_safe = candidates
@@ -131,7 +134,10 @@ pub fn evaluate_cursor(
                 col = best.column
             )
         } else {
-            "No safe cursor column — use full_refresh. (An id-only cursor for append-only tables is not yet supported.)".to_string()
+            format!(
+                "No safe cursor column — use full_refresh. (An id-only cursor for append-only tables is \
+                 not yet supported.) ({OVERWRITE_CAVEAT})"
+            )
         };
 
         // Check if configured_ts exists and is problematic
@@ -415,6 +421,7 @@ mod tests {
         let report = evaluate_cursor("orders", columns, indexes, None);
         assert!(!report.has_id);
         assert!(report.recommendation.contains("full_refresh"));
+        assert!(report.recommendation.contains(crate::writer::OVERWRITE_CAVEAT), "got: {}", report.recommendation);
         assert!(report.recommendation.contains("id"));
     }
 
@@ -585,6 +592,7 @@ mod tests {
         assert_eq!(report.candidates.len(), 2);
         assert!(report.candidates.iter().all(|c| c.verdict == Verdict::Unsafe));
         assert!(report.recommendation.contains("full_refresh"));
+        assert!(report.recommendation.contains(crate::writer::OVERWRITE_CAVEAT), "got: {}", report.recommendation);
     }
 
     #[test]

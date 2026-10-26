@@ -51,6 +51,16 @@ pub(crate) fn is_missing_table_error(e: &anyhow::Error) -> bool {
 /// behavior: `None` (starts a from-scratch re-extract, exactly like a missing HWM always has).
 pub(crate) const HWM_LOOKBACK_COMMITS: usize = 64;
 
+/// Appended to every message that offers a full refresh or `TABLE_RECONCILE` as the remedy. Both
+/// replace the whole Delta table with the source's CURRENT rows, so they are lossless only while
+/// the source still holds every row Delta does. Stating the cost where the advice is given stops it
+/// reading as a free retry — the expensive case is a table whose source rows were deleted or purged
+/// after sync, where Delta is the only copy left.
+pub(crate) const OVERWRITE_CAVEAT: &str = "CAUTION: a full refresh or TABLE_RECONCILE replaces \
+    the whole Delta table with the source's current rows — any row already deleted or purged from \
+    the source is dropped from Delta too, recoverable only through Delta time travel until a \
+    vacuum removes the old files";
+
 /// L7: scan `history` (as returned by `DeltaTable::history`, which orders MOST-RECENT-FIRST) for
 /// the newest commit whose `info` carries every one of `keys`. A Delta `OPTIMIZE` / `VACUUM` /
 /// checkpoint housekeeping commit carries none of the `hwm_*` keys, so without this scan it would

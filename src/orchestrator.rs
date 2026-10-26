@@ -12,7 +12,7 @@ use crate::discovery::{
     ColumnInfo, IndexInfo, filter_unsupported_columns, select_integer_pk,
 };
 use crate::state::{AppState, TableState};
-use crate::writer::Hwm;
+use crate::writer::{Hwm, OVERWRITE_CAVEAT};
 
 mod adapters;
 mod incremental;
@@ -343,12 +343,12 @@ where
                 let key_col = select_integer_pk(&columns, &indexes).unwrap_or_else(|| "id".to_string());
                 if !select_columns.iter().any(|c| c == &ts_col) {
                     anyhow::bail!(
-                        "incremental table '{table_name}' cursor column `{ts_col}` is missing from the Delta table schema (the schema-evolution filter dropped it because the Delta schema lacks it); evolve the Delta schema to add `{ts_col}` or run a full refresh for this table"
+                        "incremental table '{table_name}' cursor column `{ts_col}` is missing from the Delta table schema (the schema-evolution filter dropped it because the Delta schema lacks it); evolve the Delta schema to add `{ts_col}` or run a full refresh for this table ({OVERWRITE_CAVEAT})"
                     );
                 }
                 if !select_columns.iter().any(|c| c == &key_col) {
                     anyhow::bail!(
-                        "incremental table '{table_name}' key column `{key_col}` is missing from the Delta table schema (the schema-evolution filter dropped it because the Delta schema lacks it); evolve the Delta schema to add `{key_col}` or run a full refresh for this table"
+                        "incremental table '{table_name}' key column `{key_col}` is missing from the Delta table schema (the schema-evolution filter dropped it because the Delta schema lacks it); evolve the Delta schema to add `{key_col}` or run a full refresh for this table ({OVERWRITE_CAVEAT})"
                     );
                 }
                 // D2: whether the cursor is nullable decides if the NULL-cursor exclusion is
@@ -370,12 +370,12 @@ where
                     .expect("two_stream config present for TwoStream mode");
                 if !select_columns.iter().any(|c| c == &insert_col) {
                     anyhow::bail!(
-                        "two-stream table '{table_name}' insert cursor column `{insert_col}` is missing from the Delta table schema (the schema-evolution filter dropped it because the Delta schema lacks it); evolve the Delta schema to add `{insert_col}` or run a full refresh for this table"
+                        "two-stream table '{table_name}' insert cursor column `{insert_col}` is missing from the Delta table schema (the schema-evolution filter dropped it because the Delta schema lacks it); evolve the Delta schema to add `{insert_col}` or run a full refresh for this table ({OVERWRITE_CAVEAT})"
                     );
                 }
                 if !select_columns.iter().any(|c| c == &update_col) {
                     anyhow::bail!(
-                        "two-stream table '{table_name}' update cursor column `{update_col}` is missing from the Delta table schema (the schema-evolution filter dropped it because the Delta schema lacks it); evolve the Delta schema to add `{update_col}` or run a full refresh for this table"
+                        "two-stream table '{table_name}' update cursor column `{update_col}` is missing from the Delta table schema (the schema-evolution filter dropped it because the Delta schema lacks it); evolve the Delta schema to add `{update_col}` or run a full refresh for this table ({OVERWRITE_CAVEAT})"
                     );
                 }
                 if self.config.is_reconcile(table_name) {

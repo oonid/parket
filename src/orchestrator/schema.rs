@@ -8,6 +8,7 @@ use deltalake::arrow::record_batch::RecordBatch;
 use tracing::{error, info, warn};
 
 use crate::discovery::ColumnInfo;
+use crate::writer::OVERWRITE_CAVEAT;
 
 /// N5: DATA_TYPE alone (`tinyint`, `int`, ...) can't tell a signed column from its
 /// unsigned counterpart — that marker only shows up in COLUMN_TYPE (e.g.
@@ -184,7 +185,7 @@ pub(crate) fn schema_evolution_check(
             errors.push(format!(
                 "column {delta_name} is missing from MariaDB's current extractable columns \
                  (dropped, renamed, or altered to a non-extractable type) — run a full refresh \
-                 for this table to reconcile"
+                 for this table to reconcile ({OVERWRITE_CAVEAT})"
             ));
         }
     }
@@ -329,10 +330,13 @@ mod tests {
         // N1-r2/D1-r2: reworded — no longer claims "table was dropped" (the table still
         // exists; only the column is gone) and names all three real causes a missing column
         // can have.
-        assert!(result.unwrap_err().to_string().contains(
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains(
             "column name is missing from MariaDB's current extractable columns \
              (dropped, renamed, or altered to a non-extractable type)"
         ));
+        // The remedy is a full refresh, so the message must state what that overwrite costs.
+        assert!(err.contains(crate::writer::OVERWRITE_CAVEAT), "got: {err}");
     }
 
     #[test]
