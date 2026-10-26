@@ -27,6 +27,38 @@ fn parse_key_bound(s: &Option<String>) -> Option<i128> {
     s.as_deref().and_then(|s| s.parse::<i128>().ok())
 }
 
+/// The key-set fingerprint select list — count, distinct, range-safe min/max, xor, sum — for an
+/// already-backticked `key`. Every source query that fingerprints a key builds it here, so the
+/// copies cannot drift apart: a key fingerprint only matches Delta's if the SQL is identical.
+/// MariaDB's BIT_XOR does not accept DISTINCT (syntax error); the source key is unique, so BIT_XOR
+/// over all rows already equals the fingerprint over distinct values and doubles as `distinct_xor`.
+/// V8: MIN/MAX go through DECIMAL(20,0)-as-CHAR (not SIGNED) so a BIGINT UNSIGNED key above
+/// i64::MAX is captured exactly instead of wrapping negative; BIT_XOR stays SIGNED (bit-preserving,
+/// not a magnitude).
+fn key_fingerprint_select(key: &str) -> String {
+    format!(
+        "COUNT(*), COUNT(DISTINCT {key}), \
+         CAST(CAST(MIN({key}) AS DECIMAL(20,0)) AS CHAR), CAST(CAST(MAX({key}) AS DECIMAL(20,0)) AS CHAR), \
+         CAST(BIT_XOR({key}) AS SIGNED), CAST(SUM({key}) AS CHAR)"
+    )
+}
+
+type KeyFingerprintRow = (i64, i64, Option<String>, Option<String>, Option<i64>, Option<String>);
+
+/// Decode the six `key_fingerprint_select` columns into `KeyStats`.
+fn key_stats_from_row(row: KeyFingerprintRow) -> KeyStats {
+    let xor = row.4.unwrap_or(0);
+    KeyStats {
+        count: row.0,
+        distinct: row.1,
+        min: parse_key_bound(&row.2),
+        max: parse_key_bound(&row.3),
+        xor,
+        distinct_xor: xor,
+        sum: row.5.as_deref().unwrap_or("0").parse::<i128>().unwrap_or(0),
+    }
+}
+
 pub struct SourceProbeAdapter {
     pool: sqlx::MySqlPool,
 }
@@ -155,35 +187,16 @@ impl SourceProbe for SourceProbeAdapter {
     }
 
     async fn key_stats(&self, table: &str, key_col: &str) -> Result<KeyStats> {
-        // MariaDB's BIT_XOR does not accept DISTINCT (syntax error). The source key
-        // column is the primary key (unique), so BIT_XOR over all rows already equals
-        // the fingerprint over distinct values — we reuse it for `distinct_xor`. The
-        // Delta side, which may carry append-log duplicates, computes a true
-        // bit_xor(distinct ...).
-        // V8: MIN/MAX cast to DECIMAL(20,0)-as-CHAR (not SIGNED) so a BIGINT UNSIGNED key
-        // above i64::MAX is captured exactly instead of wrapping negative; parsed to i128
-        // below. BIT_XOR stays SIGNED/i64 (bit-preserving, not a magnitude).
+        // The Delta side, which may carry append-log duplicates, computes a true
+        // bit_xor(distinct ...); see `key_fingerprint_select` for the source side.
         let quoted_table = backtick(table);
-        let key = backtick(key_col);
-        let row: (i64, i64, Option<String>, Option<String>, Option<i64>, Option<String>) = sqlx::query_as(&format!(
-            "SELECT COUNT(*), COUNT(DISTINCT {key}), \
-             CAST(CAST(MIN({key}) AS DECIMAL(20,0)) AS CHAR), CAST(CAST(MAX({key}) AS DECIMAL(20,0)) AS CHAR), \
-             CAST(BIT_XOR({key}) AS SIGNED), CAST(SUM({key}) AS CHAR) FROM {quoted_table}"
-        ))
-        .fetch_one(&self.pool)
-        .await
-        .with_context(|| format!("source key_stats for `{table}`.`{key_col}`"))?;
-        let xor = row.4.unwrap_or(0);
-        let sum = row.5.as_deref().unwrap_or("0").parse::<i128>().unwrap_or(0);
-        Ok(KeyStats {
-            count: row.0,
-            distinct: row.1,
-            min: parse_key_bound(&row.2),
-            max: parse_key_bound(&row.3),
-            xor,
-            distinct_xor: xor,
-            sum,
-        })
+        let fingerprint = key_fingerprint_select(&backtick(key_col));
+        let row: KeyFingerprintRow =
+            sqlx::query_as(&format!("SELECT {fingerprint} FROM {quoted_table}"))
+                .fetch_one(&self.pool)
+                .await
+                .with_context(|| format!("source key_stats for `{table}`.`{key_col}`"))?;
+        Ok(key_stats_from_row(row))
     }
 
     async fn key_stats_scoped(
@@ -193,12 +206,10 @@ impl SourceProbe for SourceProbeAdapter {
         scope: &SourceScope,
     ) -> Result<KeyStats> {
         let quoted_table = backtick(table);
-        let key = backtick(key_col);
+        let fingerprint = key_fingerprint_select(&backtick(key_col));
         let predicate = scope_predicate_sql(scope);
-        let sql = format!(
-            "SELECT COUNT(*), COUNT(DISTINCT {key}),              CAST(CAST(MIN({key}) AS DECIMAL(20,0)) AS CHAR), CAST(CAST(MAX({key}) AS DECIMAL(20,0)) AS CHAR),              CAST(BIT_XOR({key}) AS SIGNED), CAST(SUM({key}) AS CHAR) FROM {quoted_table}              WHERE {predicate}"
-        );
-        let row: (i64, i64, Option<String>, Option<String>, Option<i64>, Option<String>) = sqlx::query_as(&sql)
+        let sql = format!("SELECT {fingerprint} FROM {quoted_table} WHERE {predicate}");
+        let row: KeyFingerprintRow = sqlx::query_as(&sql)
             .bind(&scope.updated_at)
             .bind(&scope.updated_at)
             .bind(scope.last_id)
@@ -210,17 +221,7 @@ impl SourceProbe for SourceProbeAdapter {
                     scope.cursor_col
                 )
             })?;
-        let xor = row.4.unwrap_or(0);
-        let sum = row.5.as_deref().unwrap_or("0").parse::<i128>().unwrap_or(0);
-        Ok(KeyStats {
-            count: row.0,
-            distinct: row.1,
-            min: parse_key_bound(&row.2),
-            max: parse_key_bound(&row.3),
-            xor,
-            distinct_xor: xor,
-            sum,
-        })
+        Ok(key_stats_from_row(row))
     }
 
     /// V3-r Tier 2: BINARY-normalized so MIN/MAX/COUNT(DISTINCT) use byte ordering instead of
