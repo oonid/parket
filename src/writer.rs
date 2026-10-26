@@ -56,6 +56,16 @@ pub(crate) const HWM_LOOKBACK_COMMITS: usize = 64;
 /// the source still holds every row Delta does. Stating the cost where the advice is given stops it
 /// reading as a free retry — the expensive case is a table whose source rows were deleted or purged
 /// after sync, where Delta is the only copy left.
+/// Rows a file contributes to a scan: its physical `numRecords` minus the rows its deletion vector
+/// hides, if it has one. parket never writes deletion vectors, but another writer (Spark, a later
+/// delta-rs) deleting from the table with them leaves `numRecords` counting rows no scan returns —
+/// counted physically, every later overwrite's row accounting would refuse to commit, for good.
+/// `None` when the file has no row count.
+fn logical_rows(num_records: Option<usize>, deletion_vector_cardinality: Option<i64>) -> Option<u64> {
+    let hidden = deletion_vector_cardinality.map_or(0, |c| u64::try_from(c).unwrap_or(0));
+    num_records.map(|n| (n as u64).saturating_sub(hidden))
+}
+
 pub(crate) const OVERWRITE_CAVEAT: &str = "CAUTION: a full refresh or TABLE_RECONCILE replaces \
     the whole Delta table with the source's current rows — any row already deleted or purged from \
     the source is dropped from Delta too, recoverable only through Delta time travel until a \
@@ -682,6 +692,43 @@ impl DeltaWriter {
         Ok(())
     }
 
+    /// Row accounting for `table_name`'s in-flight overwrite session, read from Delta-log
+    /// statistics rather than from any scan: `.0` is the logical rows held by the snapshot whose
+    /// files `commit_overwrite` will REMOVE, `.1` the rows in the files staged so far. Either is
+    /// `None` when a file carries no row count (stats are optional in the protocol), so a caller
+    /// can tell "unknown" apart from zero.
+    pub(crate) async fn overwrite_row_accounting(
+        &self,
+        table_name: &str,
+    ) -> Result<(Option<u64>, Option<u64>)> {
+        let sessions = self.overwrite_sessions.lock().await;
+        let session = sessions.get(table_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "overwrite_row_accounting: no overwrite session in progress for table `{table_name}`"
+            )
+        })?;
+        let removed = session
+            .table
+            .snapshot()?
+            .log_data()
+            .iter()
+            .try_fold(0u64, |acc, file| {
+                let hidden = file.deletion_vector_descriptor().map(|dv| dv.cardinality);
+                logical_rows(file.num_records(), hidden).map(|n| acc + n)
+            });
+        let mut staged = Some(0u64);
+        for add in &session.adds {
+            staged = match (staged, add.get_stats().context("parsing a staged file's stats")?) {
+                (Some(acc), Some(stats)) => Some(
+                    acc + u64::try_from(stats.num_records)
+                        .context("a staged file's stats report a negative numRecords")?,
+                ),
+                _ => None,
+            };
+        }
+        Ok((removed, staged))
+    }
+
     /// O2-r CP1: finish the staged-overwrite session for `table_name` with ONE atomic commit —
     /// `Remove` actions for every file in the table's CURRENT snapshot, plus `Add` actions for
     /// every chunk staged since `begin_overwrite`. The Delta transaction log commit IS the
@@ -882,6 +929,14 @@ impl DeltaWriter {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn logical_rows_subtracts_rows_hidden_by_a_deletion_vector() {
+        assert_eq!(logical_rows(Some(1000), None), Some(1000), "no deletion vector");
+        assert_eq!(logical_rows(Some(1000), Some(40)), Some(960), "40 rows hidden by a DV");
+        assert_eq!(logical_rows(None, Some(40)), None, "no row count stays unknown");
+        assert_eq!(logical_rows(Some(10), Some(-1)), Some(10), "a malformed cardinality hides nothing");
+    }
 
     /// §10.7: a dry-run vacuum must report BYTES, not just a file count.
     ///

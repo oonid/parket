@@ -12,7 +12,7 @@ use deltalake::datafusion::prelude::{Column, Expr, SessionConfig, SessionContext
 use deltalake::kernel::transaction::CommitBuilder;
 use deltalake::operations::write::SchemaMode;
 use deltalake::protocol::{DeltaOperation, SaveMode};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::query::backtick;
 
@@ -71,6 +71,56 @@ fn survivor_scan_sql(target_table: &str, target_schema: &deltalake::arrow::datat
         .collect::<Vec<_>>()
         .join(", ");
     format!("SELECT {col_list} FROM {target_table}")
+}
+
+/// Refuse to commit an upsert overwrite whose row accounting does not close. The overwrite swaps the
+/// WHOLE table, so a target scan that silently missed rows (or a writer that dropped some) would
+/// commit a smaller table with nothing to flag it. Two identities must hold, each checked against
+/// Delta-log row counts rather than anything the scan reports about itself:
+///   * `kept + replaced == removed` — the scan saw every row of the snapshot whose files the commit
+///     removes. Replaced rows are the old versions of incoming keys, so duplicate copies being
+///     healed are accounted for, not refused.
+///   * `staged == kept + new_rows` — the staged files hold exactly the rows handed to them.
+///
+/// A `None` count (a file without stats) cannot be checked; that is logged, never passed silently.
+fn check_overwrite_accounting(
+    table_name: &str,
+    removed: Option<u64>,
+    kept: u64,
+    replaced: u64,
+    new_rows: u64,
+    staged: Option<u64>,
+) -> Result<()> {
+    let scanned = kept + replaced;
+    match removed {
+        Some(removed) if removed != scanned => anyhow::bail!(
+            "refusing to commit the overwrite of `{table_name}`: the target scan accounted for \
+             {scanned} rows (kept {kept} + replaced {replaced}) but the snapshot being replaced holds \
+             {removed} per the Delta log. Committing would change the table by rows the update never \
+             touched. Nothing was committed; the live table is unchanged"
+        ),
+        Some(_) => {}
+        None => warn!(
+            table = table_name,
+            "overwrite accounting: the snapshot has files without row-count stats, so the target \
+             scan's {scanned} rows could not be checked against it"
+        ),
+    }
+    let expected = kept + new_rows;
+    match staged {
+        Some(staged) if staged != expected => anyhow::bail!(
+            "refusing to commit the overwrite of `{table_name}`: the staged files hold {staged} rows \
+             but {expected} were staged (kept {kept} + new {new_rows}). Nothing was committed; the \
+             live table is unchanged"
+        ),
+        Some(_) => {}
+        None => warn!(
+            table = table_name,
+            "overwrite accounting: staged files carry no row-count stats, so the {expected} staged \
+             rows could not be checked"
+        ),
+    }
+    Ok(())
 }
 
 /// Arguments for `delete_then_append_via_overwrite` (§10.1). Grouped into a struct purely to keep
@@ -292,13 +342,23 @@ impl DeltaWriter {
                 table_name, ctx, &sql, key_col, &keyset, deduped_batches, self.stage_bytes(),
             )
             .await;
-        let survivors = match staged {
-            Ok(n) => n,
+        let (survivors, replaced) = match staged {
+            Ok(counts) => counts,
             Err(e) => {
                 self.abort_overwrite(table_name).await;
                 return Err(e);
             }
         };
+
+        let accounting = self.overwrite_row_accounting(table_name).await.and_then(|(removed, staged)| {
+            check_overwrite_accounting(
+                table_name, removed, survivors as u64, replaced as u64, new_rows as u64, staged,
+            )
+        });
+        if let Err(e) = accounting {
+            self.abort_overwrite(table_name).await;
+            return Err(e);
+        }
 
         if let Err(e) = self.commit_overwrite(table_name, update_hwm, insert_id).await {
             self.abort_overwrite(table_name).await;
@@ -309,6 +369,7 @@ impl DeltaWriter {
             table = table_name,
             keys = key_count,
             survivors,
+            replaced,
             new_rows,
             "delete_then_append: applied via ONE atomic overwrite (anti-join), not per-chunk DELETEs"
         );
@@ -317,7 +378,8 @@ impl DeltaWriter {
 
     /// Stream the target, keep rows whose key is NOT in `keyset`, stage them, then stage the new
     /// versions. Split out so the caller can `abort_overwrite` on any error without duplicating
-    /// cleanup. Returns the number of surviving rows.
+    /// cleanup. Returns `(kept, replaced)`: the surviving rows, and the target rows dropped because
+    /// an incoming key replaces them — together every row the scan saw.
     ///
     /// §10.1-r: the survivor test is a Rust `HashSet` lookup, not a SQL join — see the call site for
     /// why the SQL anti-join was unbounded. Memory here is the keyset plus at most `stage_rows`
@@ -332,7 +394,7 @@ impl DeltaWriter {
         keyset: &std::collections::HashSet<i64>,
         deduped_batches: Vec<RecordBatch>,
         stage_bytes: usize,
-    ) -> Result<usize> {
+    ) -> Result<(usize, usize)> {
         use deltalake::arrow::array::BooleanArray;
         use deltalake::arrow::compute::{CastOptions, cast_with_options, filter_record_batch};
         use futures::StreamExt;
@@ -350,6 +412,7 @@ impl DeltaWriter {
         let cast_opts = CastOptions { safe: false, ..Default::default() };
 
         let mut survivors = 0usize;
+        let mut replaced = 0usize;
         let mut buffered = 0usize;
         let mut buf: Vec<RecordBatch> = Vec::new();
         while let Some(batch) = stream.next().await {
@@ -384,6 +447,7 @@ impl DeltaWriter {
                 .map(|i| Some(keys.is_null(i) || !keyset.contains(&keys.value(i))))
                 .collect();
             let kept = filter_record_batch(&batch, &mask).context("filtering surviving rows")?;
+            replaced += batch.num_rows() - kept.num_rows();
 
             if kept.num_rows() > 0 {
                 survivors += kept.num_rows();
@@ -401,7 +465,7 @@ impl DeltaWriter {
         }
         // The new versions land in the SAME overwrite, so the table never lacks these keys.
         self.stage_overwrite_chunk(table_name, deduped_batches).await?;
-        Ok(survivors)
+        Ok((survivors, replaced))
     }
 
 
@@ -2429,6 +2493,116 @@ mod tests {
         );
         assert_eq!(g(4), 1, "lowest id preserved");
         assert_eq!(g(5), total, "highest id preserved");
+    }
+
+    #[test]
+    fn overwrite_accounting_passes_when_every_row_is_accounted_for() {
+        // 100 rows in the snapshot: 90 kept, 10 replaced by 10 new versions → 100 staged.
+        check_overwrite_accounting("t", Some(100), 90, 10, 10, Some(100)).unwrap();
+    }
+
+    #[test]
+    fn overwrite_accounting_refuses_a_scan_that_missed_rows() {
+        // The scan saw 95 of the snapshot's 100 rows; committing would silently drop 5.
+        let err = check_overwrite_accounting("t", Some(100), 85, 10, 10, Some(95)).unwrap_err().to_string();
+        assert!(err.contains("refusing to commit"), "got: {err}");
+        assert!(err.contains("95") && err.contains("100"), "must name both counts: {err}");
+    }
+
+    #[test]
+    fn overwrite_accounting_refuses_staged_files_that_lost_rows() {
+        // Scan closes (90 + 10 = 100) but the staged files hold 99 rows, not 90 kept + 10 new.
+        let err = check_overwrite_accounting("t", Some(100), 90, 10, 10, Some(99)).unwrap_err().to_string();
+        assert!(err.contains("refusing to commit"), "got: {err}");
+        assert!(err.contains("99") && err.contains("100"), "must name both counts: {err}");
+    }
+
+    #[test]
+    fn overwrite_accounting_allows_healing_duplicate_keys() {
+        // 3 duplicate old rows for the incoming keys: 103 rows → 90 kept + 13 replaced, 10 new.
+        // The table legitimately shrinks to 100; accounting closes, so this must not be refused.
+        check_overwrite_accounting("t", Some(103), 90, 13, 10, Some(100)).unwrap();
+    }
+
+    #[test]
+    fn overwrite_accounting_without_row_counts_is_not_refused() {
+        // Stats are optional in the Delta protocol; an uncheckable count is logged, not fatal.
+        check_overwrite_accounting("t", None, 90, 10, 10, None).unwrap();
+    }
+
+    #[tokio::test]
+    async fn overwrite_row_accounting_reads_real_counts_from_the_log() {
+        // The guard is only as good as its inputs: if delta-rs left numRecords unparsed, every
+        // overwrite would take the "could not be checked" branch and the check would be inert.
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new("id", DataType::Int64, false)]));
+        writer.ensure_table("t", schema.clone()).await.unwrap();
+        let rows = |ids: Vec<i64>| RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(ids))]).unwrap();
+        let t = writer.open_table("t").await.unwrap();
+        t.write(vec![rows((1..=700).collect()), rows((701..=1200).collect())])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .unwrap();
+
+        writer.begin_overwrite("t", schema.clone()).await.unwrap();
+        writer.stage_overwrite_chunk("t", vec![rows((1..=5).collect())]).await.unwrap();
+        writer.stage_overwrite_chunk("t", vec![rows((6..=9).collect())]).await.unwrap();
+        let (removed, staged) = writer.overwrite_row_accounting("t").await.unwrap();
+        writer.abort_overwrite("t").await;
+
+        assert_eq!(removed, Some(1200), "snapshot row count must come from the log");
+        assert_eq!(staged, Some(9), "staged row count must come from the staged files' stats");
+    }
+
+    #[tokio::test]
+    async fn delete_then_append_overwrite_heals_duplicate_keys_without_tripping_accounting() {
+        // FA2-class history: the target holds a second copy of ids 1..=500. The overwrite path must
+        // replace both copies with the one new version and commit — the accounting check counts
+        // those as replaced rows, so a shrinking-but-correct rewrite is not refused.
+        let temp = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(temp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        writer.ensure_table("t", schema.clone()).await.unwrap();
+
+        let total: i64 = 12_000;
+        let dup: i64 = 500;
+        let updated: i64 = 10_000; // ceil(10000/1024) = 10 chunks > 8 → overwrite path
+        let batch = |ids: Vec<i64>, v: &str| {
+            let n = ids.len();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(ids)), Arc::new(StringArray::from(vec![v; n]))],
+            )
+            .unwrap()
+        };
+        let t = writer.open_table("t").await.unwrap();
+        t.write(vec![batch((1..=total).collect(), "old"), batch((1..=dup).collect(), "old")])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .unwrap();
+
+        writer
+            .delete_then_append("t", vec![batch((1..=updated).collect(), "new")], "id", Some(total), None)
+            .await
+            .unwrap();
+
+        let t = writer.open_table("t").await.unwrap();
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        ctx.register_table("t", t.table_provider().await.unwrap()).unwrap();
+        let batches = ctx
+            .sql("SELECT COUNT(*) AS c, COUNT(DISTINCT id) AS d FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let g = |i: usize| batches[0].column(i).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+        assert_eq!(g(0), total, "the duplicate copies are gone, nothing else is");
+        assert_eq!(g(1), total, "every id appears exactly once");
     }
 
 #[tokio::test]
