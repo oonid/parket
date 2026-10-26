@@ -2,9 +2,11 @@ name: CI
 
 on:
   push:
-    branches: ["*"]
+    # `**`, not `*`: in GitHub's branch filters `*` stops at `/`, so `*` never matched a
+    # `fix/...` or `feat/...` branch and those pushes ran no CI.
+    branches: ["**"]
   pull_request:
-    branches: [main]
+    branches: [master]
 
 env:
   CARGO_TERM_COLOR: always
