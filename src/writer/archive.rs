@@ -24,7 +24,9 @@ use deltalake::protocol::{DeltaOperation, SaveMode};
 use deltalake::writer::{DeltaWriter as _, RecordBatchWriter};
 use tracing::info;
 
-use super::{DeltaWriter, coerce_batch_to_schema, is_missing_table_error};
+use super::{DeltaWriter, arrow_type_to_delta, coerce_batch_to_schema, is_missing_table_error};
+use crate::archive::SOURCE_TIME_ZONE_PROPERTY;
+use deltalake::kernel::{MetadataValue, StructField};
 
 /// The column every archived row carries: the id of the unit (e.g. the campaign) it belongs to.
 pub const ARCHIVE_UNIT_COLUMN: &str = "_archive_unit";
@@ -71,6 +73,46 @@ fn stamp_unit(batch: &RecordBatch, unit: i64) -> Result<RecordBatch> {
 }
 
 impl DeltaWriter {
+    /// Create the archive table if it does not exist: `schema` (from `archive::archive_schema`)
+    /// with every field's metadata kept — the sync path's `arrow_schema_to_delta` drops it — and
+    /// the source time zone as a table property. An existing table is returned as is;
+    /// `begin_archive_unit` refuses one that is not an archive table.
+    pub async fn ensure_archive_table(
+        &self,
+        table_name: &str,
+        schema: SchemaRef,
+        source_time_zone: &str,
+    ) -> Result<DeltaTable> {
+        match self.open_table(table_name).await {
+            Ok(table) => return Ok(table),
+            Err(e) if is_missing_table_error(&e) => {}
+            Err(e) => return Err(e).context(format!("archive: opening `{table_name}`")),
+        }
+        let fields = schema
+            .fields()
+            .iter()
+            .map(|f| {
+                let field = StructField::new(f.name(), arrow_type_to_delta(f.data_type())?, f.is_nullable());
+                Ok(field.with_metadata(
+                    f.metadata().iter().map(|(k, v)| (k.clone(), MetadataValue::String(v.clone()))),
+                ))
+            })
+            .collect::<Result<Vec<StructField>>>()?;
+        let table = deltalake::DeltaTableBuilder::from_url(self.table_url(table_name)?)?
+            .with_storage_options(self.storage_options.clone())
+            .build()?;
+        let created = table
+            .create()
+            .with_columns(fields)
+            .with_table_name(table_name)
+            .with_configuration([(SOURCE_TIME_ZONE_PROPERTY, Some(source_time_zone))])
+            // the property is parket's own, not a `delta.*` key
+            .with_raise_if_key_not_exists(false)
+            .await?;
+        info!(table = table_name, source_time_zone, "archive: table created");
+        Ok(created)
+    }
+
     /// Whether `table_name` already holds rows of `unit`. A missing table holds nothing. Each
     /// archive file holds one unit, so the filter is answered from file statistics.
     pub async fn archive_unit_present(&self, table_name: &str, unit: i64) -> Result<bool> {
@@ -314,6 +356,70 @@ mod tests {
         writer.ensure_table("messages", source_schema()).await.unwrap();
         let err = writer.begin_archive_unit("messages", 909).await.unwrap_err().to_string();
         assert!(err.contains("not created as an archive table"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn an_archive_table_keeps_typed_utc_timestamps_and_the_source_zone() {
+        use crate::archive::{SOURCE_TIME_ZONE_KEY, archive_schema, to_archive_batch};
+        use crate::discovery::ColumnInfo;
+        let col = |name: &str, dt: &str| ColumnInfo {
+            name: name.into(),
+            data_type: dt.into(),
+            column_type: dt.into(),
+            nullable: true,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let writer = DeltaWriter::new_local(dir.path().to_str().unwrap());
+        let schema = archive_schema(&[col("id", "bigint"), col("sent_at", "timestamp")], "Asia/Jakarta").unwrap();
+        writer.ensure_archive_table("messages", schema.clone(), "Asia/Jakarta").await.unwrap();
+
+        // The zone survives into the Delta schema and the table properties.
+        let table = writer.open_table("messages").await.unwrap();
+        let snapshot = table.snapshot().unwrap();
+        let sent = snapshot.schema().field("sent_at").unwrap().clone();
+        assert_eq!(
+            sent.metadata().get(SOURCE_TIME_ZONE_KEY),
+            Some(&MetadataValue::String("Asia/Jakarta".into()))
+        );
+        assert_eq!(
+            snapshot.metadata().configuration().get(SOURCE_TIME_ZONE_PROPERTY).map(String::as_str),
+            Some("Asia/Jakarta")
+        );
+
+        // Extracted UTC text becomes instants, archived as one unit.
+        let extracted = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("sent_at", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![Some("2026-10-26 04:30:44"), None])),
+            ],
+        )
+        .unwrap();
+        let without_unit = Schema::new(
+            schema.fields().iter().filter(|f| f.name() != ARCHIVE_UNIT_COLUMN).cloned().collect::<Vec<_>>(),
+        );
+        let typed = to_archive_batch(&extracted, &without_unit).unwrap();
+        writer.begin_archive_unit("messages", 909).await.unwrap();
+        writer.stage_archive_chunk("messages", vec![typed]).await.unwrap();
+        assert_eq!(writer.commit_archive_unit("messages").await.unwrap(), 2);
+
+        // Read back in WIB with `AT TIME ZONE`. (DataFusion's `execution.time_zone` session setting
+        // does NOT change how a stored timestamp displays — checked, so readers must convert.)
+        let table = writer.open_table("messages").await.unwrap();
+        let ctx = deltalake::datafusion::prelude::SessionContext::new();
+        ctx.register_table("t", table.table_provider().await.unwrap()).unwrap();
+        let b = ctx
+            .sql("SELECT cast(sent_at AT TIME ZONE 'Asia/Jakarta' AS varchar) FROM t WHERE id = 1")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let shown = deltalake::arrow::util::display::array_value_to_string(b[0].column(0), 0).unwrap();
+        assert_eq!(shown, "2026-10-26T11:30:44+07:00", "04:30:44 UTC shown in WIB");
     }
 
     #[test]

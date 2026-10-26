@@ -23,6 +23,9 @@ pub struct BatchExtractor {
     /// truncation or error so the next call opens fresh (identical to the old fresh-conn-per-call,
     /// preserving M2 breaker semantics).
     conn: Option<connector_arrow::mysql::MySQLConnection<mysql::Conn>>,
+    /// Statements run on every connect and reconnect. Empty for sync; archive extraction sets
+    /// `archive::ARCHIVE_SESSION_INIT` (UTC session, predictable escaping).
+    session_init: Vec<String>,
 }
 
 impl BatchExtractor {
@@ -34,7 +37,25 @@ impl BatchExtractor {
             batch_size: default_batch_size,
             adapted: false,
             conn: None,
+            session_init: Vec::new(),
         }
+    }
+
+    /// Run `statements` on every connection this extractor opens, after any init the URL carries.
+    pub fn with_session_init(mut self, statements: &[&str]) -> Self {
+        self.session_init = statements.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    fn connection_opts(&self) -> Result<mysql::Opts> {
+        let opts = mysql::Opts::from_url(&self.database_url)
+            .map_err(|e| anyhow::anyhow!("invalid database url: {e}"))?;
+        if self.session_init.is_empty() {
+            return Ok(opts);
+        }
+        let mut init = opts.get_init();
+        init.extend(self.session_init.iter().cloned());
+        Ok(mysql::OptsBuilder::from_opts(opts).init(init).into())
     }
 
     pub fn calculate_batch_size(&mut self, avg_row_length: Option<u64>) -> u64 {
@@ -62,8 +83,7 @@ impl BatchExtractor {
     }
 
     fn open_connection(&self) -> Result<connector_arrow::mysql::MySQLConnection<mysql::Conn>> {
-        let opts = mysql::Opts::from_url(&self.database_url)
-            .map_err(|e| anyhow::anyhow!("invalid database url: {e}"))?;
+        let opts = self.connection_opts()?;
         let conn = mysql::Conn::new(opts)
             .map_err(|e| anyhow::anyhow!("MySQL connection failed: {e}"))?;
         Ok(connector_arrow::mysql::MySQLConnection::new(conn))
@@ -308,6 +328,16 @@ mod tests {
         RecordBatch::try_new(schema, arrays).unwrap()
     }
 
+
+    #[test]
+    fn session_init_is_added_to_every_connection_only_when_asked() {
+        let url = "mysql://u:p@localhost:3306/db";
+        let sync = BatchExtractor::new(url, 64, 1000);
+        assert!(sync.connection_opts().unwrap().get_init().is_empty(), "sync connections are untouched");
+        let archive = BatchExtractor::new(url, 64, 1000).with_session_init(&crate::archive::ARCHIVE_SESSION_INIT);
+        let init = archive.connection_opts().unwrap().get_init();
+        assert_eq!(init, crate::archive::ARCHIVE_SESSION_INIT.map(String::from).to_vec());
+    }
 
     #[test]
     fn calculate_batch_size_with_avg_row_length() {
