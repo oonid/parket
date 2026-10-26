@@ -226,6 +226,12 @@ where
                 break;
             }
 
+            // Archive tables are listed in TABLES for the archive commands; a sync skips them.
+            if let Some(scope) = self.config.archive_scope(table_name) {
+                info!(table = table_name, scope, "archive table: skipped by sync runs (use the archive commands)");
+                continue;
+            }
+
             match self.process_table(table_name).await {
                 Ok(()) => {
                     info!(table = table_name, "table succeeded");
@@ -288,8 +294,7 @@ where
         if let Some(scope) = self.config.archive_scope(table_name) {
             anyhow::bail!(
                 "table `{table_name}` is in archive mode (TABLE_ARCHIVE_{table_name}=`{scope}`); a \
-                 sync run never processes archive tables, and the archive run is not available yet. \
-                 Remove it from TABLES for sync runs"
+                 sync run never processes archive tables. Use `--archive-units` for it"
             );
         }
         let start = Instant::now();
@@ -581,6 +586,27 @@ mod tests {
         assert_eq!(ExitCode::Success as i32, 0);
         assert_eq!(ExitCode::PartialFailure as i32, 1);
         assert_eq!(ExitCode::Fatal as i32, 2);
+    }
+
+    #[tokio::test]
+    async fn a_sync_run_skips_archive_tables_without_failing() {
+        // TABLES lists the archive table for the archive commands; a sync run must neither read it
+        // nor count it as a failure (no mock expectations: any call would panic).
+        let dir = TempDir::new().unwrap();
+        let mut config = make_config(vec!["messages".to_string()]);
+        config.table_archive.insert("messages".to_string(), "source_id = ?".to_string());
+        let mut state = MockStateManage::new();
+        state.expect_load_or_default().returning(|_| crate::state::AppState::default());
+        state.expect_update_table().times(0);
+        let mut orch = make_orchestrator(
+            config,
+            MockSchemaInspect::new(),
+            MockExtract::new(),
+            MockDeltaWrite::new(),
+            state,
+            dir.path().to_path_buf(),
+        );
+        assert!(matches!(orch.run().await, ExitCode::Success));
     }
 
     #[tokio::test]
