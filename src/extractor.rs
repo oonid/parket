@@ -235,9 +235,7 @@ impl BatchExtractor {
         let actual_bytes_per_row = actual_bytes / row_count as u64;
         let target_bytes = self.target_memory_mb * 1024 * 1024;
 
-        let estimated_bytes_per_row = if self.batch_size > 0 {
-            target_bytes / self.batch_size
-        } else {
+        let Some(estimated_bytes_per_row) = target_bytes.checked_div(self.batch_size) else {
             return;
         };
 
