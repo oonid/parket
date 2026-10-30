@@ -1,5 +1,27 @@
 # Audit findings register (living document)
 
+**Release v0.3.0 (2026-10-30)** — archive mode, and safety checks that change how some runs end:
+
+* **Archive mode (new).** A table set to `TABLE_ARCHIVE_<t>=<scope>` is never synced. It is copied
+  to Delta one unit at a time, so its Delta copy can outlive the source rows:
+  `--archive-units` appends each unit in one commit, stamped with `_archive_unit`, in UTC, with
+  the source zone as metadata; `--verify-archive-units` compares a unit with the source row by
+  row; `--replace-archive-units` repairs a unit by replacing exactly its files. A scope may use the
+  unit id more than once, so a table without a unit column is archived in ranges of its primary
+  key. Also a library API for callers that choose the units themselves. See
+  [config.md](config.md#per-table-archive-mode-table_archive) and [cli.md](cli.md).
+* **A two-stream upsert overwrite whose row accounting does not close is refused** before it
+  commits: kept + replaced must equal the rows removed, and the staged rows must equal kept + new.
+  The live table is left untouched. A run that used to commit such a rewrite now stops.
+* **A Drift verdict compares values per key bucket**, naming the buckets that differ (report only).
+* **Every message that offers a full refresh or `TABLE_RECONCILE` as the fix** now says what it
+  costs: the whole Delta table is replaced by the source's current rows, dropping rows the source
+  has deleted or purged.
+* **`--vacuum`** tells files the log names apart from files present in storage (§10.7); the byte
+  totals were correct.
+
+Upgrading from v0.2.6: run `--check`, then one supervised sync, and keep v0.2.6 for rollback.
+
 **Release v0.2.6 (2026-08-07)** — four findings, superseding the notes on the `0597d8a` release
 commit, which described a `STAGE_ROWS` change that a later commit replaced:
 
