@@ -2022,6 +2022,88 @@ async fn archive_units_copies_one_campaign_in_utc_and_skips_it_on_a_rerun() {
     assert_eq!(query("messages", "SELECT count(*) FROM t").await, "25");
 }
 
+/// A table with no unit column, archived in ranges of its primary key: every `?` in the scope is
+/// the unit id. The fixture's 70 events (ids 1 to 70) fall into units of 20 ids; paging four rows
+/// at a time, each unit takes exactly its own range, the unit left out is not read, and every
+/// archived unit verifies row by row.
+#[tokio::test]
+#[serial_test::serial]
+async fn archive_units_by_primary_key_range_takes_each_range_once_and_verifies() {
+    use parket::archive::{DeltaUnitProbe, SourceUnitProbe, UnitVerdict, verify_units};
+    use parket::orchestrator::{ExtractorAdapter, SchemaInspectorAdapter};
+
+    let env = archive_fixture().await;
+    let tables = vec![ArchiveTable { name: "message_events".into(), scope: "id >= ? * 20 AND id < (? + 1) * 20".into() }];
+    let writer = || {
+        DeltaWriter::new(
+            &env.config.s3_bucket,
+            &env.config.s3_prefix,
+            env.config.s3_endpoint.as_deref(),
+            &env.config.s3_region,
+            &env.config.s3_access_key_id,
+            &env.config.s3_secret_access_key,
+        )
+    };
+    let results = Archiver::new(
+        SchemaInspectorAdapter::new(env.pool.clone(), "parket".to_string()),
+        ExtractorAdapter::for_archive(&env.config),
+        writer(),
+        "Asia/Jakarta",
+    )
+    .with_max_page_rows(4)
+    .archive_units(&tables, &[0, 1, 3, 4])
+    .await
+    .expect("archive ranges 0, 1, 3 and 4");
+    let outcomes: Vec<_> = results.iter().map(|r| (r.unit, r.outcome.clone())).collect();
+    assert_eq!(
+        outcomes,
+        vec![
+            (0, UnitOutcome::Archived { rows: 19 }),
+            (1, UnitOutcome::Archived { rows: 20 }),
+            (3, UnitOutcome::Archived { rows: 11 }),
+            (4, UnitOutcome::NoRows),
+        ],
+        "ids 1-19, 20-39 and 60-70; nothing from 80"
+    );
+
+    let t = writer().open_table("message_events").await.unwrap();
+    let ctx = deltalake::datafusion::prelude::SessionContext::new();
+    ctx.register_table("t", t.table_provider().await.unwrap()).unwrap();
+    let batches = ctx
+        .sql(
+            "SELECT cast(count(*) AS varchar) || ' ' || cast(count(DISTINCT id) AS varchar) || ' ' || \
+             cast(sum(CASE WHEN id >= 40 AND id < 60 THEN 1 ELSE 0 END) AS varchar) || ' ' || \
+             cast(sum(CASE WHEN CAST(id AS BIGINT) / 20 <> `_archive_unit` THEN 1 ELSE 0 END) AS varchar) FROM t",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        deltalake::arrow::util::display::array_value_to_string(batches[0].column(0), 0).unwrap(),
+        "50 50 0 0",
+        "50 rows, none twice, none from the range left out, each under its own unit"
+    );
+
+    let inspect = SchemaInspectorAdapter::new(env.pool.clone(), "parket".to_string());
+    let source = SourceUnitProbe::connect(&env.db_url).await.unwrap();
+    let verified: Vec<_> = verify_units(&inspect, &source, &DeltaUnitProbe::new(writer()), &tables, &[0, 1, 3])
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.unit, r.verdict))
+        .collect();
+    assert_eq!(
+        verified,
+        vec![
+            (0, UnitVerdict::Verified { rows: 19 }),
+            (1, UnitVerdict::Verified { rows: 20 }),
+            (3, UnitVerdict::Verified { rows: 11 }),
+        ]
+    );
+}
+
 /// Archive verification against a real source: an archived campaign verifies exactly in every
 /// table, and each kind of later source difference — an edited text value, an edited timestamp, a
 /// deleted row in a subquery-scoped table — is caught and named. A campaign that was never
