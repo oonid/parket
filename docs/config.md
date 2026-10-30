@@ -167,7 +167,8 @@ TABLE_ARCHIVE_failed_jobs=id >= ? * 10000 AND id < (? + 1) * 10000
 ```
 
 The `?` is replaced as text, so the predicate must not hold a `?` of its own (in a string literal,
-for example).
+for example). Units must not overlap: a row that two units' scopes both select is archived under
+each of them, and each still verifies on its own.
 
 ### What it does
 
