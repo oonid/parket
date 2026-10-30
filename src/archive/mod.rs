@@ -89,13 +89,13 @@ fn text_literal(v: &str) -> String {
     format!("'{}'", v.replace('\\', "\\\\").replace('\'', "''"))
 }
 
-/// Replace the scope predicate's single `?` with the unit id.
+/// Replace every `?` in the scope predicate with the unit id, so a unit can be a range:
+/// `id >= ? * 10000 AND id < (? + 1) * 10000`.
 fn bind_unit(scope: &str, unit: i64) -> Result<String> {
-    let placeholders = scope.matches('?').count();
-    if placeholders != 1 {
-        bail!("archive scope `{scope}` must contain exactly one `?` for the unit id, found {placeholders}");
+    if !scope.contains('?') {
+        bail!("archive scope `{scope}` must contain a `?` for the unit id");
     }
-    Ok(scope.replacen('?', &unit.to_string(), 1))
+    Ok(scope.replace('?', &unit.to_string()))
 }
 
 /// One page of a unit's rows: `WHERE (<scope>) [AND (<key>) > (<after>)] ORDER BY <key> LIMIT n`.
@@ -518,8 +518,15 @@ mod tests {
     }
 
     #[test]
+    fn page_query_puts_the_unit_in_every_placeholder_of_a_range_scope() {
+        let scope = "id >= ? * 10000 AND id < (? + 1) * 10000";
+        let q = page_query("failed_jobs", &["id".into()], scope, 7, &["id".into()], None, 10).unwrap();
+        assert!(q.contains("WHERE (id >= 7 * 10000 AND id < (7 + 1) * 10000) ORDER BY"), "got: {q}");
+    }
+
+    #[test]
     fn page_query_refuses_a_bad_scope_or_a_missing_key() {
-        assert!(page_query("t", &["id".into()], "a = ? OR b = ?", 1, &["id".into()], None, 10).is_err());
+        assert!(page_query("t", &["id".into()], "a = 1", 1, &["id".into()], None, 10).is_err());
         assert!(page_query("t", &["id".into()], "a = ?", 1, &[], None, 10).is_err());
     }
 

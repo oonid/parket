@@ -38,7 +38,7 @@ pub struct Config {
     /// normal two-stream incremental with no manual HWM seed.
     pub table_reconcile: HashSet<String>,
     /// Archive mode: tables with `TABLE_ARCHIVE_<table>=<scope predicate>`, mapped to that
-    /// predicate (one `?` for the unit id). Such a table never runs a sync mode — see
+    /// predicate (every `?` is the unit id). Such a table never runs a sync mode — see
     /// `parse::validate_archive_guard` and docs/design/archive-mode.md.
     pub table_archive: HashMap<String, String>,
     /// Archive mode: the source's IANA time zone (`ARCHIVE_SOURCE_TIME_ZONE`), recorded on every
@@ -1155,6 +1155,19 @@ mod tests {
 
     #[test]
     #[serial]
+    fn archive_scope_may_use_the_unit_more_than_once() {
+        clear_config_env();
+        set_required_vars();
+        unsafe {
+            env::set_var("TABLE_ARCHIVE_orders", "id >= ? * 10000 AND id < (? + 1) * 10000");
+            env::set_var("ARCHIVE_SOURCE_TIME_ZONE", "UTC");
+        }
+        let config = Config::load().expect("load should succeed");
+        assert_eq!(config.archive_scope("orders"), Some("id >= ? * 10000 AND id < (? + 1) * 10000"));
+    }
+
+    #[test]
+    #[serial]
     fn archive_tables_require_a_source_time_zone() {
         clear_config_env();
         set_required_vars();
@@ -1182,8 +1195,8 @@ mod tests {
 
     #[test]
     #[serial]
-    fn archive_scope_empty_or_without_exactly_one_placeholder_bails() {
-        for (value, needle) in [("   ", "empty"), ("source_id = 7", "found 0"), ("a = ? AND b = ?", "found 2")] {
+    fn archive_scope_empty_or_without_a_placeholder_bails() {
+        for (value, needle) in [("   ", "empty"), ("source_id = 7", "must contain a `?`")] {
             clear_config_env();
             set_required_vars();
             unsafe {

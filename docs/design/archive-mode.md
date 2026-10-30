@@ -38,9 +38,9 @@ Archive mode is therefore a separate mode with its own guarantees, not a variant
 ## Terms
 
 - **Unit** — the archiving granule, identified by an integer id.
-- **Scope** — per archive table, the SQL predicate selecting one unit's rows, with exactly one `?`
-  for the unit id: `campaign_id = ?`, or a subquery for a table that only references the unit
-  indirectly.
+- **Scope** — per archive table, the SQL predicate selecting one unit's rows, with `?` for the
+  unit id: `campaign_id = ?`, a subquery for a table that only references the unit indirectly, or
+  a range of the primary key (`id >= ? * 10000 AND id < (? + 1) * 10000`; every `?` is the unit id).
 - **Archived** — a table's rows for the unit are committed to Delta.
 - **Verified** — the archived copy matched the source exactly, in every archive table.
 
