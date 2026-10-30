@@ -150,7 +150,7 @@ ARCHIVE_SOURCE_TIME_ZONE=<IANA zone>
 ```
 
 Rows are archived in **units** — for example one campaign. The scope predicate is the SQL that
-selects one unit's rows, with exactly one `?` for the unit id:
+selects one unit's rows, with `?` for the unit id:
 
 ```env
 TABLES=messages,message_events
@@ -158,6 +158,16 @@ TABLE_ARCHIVE_messages=campaign_id = ?
 TABLE_ARCHIVE_message_events=message_id IN (SELECT id FROM messages WHERE campaign_id = ?)
 ARCHIVE_SOURCE_TIME_ZONE=Asia/Jakarta
 ```
+
+Every `?` is replaced by the unit id, so a table with no natural unit can be archived in ranges of
+its primary key — unit 7 is ids 70000 to 79999 here, read by the primary key:
+
+```env
+TABLE_ARCHIVE_failed_jobs=id >= ? * 10000 AND id < (? + 1) * 10000
+```
+
+The `?` is replaced as text, so the predicate must not hold a `?` of its own (in a string literal,
+for example).
 
 ### What it does
 
@@ -181,7 +191,7 @@ the units it is given (see the archive commands in [cli.md](cli.md)).
 
 ### Requirements & validation (fail at startup)
 
-- The value must be non-empty and contain exactly one `?`.
+- The value must be non-empty and contain a `?`.
 - `ARCHIVE_SOURCE_TIME_ZONE` is required as soon as any table is in archive mode, and must look
   like an IANA zone name (`Asia/Jakarta`, `UTC`).
 - An archive table has exactly one mode: `TABLE_MODE_<t>` (any value, `auto` included),
@@ -443,7 +453,7 @@ Parket validates configuration at startup and exits with code 2 on any failure:
 - `TABLES` must not be empty or whitespace-only.
 - `TARGET_MEMORY_MB` must parse as a positive integer (> 0).
 - `MERGE_MEMORY_MB`, if set, must parse as a positive integer (> 0); defaults to `TARGET_MEMORY_MB`.
-- `TABLE_ARCHIVE_<t>`, if set, must hold a scope predicate with exactly one `?`; the table may set no
+- `TABLE_ARCHIVE_<t>`, if set, must hold a scope predicate with a `?`; the table may set no
   other per-table mode option, and `ARCHIVE_SOURCE_TIME_ZONE` becomes required (see
   [Per-Table Archive Mode](#per-table-archive-mode-table_archive)).
 - All required variables must be present and non-empty.

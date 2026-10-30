@@ -220,9 +220,9 @@ pub(crate) fn validate_reconcile_requirements(
 /// Archive mode: `TABLE_ARCHIVE_<table>=<scope predicate>` marks a table whose rows are copied to
 /// Delta one unit (e.g. one campaign) at a time and later purged from the source, so its Delta copy
 /// may become the only copy (docs/design/archive-mode.md). The value is the SQL predicate that
-/// selects one unit's rows, with exactly one `?` for the unit id — `source_id = ?`, or a subquery
-/// for a table without the unit column. Parsed strictly: an empty value or a placeholder count
-/// other than one bails, naming the key.
+/// selects one unit's rows, with `?` for the unit id — `source_id = ?`, a subquery for a table
+/// without the unit column, or a range such as `id >= ? * 10000 AND id < (? + 1) * 10000` (every
+/// `?` is the unit id). Parsed strictly: an empty value or one without a `?` bails, naming the key.
 pub(crate) fn parse_table_archive(tables: &[String]) -> Result<HashMap<String, String>> {
     let mut map = HashMap::new();
     for table in tables {
@@ -235,12 +235,8 @@ pub(crate) fn parse_table_archive(tables: &[String]) -> Result<HashMap<String, S
                      unit's rows, with `?` for the unit id (e.g. `source_id = ?`)"
                 );
             }
-            let placeholders = scope.matches('?').count();
-            if placeholders != 1 {
-                bail!(
-                    "{key}={scope}: the scope predicate must contain exactly one `?` (the archive \
-                     unit id), found {placeholders}"
-                );
+            if !scope.contains('?') {
+                bail!("{key}={scope}: the scope predicate must contain a `?` for the archive unit id");
             }
             map.insert(table.clone(), scope.to_string());
         }
