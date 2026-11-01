@@ -42,7 +42,7 @@ src/
 
 - **HWM storage:** High Watermark stored in Delta commitInfo metadata (not state.json) for crash safety
 - **Two DB connections:** sqlx for metadata queries, connector_arrow (mysql crate) for data extraction
-- **Single Arrow version:** both extractor (connector_arrow 0.11.0) and writer (deltalake 0.32.3) use arrow 58 — no conversion layer
+- **Single Arrow version:** both extractor (connector_arrow 0.12.1) and writer (deltalake 0.32.4) use arrow 58 — no conversion layer ([why, and what blocks the next upgrade](docs/arrow-versions.md))
 - **Type mapping:** `mariadb_type_to_arrow()` in `orchestrator.rs` must match connector_arrow's output: `datetime/timestamp → Utf8`, `decimal → Utf8`, `tinyint/bool → Int8`
 - **Async runtime:** tokio. connector_arrow (sync) called directly in async context (acceptable for this workload)
 - **Error handling:** `anyhow` everywhere. Exit codes: 0 (success), 1 (partial failure), 2 (fatal)

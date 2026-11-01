@@ -12,7 +12,7 @@
 | `examples/ffi_vs_ipc.rs` deleted | Done — benchmark no longer relevant |
 | DeltaOps deprecated calls replaced | Done — using `DeltaTable::create()` and `DeltaTable::write()` |
 
-**This document is now historical reference.** It describes the problem and solution approach that was implemented. The conversion layer it documents no longer exists in the codebase.
+**This document is now historical reference.** The current state is in [arrow-versions.md](arrow-versions.md). It describes the problem and solution approach that was implemented. The conversion layer it documents no longer exists in the codebase.
 
 ## Problem Statement
 
