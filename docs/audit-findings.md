@@ -1,5 +1,17 @@
 # Audit findings register (living document)
 
+**Release v0.3.1 (2026-11-01)** — dependency fixes only; no behaviour changes:
+
+* **The lockfile is in sync again.** It had drifted since August, so `--locked` refused it and the
+  v0.3.0 binaries were built with dependencies resolved at build time. v0.3.1 is the first release
+  built from a committed, checked lockfile.
+* **rustls 0.23.46** fixes four TLS advisories; **quinn-proto 0.11.16** (never built) and
+  **thrift 0.23** (through parquet 58.4.1) clear the two Dependabot alerts.
+* **Arrow and parquet 58.4.1.** Where Arrow stands and what blocks deltalake 1.x:
+  [arrow-versions.md](arrow-versions.md).
+
+Upgrading from v0.3.0 needs nothing beyond swapping the binary.
+
 **Release v0.3.0 (2026-10-30)** — archive mode, and safety checks that change how some runs end:
 
 * **Archive mode (new).** A table set to `TABLE_ARCHIVE_<t>=<scope>` is never synced. It is copied
